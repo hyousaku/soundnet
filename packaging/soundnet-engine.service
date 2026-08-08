@@ -1,0 +1,25 @@
+[Unit]
+Description=SoundNet low-latency LAN audio engine
+Documentation=https://github.com/hyousaku/soundnet
+After=network-online.target sound.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=%i
+ExecStart=/usr/local/bin/soundnet-engine
+Restart=on-failure
+RestartSec=2
+
+# Real-time scheduling — safe if the running user is in the `audio` group
+# and /etc/security/limits.d/99-realtime.conf allows rtprio 95 (see below).
+LimitRTPRIO=95
+LimitMEMLOCK=infinity
+LimitNICE=-19
+
+# Config file: $XDG_CONFIG_HOME/soundnet/config.toml (defaults to
+# /var/lib/soundnet/.config/soundnet/config.toml for a system user).
+Environment=RUST_LOG=info
+
+[Install]
+WantedBy=multi-user.target

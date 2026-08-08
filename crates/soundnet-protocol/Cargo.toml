@@ -1,0 +1,10 @@
+[package]
+name = "soundnet-protocol"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Shared types and JSON protocol between soundnet-engine and the web UI."
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
