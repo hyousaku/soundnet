@@ -65,17 +65,15 @@ fn run(
     e2e_out: &Arc<AtomicU64>,
     jitter_out: &Arc<AtomicU64>,
 ) -> Result<()> {
-    let channels = super::sender::channel_layout_for(spec.channels);
+    // Both sides register the same custom encoding for this (rate, channels)
+    // tuple so packets round-trip without libroc having to guess a match.
+    super::ensure_encoding(ctx.raw(), spec.rate, spec.channels);
     let cfg = roc::roc_receiver_config {
         frame_encoding: roc::roc_media_encoding {
             rate: spec.rate,
             format: roc::roc_format::ROC_FORMAT_PCM_FLOAT32,
-            channels,
-            tracks: if matches!(channels, roc::roc_channel_layout::ROC_CHANNEL_LAYOUT_MULTITRACK) {
-                spec.channels as u32
-            } else {
-                0
-            },
+            channels: roc::roc_channel_layout::ROC_CHANNEL_LAYOUT_MULTITRACK,
+            tracks: spec.channels as u32,
         },
         clock_source: roc::roc_clock_source::ROC_CLOCK_SOURCE_INTERNAL,
         latency_tuner_backend: roc::roc_latency_tuner_backend::ROC_LATENCY_TUNER_BACKEND_DEFAULT,
@@ -87,10 +85,6 @@ fn run(
         no_playback_timeout: 0,
         choppy_playback_timeout: 0,
     };
-
-    if matches!(channels, roc::roc_channel_layout::ROC_CHANNEL_LAYOUT_MULTITRACK) {
-        super::ensure_multitrack_encoding(ctx.raw(), spec.rate, spec.channels);
-    }
 
     let mut receiver: *mut roc::roc_receiver = std::ptr::null_mut();
     let rc = unsafe { roc::roc_receiver_open(ctx.raw(), &cfg, &mut receiver) };

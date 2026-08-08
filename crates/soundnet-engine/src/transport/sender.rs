@@ -56,19 +56,18 @@ fn run(
     mut consumer: Consumer<f32>,
     stop: &Arc<AtomicBool>,
 ) -> Result<()> {
-    let channels = channel_layout(spec.channels);
-    let mut cfg = roc::roc_sender_config {
+    // Always use MULTITRACK layout — same code path for 1..32 channels, and
+    // we register a custom packet encoding below so libroc doesn't try to
+    // pick a built-in that doesn't exist for our rate/format.
+    let packet_encoding = super::ensure_encoding(ctx.raw(), spec.rate, spec.channels);
+    let cfg = roc::roc_sender_config {
         frame_encoding: roc::roc_media_encoding {
             rate: spec.rate,
             format: roc::roc_format::ROC_FORMAT_PCM_FLOAT32,
-            channels,
-            tracks: if matches!(channels, roc::roc_channel_layout::ROC_CHANNEL_LAYOUT_MULTITRACK) {
-                spec.channels as u32
-            } else {
-                0
-            },
+            channels: roc::roc_channel_layout::ROC_CHANNEL_LAYOUT_MULTITRACK,
+            tracks: spec.channels as u32,
         },
-        packet_encoding: 0,
+        packet_encoding,
         packet_length: 0,
         packet_interleaving: 0,
         fec_encoding: if spec.fec {
@@ -88,11 +87,6 @@ fn run(
         target_latency: 0,
         latency_tolerance: 0,
     };
-
-    // For non-stereo/mono we must register a custom packet encoding.
-    if matches!(channels, roc::roc_channel_layout::ROC_CHANNEL_LAYOUT_MULTITRACK) {
-        cfg.packet_encoding = super::ensure_multitrack_encoding(ctx.raw(), spec.rate, spec.channels);
-    }
 
     let mut sender: *mut roc::roc_sender = std::ptr::null_mut();
     let rc = unsafe { roc::roc_sender_open(ctx.raw(), &cfg, &mut sender) };
@@ -171,14 +165,5 @@ fn run(
     Ok(())
 }
 
-pub(super) fn channel_layout_for(ch: u8) -> roc::roc_channel_layout {
-    channel_layout(ch)
-}
-
-fn channel_layout(ch: u8) -> roc::roc_channel_layout {
-    match ch {
-        1 => roc::roc_channel_layout::ROC_CHANNEL_LAYOUT_MONO,
-        2 => roc::roc_channel_layout::ROC_CHANNEL_LAYOUT_STEREO,
-        _ => roc::roc_channel_layout::ROC_CHANNEL_LAYOUT_MULTITRACK,
-    }
-}
+// (Channel-layout helpers are no longer needed — we always use MULTITRACK
+// with a custom packet encoding registered per (rate, channels) tuple.)
