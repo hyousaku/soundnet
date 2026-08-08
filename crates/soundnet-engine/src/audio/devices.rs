@@ -1,9 +1,20 @@
 //! Enumerate ALSA capture/playback devices and stash them in EngineState.
 //!
-//! Uses `snd_device_name_hint` (via `alsa::device_name::HintIter`) which is
-//! ALSA's recommended device discovery entry point — it returns everything the
-//! user's `~/.asoundrc` and the system configuration knows about
-//! (`hw:*,*`, `plughw:*,*`, `default`, PipeWire, etc.).
+//! We walk the sound cards directly with `alsa::Card::iter` and, for each
+//! (card, device, direction), synthesize two ports:
+//!
+//! * a `plughw:C,D` entry — the friendly, always-openable one that
+//!   auto-converts rate / format / channel count. Default choice for the UI.
+//! * a `hw:C,D` entry — the raw device, for advanced users who want the
+//!   lowest possible latency and know their sample-rate / format matches
+//!   the hardware exactly.
+//!
+//! We deliberately skip the `default:` / `sysdefault:` / `dmix:` / `dsnoop:`
+//! / `surround*:` / `front:` / `iec958:` aliases that ALSA's hint API would
+//! otherwise return: most of them either duplicate the hardware or require
+//! very specific channel/format combinations that our per-route spec
+//! doesn't match — leaving them on the list just gave the user a bunch of
+//! broken destinations.
 
 use anyhow::Result;
 use soundnet_protocol::{LocalPort, PortKind, SampleFormat};
@@ -26,31 +37,50 @@ pub fn refresh(state: &Arc<EngineState>) -> Result<()> {
         .local_ports
         .retain(|_, port| matches!(port.kind, PortKind::Tone));
 
-    let hints = alsa::device_name::HintIter::new_str(None, "pcm")?;
-    for hint in hints {
-        let Some(name) = hint.name else { continue };
-        if name == "null" {
-            continue;
-        }
-        // Skip most `plughw:` duplicates — expose the plain hw entry only.
-        // We keep `default` since it's the friendly per-user route.
-        if name.starts_with("plughw:") || name.starts_with("sysdefault") {
-            continue;
-        }
+    for card in alsa::card::Iter::new().flatten() {
+        let card_idx = card.get_index();
+        let card_name = card
+            .get_name()
+            .unwrap_or_else(|_| format!("card{card_idx}"));
 
-        let desc = hint
-            .desc
-            .as_ref()
-            .and_then(|d| d.lines().next().map(|s| s.to_string()))
-            .unwrap_or_else(|| name.clone());
+        let ctl = match alsa::Ctl::from_card(&card, false) {
+            Ok(c) => c,
+            Err(err) => {
+                tracing::debug!("card {card_idx} ({card_name}) ctl open: {err}");
+                continue;
+            }
+        };
 
-        match hint.direction {
-            Some(alsa::Direction::Capture) => add_port(state, &name, &desc, PortKind::Capture),
-            Some(alsa::Direction::Playback) => add_port(state, &name, &desc, PortKind::Playback),
-            None => {
-                // Duplex — expose both.
-                add_port(state, &name, &desc, PortKind::Capture);
-                add_port(state, &name, &desc, PortKind::Playback);
+        for device_idx in alsa::ctl::DeviceIter::new(&ctl) {
+            for dir in [alsa::Direction::Capture, alsa::Direction::Playback] {
+                let info = match ctl.pcm_info(device_idx as u32, 0, dir) {
+                    Ok(i) => i,
+                    Err(_) => continue, // this direction not supported on this device
+                };
+                let dev_name = info.get_name().unwrap_or("").to_string();
+                let kind = match dir {
+                    alsa::Direction::Capture => PortKind::Capture,
+                    alsa::Direction::Playback => PortKind::Playback,
+                };
+
+                // Preferred: plughw — libasound converts rate/format/channels
+                // on the fly, so almost any route spec will Just Work.
+                add_port(
+                    state,
+                    &format!("plughw:{card_idx},{device_idx}"),
+                    &format!("{card_name} — {dev_name}"),
+                    kind,
+                    /* raw */ false,
+                );
+
+                // Also expose the raw device for advanced/low-latency use.
+                add_port(
+                    state,
+                    &format!("hw:{card_idx},{device_idx}"),
+                    &format!("{card_name} — {dev_name}"),
+                    kind,
+                    /* raw */ true,
+                );
             }
         }
     }
@@ -59,7 +89,13 @@ pub fn refresh(state: &Arc<EngineState>) -> Result<()> {
     Ok(())
 }
 
-fn add_port(state: &Arc<EngineState>, alsa_name: &str, desc: &str, kind: PortKind) {
+fn add_port(
+    state: &Arc<EngineState>,
+    alsa_name: &str,
+    hardware_label: &str,
+    kind: PortKind,
+    raw: bool,
+) {
     let dir = match kind {
         PortKind::Capture => alsa::Direction::Capture,
         PortKind::Playback => alsa::Direction::Playback,
@@ -67,15 +103,20 @@ fn add_port(state: &Arc<EngineState>, alsa_name: &str, desc: &str, kind: PortKin
     };
 
     let (max_channels, formats, rates) = probe(alsa_name, dir);
-    let id = format!(
-        "{}_{}",
-        alsa_name.replace([':', ',', '/', ' '], "_"),
-        if matches!(kind, PortKind::Capture) { "in" } else { "out" }
-    );
-    let label = format!(
-        "{desc} ({})",
-        if matches!(kind, PortKind::Capture) { "in" } else { "out" }
-    );
+    let id = alsa_name.replace([':', ',', '/', ' '], "_")
+        + match kind {
+            PortKind::Capture => "_in",
+            PortKind::Playback => "_out",
+            PortKind::Tone => "",
+        };
+    let dir_label = match kind {
+        PortKind::Capture => "in",
+        PortKind::Playback => "out",
+        PortKind::Tone => "",
+    };
+    let mode_label = if raw { " · low-latency" } else { "" };
+    let label = format!("{hardware_label} ({dir_label}{mode_label})");
+
     state.local_ports.insert(
         id.clone(),
         LocalPort {
