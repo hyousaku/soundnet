@@ -64,3 +64,44 @@ pub(crate) fn endpoint_free(ep: *mut roc::roc_endpoint) {
         unsafe { roc::roc_endpoint_deallocate(ep) };
     }
 }
+
+/// Deterministic encoding id for a given multitrack (rate, channels) tuple.
+/// Both sender and receiver derive the same id so they agree on the wire
+/// format. Range chosen to stay inside the valid RTP payload-type range
+/// [1;127] but well clear of standard AVP assignments (≤ 34).
+pub fn multitrack_encoding_id(rate: u32, channels: u8) -> i32 {
+    // 8-bit channels + rate index → 100..126. Only a handful of rates are
+    // enumerated in the UI so this is comfortably unique.
+    let rate_idx = match rate {
+        44_100 => 0,
+        48_000 => 1,
+        88_200 => 2,
+        96_000 => 3,
+        _ => 4,
+    };
+    // ids are [100, 126]; channels 1..=8 * 5 rate slots = 40 combinations.
+    let combo = (channels as i32).clamp(1, 8) * 5 + rate_idx;
+    100 + (combo % 27) // stays in [100, 126]
+}
+
+/// Register the multitrack encoding for (rate, channels) if not already
+/// registered on this context. `EEXIST` (returned as a negative value) is
+/// treated as success — the encoding is already there and the same shape.
+pub fn ensure_multitrack_encoding(
+    ctx: *mut roc::roc_context,
+    rate: u32,
+    channels: u8,
+) -> i32 {
+    let id = multitrack_encoding_id(rate, channels);
+    let enc = roc::roc_media_encoding {
+        rate,
+        format: roc::roc_format::ROC_FORMAT_PCM_FLOAT32,
+        channels: roc::roc_channel_layout::ROC_CHANNEL_LAYOUT_MULTITRACK,
+        tracks: channels as u32,
+    };
+    let rc = unsafe { roc::roc_context_register_encoding(ctx, id, &enc) };
+    if rc != 0 {
+        tracing::debug!("register_encoding({id}, rate={rate}, ch={channels}) rc={rc} (likely already registered)");
+    }
+    id
+}

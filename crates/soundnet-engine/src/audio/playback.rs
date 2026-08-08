@@ -74,9 +74,9 @@ fn worker(
         let hwp = alsa::pcm::HwParams::any(&pcm)?;
         hwp.set_access(alsa::pcm::Access::RWInterleaved)?;
         hwp.set_format(to_alsa_format(spec.alsa_format))?;
-        hwp.set_channels(spec.channels as u32)?;
-        hwp.set_rate(spec.rate, alsa::ValueOr::Nearest)?;
-        hwp.set_period_size(spec.frames_per_period as i64, alsa::ValueOr::Nearest)?;
+        hwp.set_channels_near(spec.channels as u32)?;
+        hwp.set_rate_near(spec.rate, alsa::ValueOr::Nearest)?;
+        hwp.set_period_size_near(spec.frames_per_period as i64, alsa::ValueOr::Nearest)?;
         hwp.set_periods(3, alsa::ValueOr::Nearest)?;
         pcm.hw_params(&hwp)?;
     }
@@ -90,6 +90,11 @@ fn worker(
     let mut raw: Vec<u8> = Vec::with_capacity(period_frames * frame_bytes);
 
     while !stop.load(Ordering::Relaxed) {
+        // If the roc receiver worker died, don't spin forever writing silence.
+        if cons.is_abandoned() && cons.slots() == 0 {
+            tracing::info!("playback: receiver upstream gone, exiting");
+            break;
+        }
         // Drain up to a period. Fill silence if underrun.
         for slot in floats.iter_mut() {
             *slot = cons.pop().unwrap_or(0.0);

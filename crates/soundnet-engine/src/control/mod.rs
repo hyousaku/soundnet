@@ -2,16 +2,27 @@ pub mod web;
 pub mod ws;
 
 use anyhow::Result;
-use axum::extract::State;
+use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Json};
 use axum::routing::{delete, get, post};
 use axum::Router;
+use serde::Deserialize;
 use soundnet_protocol::{Route, StateSnapshot};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::trace::TraceLayer;
+
+#[derive(Debug, Deserialize)]
+pub struct GossipQuery {
+    /// When explicitly `false` (from another engine), don't gossip back or
+    /// we'll create an add/remove loop.
+    #[serde(default = "default_true")]
+    gossip: bool,
+}
+
+fn default_true() -> bool { true }
 
 use crate::routing;
 use crate::state::EngineState;
@@ -61,12 +72,13 @@ async fn state_handler(State(state): State<Arc<EngineState>>) -> impl IntoRespon
 
 async fn add_route_handler(
     State(state): State<Arc<EngineState>>,
+    Query(q): Query<GossipQuery>,
     Json(mut route): Json<Route>,
 ) -> impl IntoResponse {
     if route.id.is_empty() {
         route.id = uuid::Uuid::new_v4().to_string();
     }
-    match routing::apply_route(&state, route.clone()).await {
+    match routing::apply_route(&state, route.clone(), q.gossip).await {
         Ok(()) => (StatusCode::CREATED, Json(route)).into_response(),
         Err(err) => (
             StatusCode::BAD_REQUEST,
@@ -78,8 +90,9 @@ async fn add_route_handler(
 
 async fn remove_route_handler(
     State(state): State<Arc<EngineState>>,
+    Query(q): Query<GossipQuery>,
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> impl IntoResponse {
-    routing::remove_route(&state, &id).await;
+    routing::remove_route(&state, &id, q.gossip).await;
     StatusCode::NO_CONTENT
 }

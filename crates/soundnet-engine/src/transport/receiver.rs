@@ -83,13 +83,7 @@ fn run(
     };
 
     if matches!(channels, roc::roc_channel_layout::ROC_CHANNEL_LAYOUT_MULTITRACK) {
-        let enc = roc::roc_media_encoding {
-            rate: spec.rate,
-            format: roc::roc_format::ROC_FORMAT_PCM_FLOAT32,
-            channels,
-            tracks: spec.channels as u32,
-        };
-        unsafe { roc::roc_context_register_encoding(ctx.raw(), 100, &enc) };
+        super::ensure_multitrack_encoding(ctx.raw(), spec.rate, spec.channels);
     }
 
     let mut receiver: *mut roc::roc_receiver = std::ptr::null_mut();

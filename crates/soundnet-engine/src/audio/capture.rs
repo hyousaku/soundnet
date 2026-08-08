@@ -78,9 +78,11 @@ fn alsa_worker(
         let hwp = alsa::pcm::HwParams::any(&pcm)?;
         hwp.set_access(alsa::pcm::Access::RWInterleaved)?;
         hwp.set_format(to_alsa_format(spec.alsa_format))?;
-        hwp.set_channels(spec.channels as u32)?;
-        hwp.set_rate(spec.rate, alsa::ValueOr::Nearest)?;
-        hwp.set_period_size(spec.frames_per_period as i64, alsa::ValueOr::Nearest)?;
+        // *_near variants let the driver pick the closest supported value —
+        // USB DACs commonly reject exact rate/period requests.
+        hwp.set_channels_near(spec.channels as u32)?;
+        hwp.set_rate_near(spec.rate, alsa::ValueOr::Nearest)?;
+        hwp.set_period_size_near(spec.frames_per_period as i64, alsa::ValueOr::Nearest)?;
         hwp.set_periods(3, alsa::ValueOr::Nearest)?;
         pcm.hw_params(&hwp)?;
     }

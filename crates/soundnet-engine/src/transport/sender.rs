@@ -85,16 +85,7 @@ fn run(
 
     // For non-stereo/mono we must register a custom packet encoding.
     if matches!(channels, roc::roc_channel_layout::ROC_CHANNEL_LAYOUT_MULTITRACK) {
-        // Reserve encoding id 100 for our multi-track PCM.
-        let enc = roc::roc_media_encoding {
-            rate: spec.rate,
-            format: roc::roc_format::ROC_FORMAT_PCM_FLOAT32,
-            channels,
-            tracks: spec.channels as u32,
-        };
-        // Idempotent — errors when already registered, which is fine.
-        unsafe { roc::roc_context_register_encoding(ctx.raw(), 100, &enc) };
-        cfg.packet_encoding = 100;
+        cfg.packet_encoding = super::ensure_multitrack_encoding(ctx.raw(), spec.rate, spec.channels);
     }
 
     let mut sender: *mut roc::roc_sender = std::ptr::null_mut();
@@ -153,9 +144,12 @@ fn run(
     let mut buf: Vec<f32> = vec![0.0; period_samples];
 
     while !stop.load(Ordering::Relaxed) {
-        // Wait until at least one period is available; if the capture side is
-        // slow, fill silence rather than starve roc (which would drift target
-        // latency).
+        // If the capture worker died, its Producer has been dropped and the
+        // ring is abandoned — no point streaming silence forever.
+        if consumer.is_abandoned() && consumer.slots() == 0 {
+            tracing::info!("sender: capture upstream gone, exiting");
+            break;
+        }
         for slot in buf.iter_mut() {
             *slot = consumer.pop().unwrap_or(0.0);
         }

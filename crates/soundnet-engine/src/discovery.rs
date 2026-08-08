@@ -190,7 +190,11 @@ async fn fetch_peer_state(state: &Arc<EngineState>, node: Node) {
             let ports: Vec<LocalPort> = snap.local_ports;
             let record = PeerRecord { node: node.clone(), ports: ports.clone() };
             state.peers.insert(node.id.clone(), record);
-            let _ = state.events.send(ServerMsg::NodeAppeared { node, ports });
+            let _ = state
+                .events
+                .send(ServerMsg::NodeAppeared { node: node.clone(), ports });
+            // Retry any routes that were waiting for this peer.
+            routing::retry_pending_for_peer(state, &node.id).await;
         }
         Ok(Err(err)) => tracing::warn!("failed to fetch peer state from {}:{}: {err:#}", node.addr, node.port),
         Err(err) => tracing::warn!("peer state task panicked: {err}"),

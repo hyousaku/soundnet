@@ -82,10 +82,13 @@ async fn main() -> Result<()> {
         discovery::probe_manual(state.clone(), mh.addr.clone(), mh.port);
     }
 
-    // Restore persisted routes.
+    // Restore persisted routes into state.routes. try_start will pick them up
+    // once the referenced peers appear via mDNS (or the manual host probe).
     for route in cfg.routes.iter().cloned() {
-        if let Err(err) = routing::apply_route(&state, route).await {
-            tracing::warn!("failed to restore route: {err:?}");
+        state.routes.insert(route.id.clone(), route.clone());
+        // If it references only self, try to start it right away.
+        if let Err(err) = routing::try_start(&state, &route).await {
+            tracing::debug!("restore: route {} pending: {err:#}", route.id);
         }
     }
 

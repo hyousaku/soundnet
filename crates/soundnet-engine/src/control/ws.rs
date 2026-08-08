@@ -46,8 +46,11 @@ async fn serve_socket(socket: WebSocket, state: Arc<EngineState>) {
         let parsed: Result<ClientMsg, _> = serde_json::from_str(&text);
         match parsed {
             Ok(ClientMsg::Hello) => {}
-            Ok(ClientMsg::AddRoute { route }) => {
-                if let Err(err) = routing::apply_route(&state, route).await {
+            Ok(ClientMsg::AddRoute { mut route }) => {
+                if route.id.is_empty() {
+                    route.id = uuid::Uuid::new_v4().to_string();
+                }
+                if let Err(err) = routing::apply_route(&state, route, true).await {
                     tracing::warn!("ws add_route failed: {err:#}");
                     let _ = state
                         .events
@@ -55,12 +58,12 @@ async fn serve_socket(socket: WebSocket, state: Arc<EngineState>) {
                 }
             }
             Ok(ClientMsg::RemoveRoute { id }) => {
-                routing::remove_route(&state, &id).await;
+                routing::remove_route(&state, &id, true).await;
             }
             Ok(ClientMsg::UpdateSpec { id, spec }) => {
                 if let Some(mut route) = state.routes.get(&id).map(|r| r.clone()) {
                     route.spec = spec;
-                    if let Err(err) = routing::apply_route(&state, route.clone()).await {
+                    if let Err(err) = routing::apply_route(&state, route.clone(), true).await {
                         tracing::warn!("ws update_spec failed: {err:#}");
                     } else {
                         let _ = state.events.send(ServerMsg::RouteUpdated { route });

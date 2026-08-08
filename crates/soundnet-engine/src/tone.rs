@@ -30,14 +30,6 @@ pub fn register_default_tones(state: &Arc<EngineState>) {
     }
 }
 
-/// Parse the frequency out of `tone:440`. Returns 440 if malformed.
-pub fn parse_frequency(alsa_name: &str) -> f32 {
-    alsa_name
-        .strip_prefix(TONE_PREFIX)
-        .and_then(|s| s.parse::<f32>().ok())
-        .unwrap_or(440.0)
-}
-
 /// Fill `out` with `frames` frames of interleaved sine at `freq`, advancing
 /// `phase` (radians, 0..2π) in-place. Amplitude is fixed at -12 dBFS.
 pub fn generate(freq: f32, rate: u32, channels: u8, frames: usize, phase: &mut f32, out: &mut Vec<f32>) {
