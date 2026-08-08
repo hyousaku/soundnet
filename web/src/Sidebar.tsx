@@ -4,6 +4,10 @@ export default function Sidebar() {
   const nodes = useStore((s) => s.nodes);
   const ports = useStore((s) => s.ports);
   const self = useStore((s) => s.self);
+  const manualHosts = useStore((s) => s.manualHosts);
+  const send = useStore((s) => s.send);
+
+  const peers = Object.values(nodes).filter((n) => n.id !== self?.id);
 
   return (
     <aside className="sidebar">
@@ -15,16 +19,34 @@ export default function Sidebar() {
       )}
 
       <h2>Peers on the LAN</h2>
-      {Object.values(nodes)
-        .filter((n) => n.id !== self?.id)
-        .map((n) => (
-          <NodeSection key={n.id} node={n} ports={ports[n.id] ?? []} />
-        ))}
-      {Object.values(nodes).length <= 1 && (
+      {peers.map((n) => (
+        <NodeSection key={n.id} node={n} ports={ports[n.id] ?? []} />
+      ))}
+      {peers.length === 0 && (
         <div className="hint">
           No peers discovered yet. Make sure `soundnet-engine` is running on the
           other host and mDNS traffic isn't blocked between the two.
         </div>
+      )}
+
+      {manualHosts.length > 0 && (
+        <>
+          <h2>Manually-added hosts</h2>
+          {manualHosts.map((h) => (
+            <div key={`${h.addr}:${h.port}`} className="node-card"
+                 style={{ display: "flex", justifyContent: "space-between",
+                          alignItems: "center", padding: "6px 10px" }}>
+              <span style={{ fontSize: 12 }}>{h.addr}:{h.port}</span>
+              <button
+                onClick={() => send({ type: "remove_manual_host", addr: h.addr, port: h.port })}
+                title="Forget this host"
+                style={{ padding: "2px 8px", fontSize: 11 }}
+              >
+                ×
+              </button>
+            </div>
+          ))}
+        </>
       )}
     </aside>
   );

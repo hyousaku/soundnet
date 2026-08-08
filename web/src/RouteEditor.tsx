@@ -40,6 +40,7 @@ export default function RouteEditor() {
             <th>FEC</th>
             <th>Level</th>
             <th>e2e</th>
+            <th>jitter</th>
             <th>xr</th>
             <th></th>
           </tr>
@@ -106,6 +107,7 @@ export default function RouteEditor() {
                 <LevelMeter db={stats[r.id]?.level_db ?? -120} />
               </td>
               <td>{stats[r.id] ? `${stats[r.id].e2e_latency_ms.toFixed(1)} ms` : "—"}</td>
+              <td>{stats[r.id] ? `${stats[r.id].jitter_ms.toFixed(2)} ms` : "—"}</td>
               <td>{stats[r.id]?.xruns ?? 0}</td>
               <td>
                 <button onClick={() => send({ type: "remove_route", id: r.id })}>

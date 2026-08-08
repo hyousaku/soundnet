@@ -125,6 +125,14 @@ pub struct StreamStats {
     pub e2e_latency_ms: f32,
 }
 
+/// A host the user added manually (mDNS was blocked / offline). Rendered in
+/// the sidebar with a delete button so the operator can drop it if it moves.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ManualHost {
+    pub addr: String,
+    pub port: u16,
+}
+
 /// Full state snapshot pushed on connect.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StateSnapshot {
@@ -133,6 +141,8 @@ pub struct StateSnapshot {
     pub local_ports: Vec<LocalPort>,
     pub remote_ports: Vec<LocalPort>,
     pub routes: Vec<Route>,
+    #[serde(default)]
+    pub manual_hosts: Vec<ManualHost>,
 }
 
 // ---------- WS client -> server ----------

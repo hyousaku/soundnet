@@ -23,7 +23,7 @@ async fn serve_socket(socket: WebSocket, state: Arc<EngineState>) {
     let (mut sink, mut stream) = socket.split();
 
     // Snapshot on connect so the browser has a full picture up front.
-    let snap = super::snapshot(&state);
+    let snap = super::snapshot(&state).await;
     if let Ok(json) = serde_json::to_string(&ServerMsg::State { snapshot: snap }) {
         let _ = sink.send(Message::Text(json)).await;
     }

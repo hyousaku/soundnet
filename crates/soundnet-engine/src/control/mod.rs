@@ -44,7 +44,7 @@ pub async fn serve(state: Arc<EngineState>, addr: SocketAddr) -> Result<()> {
 }
 
 /// Build a snapshot for a fresh client.
-pub fn snapshot(state: &Arc<EngineState>) -> StateSnapshot {
+pub async fn snapshot(state: &Arc<EngineState>) -> StateSnapshot {
     let self_node = state.self_node();
 
     let local_ports: Vec<_> = state.local_ports.iter().map(|e| e.value().clone()).collect();
@@ -56,6 +56,7 @@ pub fn snapshot(state: &Arc<EngineState>) -> StateSnapshot {
         remote_ports.extend(entry.ports.iter().cloned());
     }
     let routes: Vec<_> = state.routes.iter().map(|e| e.value().clone()).collect();
+    let manual_hosts = state.manual_hosts.read().await.clone();
 
     StateSnapshot {
         self_node,
@@ -63,11 +64,12 @@ pub fn snapshot(state: &Arc<EngineState>) -> StateSnapshot {
         local_ports,
         remote_ports,
         routes,
+        manual_hosts,
     }
 }
 
 async fn state_handler(State(state): State<Arc<EngineState>>) -> impl IntoResponse {
-    Json(snapshot(&state))
+    Json(snapshot(&state).await)
 }
 
 async fn add_route_handler(

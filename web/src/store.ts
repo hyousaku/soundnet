@@ -2,6 +2,7 @@ import { create } from "zustand";
 import type {
   ClientMsg,
   LocalPort,
+  ManualHost,
   Node,
   NodeId,
   Route,
@@ -18,6 +19,7 @@ interface Store {
   ports: Record<NodeId, LocalPort[]>;
   routes: Record<RouteId, Route>;
   stats: Record<RouteId, StreamStats>;
+  manualHosts: ManualHost[];
   send: (msg: ClientMsg) => void;
   _socket?: WebSocket;
   _connect: () => void;
@@ -29,6 +31,7 @@ export const useStore = create<Store>((set, get) => ({
   ports: {},
   routes: {},
   stats: {},
+  manualHosts: [],
   send: (msg) => {
     const ws = get()._socket;
     if (ws && ws.readyState === WebSocket.OPEN) {
@@ -80,7 +83,13 @@ function applyServerMsg(
       }
       for (const r of snap.routes) routes[r.id] = r;
 
-      set({ self: snap.self_node, nodes, ports, routes });
+      set({
+        self: snap.self_node,
+        nodes,
+        ports,
+        routes,
+        manualHosts: snap.manual_hosts ?? [],
+      });
       break;
     }
     case "node_appeared":

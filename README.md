@@ -50,6 +50,13 @@ box.
 - (Recommended) `PREEMPT_RT` kernel and membership in the `audio` group for
   real-time scheduling
 
+> **libroc + FEC:** Debian's `libroc0.3` binary is currently built **without**
+> FEC support. If you try a route with `fec: true` and get
+> `roc_fec: codec map: no codec available for fec scheme 'rs8m'`, either
+> uncheck FEC in the route editor, or build roc-toolkit from source with
+> `--with-openfec` and install the resulting `libroc.so` — then FEC works.
+> Raspberry Pi OS ships the same Debian package, so the same note applies.
+
 ## Build dependencies
 
 - Rust stable (`rustup default stable`)

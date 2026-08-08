@@ -143,7 +143,7 @@ pub async fn add_manual(state: &Arc<EngineState>, addr: String, port: u16) {
         let mut hosts = state.manual_hosts.write().await;
         let already = hosts.iter().any(|h| h.addr == addr && h.port == port);
         if !already {
-            hosts.push(crate::config::ManualHost { addr: addr.clone(), port });
+            hosts.push(soundnet_protocol::ManualHost { addr: addr.clone(), port });
         }
     }
     routing::persist(state).await;

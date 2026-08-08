@@ -17,6 +17,9 @@ pub struct ReceiverHandle {
     /// Last observed end-to-end latency in nanoseconds, refreshed every ~200ms
     /// by the receiver thread via `roc_receiver_query`.
     pub e2e_latency_ns: Arc<AtomicU64>,
+    /// Rolling standard deviation of `niq_latency` in nanoseconds — a proxy
+    /// for network jitter. Small = smooth stream, big = jittery.
+    pub jitter_ns: Arc<AtomicU64>,
 }
 
 impl ReceiverHandle {
@@ -36,18 +39,20 @@ pub fn spawn(
     let stop = Arc::new(AtomicBool::new(false));
     let stop_worker = stop.clone();
     let e2e = Arc::new(AtomicU64::new(0));
+    let jitter = Arc::new(AtomicU64::new(0));
     let e2e_worker = e2e.clone();
+    let jitter_worker = jitter.clone();
     let bind_host = bind_host.to_string();
     let spec = spec.clone();
 
     let thread = thread::Builder::new()
         .name(format!("roc-rx-{bind_host}-{bind_port}"))
         .spawn(move || {
-            if let Err(err) = run(&ctx, &bind_host, bind_port, &spec, &mut producer, &stop_worker, &e2e_worker) {
+            if let Err(err) = run(&ctx, &bind_host, bind_port, &spec, &mut producer, &stop_worker, &e2e_worker, &jitter_worker) {
                 tracing::error!("receiver on {bind_host}:{bind_port} failed: {err:#}");
             }
         })?;
-    Ok(ReceiverHandle { stop, thread, e2e_latency_ns: e2e })
+    Ok(ReceiverHandle { stop, thread, e2e_latency_ns: e2e, jitter_ns: jitter })
 }
 
 fn run(
@@ -58,6 +63,7 @@ fn run(
     producer: &mut Producer<f32>,
     stop: &Arc<AtomicBool>,
     e2e_out: &Arc<AtomicU64>,
+    jitter_out: &Arc<AtomicU64>,
 ) -> Result<()> {
     let channels = super::sender::channel_layout_for(spec.channels);
     let cfg = roc::roc_receiver_config {
@@ -143,6 +149,10 @@ fn run(
     let metrics_every = (spec.rate as usize / 5 / period_frames.max(1)).max(1);
     let mut ticks = 0_usize;
 
+    // Rolling window of niq_latency samples (ns), for jitter (stddev).
+    const NIQ_WINDOW: usize = 32;
+    let mut niq_hist = std::collections::VecDeque::<u64>::with_capacity(NIQ_WINDOW);
+
     while !stop.load(Ordering::Relaxed) {
         let mut frame = roc::roc_frame {
             samples: buf.as_mut_ptr() as *mut _,
@@ -173,8 +183,30 @@ fn run(
             if rc == 0 {
                 let n = metrics.num_sessions.min(sessions.len() as u32) as usize;
                 // Report the largest e2e_latency across sessions (worst case).
-                let worst = sessions[..n].iter().map(|s| s.e2e_latency).max().unwrap_or(0);
-                e2e_out.store(worst, Ordering::Relaxed);
+                let worst_e2e = sessions[..n].iter().map(|s| s.e2e_latency).max().unwrap_or(0);
+                e2e_out.store(worst_e2e, Ordering::Relaxed);
+
+                // Feed the largest niq_latency into the rolling window and
+                // recompute stddev in ns.
+                let worst_niq = sessions[..n].iter().map(|s| s.niq_latency).max().unwrap_or(0);
+                if worst_niq > 0 {
+                    if niq_hist.len() == NIQ_WINDOW {
+                        niq_hist.pop_front();
+                    }
+                    niq_hist.push_back(worst_niq);
+                    if niq_hist.len() >= 2 {
+                        let mean = niq_hist.iter().sum::<u64>() as f64 / niq_hist.len() as f64;
+                        let var = niq_hist
+                            .iter()
+                            .map(|&v| {
+                                let d = v as f64 - mean;
+                                d * d
+                            })
+                            .sum::<f64>()
+                            / niq_hist.len() as f64;
+                        jitter_out.store(var.sqrt() as u64, Ordering::Relaxed);
+                    }
+                }
             }
         }
     }

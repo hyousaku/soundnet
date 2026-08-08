@@ -2,6 +2,7 @@
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
+pub use soundnet_protocol::ManualHost;
 use soundnet_protocol::Route;
 use std::path::{Path, PathBuf};
 
@@ -11,12 +12,6 @@ pub struct Config {
     pub routes: Vec<Route>,
     #[serde(default)]
     pub manual_hosts: Vec<ManualHost>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ManualHost {
-    pub addr: String,
-    pub port: u16,
 }
 
 impl Config {

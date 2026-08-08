@@ -14,9 +14,9 @@
 //! Route add/remove is gossiped between engines over HTTP so both endpoints
 //! spin up their side without the browser having to talk to both.
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use once_cell::sync::Lazy;
-use soundnet_protocol::{Route, ServerMsg, StreamStats};
+use soundnet_protocol::{PortKind, Route, ServerMsg, StreamStats};
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -39,6 +39,7 @@ pub struct RunningRoute {
     pub level_bits: Option<Arc<AtomicU32>>,
     pub xruns: Option<Arc<AtomicUsize>>,
     pub e2e_ns: Option<Arc<AtomicU64>>,
+    pub jitter_ns: Option<Arc<AtomicU64>>,
 }
 
 /// One process-wide roc context — allocating per Route would explode the
@@ -85,6 +86,8 @@ pub fn is_local_dst(state: &Arc<EngineState>, route: &Route) -> bool {
 /// **Not fatal if endpoints aren't reachable yet** — the route lives in
 /// `state.routes` regardless and `try_start` retries on peer discovery.
 pub async fn apply_route(state: &Arc<EngineState>, route: Route, gossip: bool) -> Result<()> {
+    validate_route(state, &route)?;
+
     let is_new_or_changed = state
         .routes
         .get(&route.id)
@@ -112,6 +115,37 @@ pub async fn apply_route(state: &Arc<EngineState>, route: Route, gossip: bool) -
     Ok(())
 }
 
+/// Reject obviously invalid routes before they touch any hardware.
+fn validate_route(state: &Arc<EngineState>, route: &Route) -> Result<()> {
+    // If the port is on THIS engine we can check its kind — Tone/Capture
+    // ports are inputs only, Playback ports are outputs only. For ports on
+    // remote peers we trust the peer to reject bogus requests.
+    if is_local_src(state, route) {
+        if let Some(p) = state.local_ports.get(&route.src.port_id) {
+            if matches!(p.kind, PortKind::Playback) {
+                bail!("src port {} is a Playback port; sources must be Capture or Tone", route.src.port_id);
+            }
+        }
+    }
+    if is_local_dst(state, route) {
+        if let Some(p) = state.local_ports.get(&route.dst.port_id) {
+            if !matches!(p.kind, PortKind::Playback) {
+                bail!(
+                    "dst port {} is a {:?} port; destinations must be Playback",
+                    route.dst.port_id, p.kind
+                );
+            }
+        }
+    }
+    if route.spec.channels == 0 {
+        bail!("channels must be >= 1");
+    }
+    if route.spec.frames_per_period == 0 {
+        bail!("frames_per_period must be >= 1");
+    }
+    Ok(())
+}
+
 /// Try to spawn the local workers for this route. Returns an error if the
 /// required endpoints aren't currently available (e.g. the peer hasn't been
 /// discovered yet); callers should keep the route in state and retry later.
@@ -121,7 +155,7 @@ pub async fn try_start(state: &Arc<EngineState>, route: &Route) -> Result<()> {
     }
     let mut running = RunningRoute {
         cap: None, tx: None, rx: None, pb: None,
-        level_bits: None, xruns: None, e2e_ns: None,
+        level_bits: None, xruns: None, e2e_ns: None, jitter_ns: None,
     };
 
     if is_local_src(state, route) {
@@ -130,11 +164,17 @@ pub async fn try_start(state: &Arc<EngineState>, route: &Route) -> Result<()> {
             .get(&route.src.port_id)
             .map(|p| p.clone())
             .ok_or_else(|| anyhow!("unknown local src port {}", route.src.port_id))?;
-        let dst_node = state
-            .peers
-            .get(&route.dst.node_id)
-            .map(|r| r.node.clone())
-            .with_context(|| format!("unknown dst peer {}", route.dst.node_id))?;
+        // Self-loop: dst is us too — send to our own audio port on loopback,
+        // no peer lookup needed. (Useful for local tone → local playback tests.)
+        let dst_node = if is_local_dst(state, route) {
+            state.self_node()
+        } else {
+            state
+                .peers
+                .get(&route.dst.node_id)
+                .map(|r| r.node.clone())
+                .with_context(|| format!("unknown dst peer {}", route.dst.node_id))?
+        };
 
         let dst_port = route_port(dst_node.audio_port, &route.id);
         let cap = capture::spawn(&port.alsa_name, &route.spec)?;
@@ -169,6 +209,7 @@ pub async fn try_start(state: &Arc<EngineState>, route: &Route) -> Result<()> {
         running.level_bits = Some(pb.level_bits.clone());
         running.xruns = Some(pb.xruns.clone());
         running.e2e_ns = Some(receiver.e2e_latency_ns.clone());
+        running.jitter_ns = Some(receiver.jitter_ns.clone());
         running.rx = Some(receiver);
         running.pb = Some(pb.control);
     }
@@ -323,9 +364,14 @@ pub fn spawn_stats_pump(state: Arc<EngineState>) {
                     .as_ref()
                     .map(|n| n.load(Ordering::Relaxed) as f32 / 1_000_000.0)
                     .unwrap_or(0.0);
+                let jitter_ms = running
+                    .jitter_ns
+                    .as_ref()
+                    .map(|n| n.load(Ordering::Relaxed) as f32 / 1_000_000.0)
+                    .unwrap_or(0.0);
                 let stats = StreamStats {
                     xruns,
-                    jitter_ms: 0.0,
+                    jitter_ms,
                     level_db: if level > 0.0 { 20.0 * level.log10() } else { -120.0 },
                     e2e_latency_ms: e2e_ms,
                 };

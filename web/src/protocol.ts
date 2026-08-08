@@ -63,12 +63,18 @@ export interface StreamStats {
   e2e_latency_ms: number;
 }
 
+export interface ManualHost {
+  addr: string;
+  port: number;
+}
+
 export interface StateSnapshot {
   self_node: Node;
   nodes: Node[];
   local_ports: LocalPort[];
   remote_ports: LocalPort[];
   routes: Route[];
+  manual_hosts: ManualHost[];
 }
 
 export type ServerMsg =
