@@ -78,8 +78,8 @@ fn run(
             },
         },
         clock_source: roc::roc_clock_source::ROC_CLOCK_SOURCE_INTERNAL,
-        clock_sync_backend: roc::roc_clock_sync_backend::ROC_CLOCK_SYNC_BACKEND_DEFAULT,
-        clock_sync_profile: roc::roc_clock_sync_profile::ROC_CLOCK_SYNC_PROFILE_DEFAULT,
+        latency_tuner_backend: roc::roc_latency_tuner_backend::ROC_LATENCY_TUNER_BACKEND_DEFAULT,
+        latency_tuner_profile: roc::roc_latency_tuner_profile::ROC_LATENCY_TUNER_PROFILE_DEFAULT,
         resampler_backend: roc::roc_resampler_backend::ROC_RESAMPLER_BACKEND_DEFAULT,
         resampler_profile: roc::roc_resampler_profile::ROC_RESAMPLER_PROFILE_DEFAULT,
         target_latency: (spec.target_latency_ms as u64) * 1_000_000,
@@ -148,10 +148,7 @@ fn run(
     // How many periods between metric snapshots (~200ms cadence).
     let metrics_every = (spec.rate as usize / 5 / period_frames.max(1)).max(1);
     let mut ticks = 0_usize;
-
-    // Rolling window of niq_latency samples (ns), for jitter (stddev).
-    const NIQ_WINDOW: usize = 32;
-    let mut niq_hist = std::collections::VecDeque::<u64>::with_capacity(NIQ_WINDOW);
+    let _ = jitter_out; // libroc 0.4 dropped niq_latency, so jitter stays 0.
 
     while !stop.load(Ordering::Relaxed) {
         let mut frame = roc::roc_frame {
@@ -171,42 +168,23 @@ fn run(
         ticks += 1;
         if ticks >= metrics_every {
             ticks = 0;
-            let mut sessions = [roc::roc_session_metrics::default(); 4];
-            let mut metrics = roc::roc_receiver_metrics {
-                num_sessions: 0,
-                sessions: sessions.as_mut_ptr(),
-                sessions_size: sessions.len(),
-            };
+            let mut slot_metrics = roc::roc_receiver_metrics::default();
+            let mut conn = [roc::roc_connection_metrics::default(); 8];
+            let mut conn_count: usize = conn.len();
             let rc = unsafe {
-                roc::roc_receiver_query(receiver, roc::ROC_SLOT_DEFAULT, &mut metrics)
+                roc::roc_receiver_query(
+                    receiver,
+                    roc::ROC_SLOT_DEFAULT,
+                    &mut slot_metrics,
+                    conn.as_mut_ptr(),
+                    &mut conn_count,
+                )
             };
             if rc == 0 {
-                let n = metrics.num_sessions.min(sessions.len() as u32) as usize;
-                // Report the largest e2e_latency across sessions (worst case).
-                let worst_e2e = sessions[..n].iter().map(|s| s.e2e_latency).max().unwrap_or(0);
+                let n = conn_count.min(conn.len());
+                // Report the largest e2e_latency across connections.
+                let worst_e2e = conn[..n].iter().map(|c| c.e2e_latency).max().unwrap_or(0);
                 e2e_out.store(worst_e2e, Ordering::Relaxed);
-
-                // Feed the largest niq_latency into the rolling window and
-                // recompute stddev in ns.
-                let worst_niq = sessions[..n].iter().map(|s| s.niq_latency).max().unwrap_or(0);
-                if worst_niq > 0 {
-                    if niq_hist.len() == NIQ_WINDOW {
-                        niq_hist.pop_front();
-                    }
-                    niq_hist.push_back(worst_niq);
-                    if niq_hist.len() >= 2 {
-                        let mean = niq_hist.iter().sum::<u64>() as f64 / niq_hist.len() as f64;
-                        let var = niq_hist
-                            .iter()
-                            .map(|&v| {
-                                let d = v as f64 - mean;
-                                d * d
-                            })
-                            .sum::<f64>()
-                            / niq_hist.len() as f64;
-                        jitter_out.store(var.sqrt() as u64, Ordering::Relaxed);
-                    }
-                }
             }
         }
     }

@@ -45,17 +45,17 @@ box.
 ## Runtime dependencies
 
 - Linux kernel with ALSA (any modern distro)
-- `libroc` (roc-toolkit) 0.3+  — Debian/Ubuntu/Raspberry Pi OS: `libroc0.3`
+- **`libroc` (roc-toolkit) 0.4.x** — Debian trixie / Raspberry Pi OS trixie:
+  `libroc0.4`. Older `libroc0.3` (Ubuntu 24.04) is **not** ABI-compatible.
 - `libasound2` — usually already installed
 - (Recommended) `PREEMPT_RT` kernel and membership in the `audio` group for
   real-time scheduling
 
-> **libroc + FEC:** Debian's `libroc0.3` binary is currently built **without**
-> FEC support. If you try a route with `fec: true` and get
-> `roc_fec: codec map: no codec available for fec scheme 'rs8m'`, either
-> uncheck FEC in the route editor, or build roc-toolkit from source with
-> `--with-openfec` and install the resulting `libroc.so` — then FEC works.
-> Raspberry Pi OS ships the same Debian package, so the same note applies.
+> **FEC availability:** Debian trixie's `libroc0.4` is built **with** FEC
+> (pulls in `libopenfec`), so `fec: true` routes work out of the box. On
+> Ubuntu 24.04 the older `libroc0.3` package is built **without** FEC and
+> is also the wrong ABI for this project — either upgrade to trixie or
+> build roc-toolkit 0.4 from source with `--with-openfec`.
 
 ## Build dependencies
 

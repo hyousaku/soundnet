@@ -79,8 +79,14 @@ fn run(
         fec_block_source_packets: 0,
         fec_block_repair_packets: 0,
         clock_source: roc::roc_clock_source::ROC_CLOCK_SOURCE_INTERNAL,
+        latency_tuner_backend: roc::roc_latency_tuner_backend::ROC_LATENCY_TUNER_BACKEND_DEFAULT,
+        latency_tuner_profile: roc::roc_latency_tuner_profile::ROC_LATENCY_TUNER_PROFILE_DEFAULT,
         resampler_backend: roc::roc_resampler_backend::ROC_RESAMPLER_BACKEND_DEFAULT,
         resampler_profile: roc::roc_resampler_profile::ROC_RESAMPLER_PROFILE_DEFAULT,
+        // Latency tuning defaults are managed on the receiver side; keep
+        // sender-side tuning disabled by leaving these zero.
+        target_latency: 0,
+        latency_tolerance: 0,
     };
 
     // For non-stereo/mono we must register a custom packet encoding.

@@ -1,8 +1,25 @@
-//! Hand-written FFI bindings for libroc 0.3.x.
+//! Hand-written FFI bindings for libroc **0.4.x** (Debian trixie / Raspberry
+//! Pi OS trixie).
 //!
-//! Only the surface we actually need in `soundnet-engine` is exposed:
-//! context lifecycle, sender/receiver open/close, endpoint URI setup,
-//! bind/connect, frame read/write. Keep in sync with `/usr/include/roc/*.h`.
+//! Only the surface we actually need in `soundnet-engine` is exposed: context
+//! lifecycle, sender/receiver open/close, endpoint URI setup, bind/connect,
+//! frame read/write, and query. Keep in sync with `/usr/include/roc/*.h`.
+//!
+//! ### Notes on the 0.3 → 0.4 jump
+//!
+//! * `roc_clock_source` enum values shifted (0.4 added `DEFAULT = 0`).
+//! * `roc_clock_sync_backend` / `roc_clock_sync_profile` were renamed to
+//!   `roc_latency_tuner_backend` / `roc_latency_tuner_profile`.
+//! * `roc_sender_config` gained `latency_tuner_backend`, `latency_tuner_profile`,
+//!   `target_latency`, `latency_tolerance` at the end.
+//! * `roc_receiver_config` fields renamed (same layout).
+//! * `metrics.h` was rewritten: no more `roc_session_metrics {niq_latency,
+//!   e2e_latency}` / receiver-metrics-with-sessions-pointer. Now:
+//!   `roc_connection_metrics {e2e_latency}` (only) is an out-array,
+//!   `roc_receiver_metrics {connection_count}` and
+//!   `roc_sender_metrics {connection_count}` are the slot-level structs.
+//! * `roc_receiver_query` / `roc_sender_query` grew a fourth+fifth argument
+//!   (slot metrics, connection metrics array, count).
 
 #![allow(non_camel_case_types)]
 #![allow(non_upper_case_globals)]
@@ -93,24 +110,25 @@ pub struct roc_media_encoding {
 #[repr(C)]
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum roc_clock_source {
-    ROC_CLOCK_SOURCE_EXTERNAL = 0,
-    ROC_CLOCK_SOURCE_INTERNAL = 1,
+    ROC_CLOCK_SOURCE_DEFAULT = 0,
+    ROC_CLOCK_SOURCE_EXTERNAL = 1,
+    ROC_CLOCK_SOURCE_INTERNAL = 2,
 }
 
 #[repr(C)]
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum roc_clock_sync_backend {
-    ROC_CLOCK_SYNC_BACKEND_DISABLE = -1,
-    ROC_CLOCK_SYNC_BACKEND_DEFAULT = 0,
-    ROC_CLOCK_SYNC_BACKEND_NIQ = 2,
+pub enum roc_latency_tuner_backend {
+    ROC_LATENCY_TUNER_BACKEND_DEFAULT = 0,
+    ROC_LATENCY_TUNER_BACKEND_NIQ = 2,
 }
 
 #[repr(C)]
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum roc_clock_sync_profile {
-    ROC_CLOCK_SYNC_PROFILE_DEFAULT = 0,
-    ROC_CLOCK_SYNC_PROFILE_RESPONSIVE = 1,
-    ROC_CLOCK_SYNC_PROFILE_GRADUAL = 2,
+pub enum roc_latency_tuner_profile {
+    ROC_LATENCY_TUNER_PROFILE_DEFAULT = 0,
+    ROC_LATENCY_TUNER_PROFILE_INTACT = 1,
+    ROC_LATENCY_TUNER_PROFILE_RESPONSIVE = 2,
+    ROC_LATENCY_TUNER_PROFILE_GRADUAL = 3,
 }
 
 #[repr(C)]
@@ -149,8 +167,13 @@ pub struct roc_sender_config {
     pub fec_block_source_packets: c_uint,
     pub fec_block_repair_packets: c_uint,
     pub clock_source: roc_clock_source,
+    // Fields below were added in libroc 0.4.
+    pub latency_tuner_backend: roc_latency_tuner_backend,
+    pub latency_tuner_profile: roc_latency_tuner_profile,
     pub resampler_backend: roc_resampler_backend,
     pub resampler_profile: roc_resampler_profile,
+    pub target_latency: u64,
+    pub latency_tolerance: u64,
 }
 
 #[repr(C)]
@@ -158,8 +181,8 @@ pub struct roc_sender_config {
 pub struct roc_receiver_config {
     pub frame_encoding: roc_media_encoding,
     pub clock_source: roc_clock_source,
-    pub clock_sync_backend: roc_clock_sync_backend,
-    pub clock_sync_profile: roc_clock_sync_profile,
+    pub latency_tuner_backend: roc_latency_tuner_backend,
+    pub latency_tuner_profile: roc_latency_tuner_profile,
     pub resampler_backend: roc_resampler_backend,
     pub resampler_profile: roc_resampler_profile,
     pub target_latency: u64,
@@ -176,25 +199,26 @@ pub struct roc_interface_config {
     pub reuse_address: c_int,
 }
 
+/// Per-connection metrics — one entry per active sender→receiver pairing.
+/// Only `e2e_latency` is exposed by libroc 0.4 (`niq_latency` was dropped).
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Default)]
-pub struct roc_session_metrics {
-    pub niq_latency: u64,
+pub struct roc_connection_metrics {
     pub e2e_latency: u64,
 }
 
+/// Receiver slot-level metrics.
 #[repr(C)]
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, Debug, Default)]
 pub struct roc_receiver_metrics {
-    pub num_sessions: c_uint,
-    pub sessions: *mut roc_session_metrics,
-    pub sessions_size: usize,
+    pub connection_count: c_uint,
 }
 
+/// Sender slot-level metrics.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Default)]
 pub struct roc_sender_metrics {
-    pub unused: c_int,
+    pub connection_count: c_uint,
 }
 
 #[repr(C)]
@@ -244,6 +268,13 @@ extern "C" {
         endpoint: *const roc_endpoint,
     ) -> c_int;
     pub fn roc_sender_unlink(sender: *mut roc_sender, slot: roc_slot) -> c_int;
+    pub fn roc_sender_query(
+        sender: *mut roc_sender,
+        slot: roc_slot,
+        slot_metrics: *mut roc_sender_metrics,
+        conn_metrics: *mut roc_connection_metrics,
+        conn_metrics_count: *mut usize,
+    ) -> c_int;
     pub fn roc_sender_write(sender: *mut roc_sender, frame: *const roc_frame) -> c_int;
     pub fn roc_sender_close(sender: *mut roc_sender) -> c_int;
 
@@ -269,7 +300,9 @@ extern "C" {
     pub fn roc_receiver_query(
         receiver: *mut roc_receiver,
         slot: roc_slot,
-        metrics: *mut roc_receiver_metrics,
+        slot_metrics: *mut roc_receiver_metrics,
+        conn_metrics: *mut roc_connection_metrics,
+        conn_metrics_count: *mut usize,
     ) -> c_int;
     pub fn roc_receiver_read(receiver: *mut roc_receiver, frame: *mut roc_frame) -> c_int;
     pub fn roc_receiver_close(receiver: *mut roc_receiver) -> c_int;
