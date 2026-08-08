@@ -266,6 +266,11 @@ extern "C" {
         endpoint: *mut roc_endpoint,
     ) -> c_int;
     pub fn roc_receiver_unlink(receiver: *mut roc_receiver, slot: roc_slot) -> c_int;
+    pub fn roc_receiver_query(
+        receiver: *mut roc_receiver,
+        slot: roc_slot,
+        metrics: *mut roc_receiver_metrics,
+    ) -> c_int;
     pub fn roc_receiver_read(receiver: *mut roc_receiver, frame: *mut roc_frame) -> c_int;
     pub fn roc_receiver_close(receiver: *mut roc_receiver) -> c_int;
 }

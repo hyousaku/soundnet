@@ -3,7 +3,7 @@
 use anyhow::{anyhow, Context, Result};
 use rtrb::{Consumer, RingBuffer, Producer};
 use soundnet_protocol::StreamSpec;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 
@@ -12,6 +12,11 @@ use crate::audio::format::{f32_to_alsa, to_alsa_format};
 pub struct PlaybackHandle {
     pub producer: Producer<f32>,
     pub control: PlaybackControl,
+    /// Bits of an f32 holding the rolling peak level over the last period.
+    /// Read via `f32::from_bits(atomic.load(...))`.
+    pub level_bits: Arc<AtomicU32>,
+    /// Monotonic counter of xruns since the worker started.
+    pub xruns: Arc<AtomicUsize>,
 }
 
 pub struct PlaybackControl {
@@ -35,10 +40,14 @@ pub fn spawn(alsa_name: &str, spec: &StreamSpec) -> Result<PlaybackHandle> {
 
     let alsa_name = alsa_name.to_string();
     let spec = spec.clone();
+    let level_bits = Arc::new(AtomicU32::new(0));
+    let xruns = Arc::new(AtomicUsize::new(0));
+    let level_worker = level_bits.clone();
+    let xruns_worker = xruns.clone();
     let thread = thread::Builder::new()
         .name(format!("pb-{alsa_name}"))
         .spawn(move || {
-            if let Err(err) = worker(&alsa_name, &spec, cons, &stop_worker) {
+            if let Err(err) = worker(&alsa_name, &spec, cons, &stop_worker, &level_worker, &xruns_worker) {
                 tracing::error!("playback {alsa_name} failed: {err:#}");
             }
         })?;
@@ -46,6 +55,8 @@ pub fn spawn(alsa_name: &str, spec: &StreamSpec) -> Result<PlaybackHandle> {
     Ok(PlaybackHandle {
         producer: prod,
         control: PlaybackControl { stop, thread },
+        level_bits,
+        xruns,
     })
 }
 
@@ -54,6 +65,8 @@ fn worker(
     spec: &StreamSpec,
     mut cons: Consumer<f32>,
     stop: &Arc<AtomicBool>,
+    level_bits: &Arc<AtomicU32>,
+    xruns: &Arc<AtomicUsize>,
 ) -> Result<()> {
     let pcm = alsa::PCM::new(alsa_name, alsa::Direction::Playback, false)
         .with_context(|| format!("open playback {alsa_name}"))?;
@@ -81,11 +94,26 @@ fn worker(
         for slot in floats.iter_mut() {
             *slot = cons.pop().unwrap_or(0.0);
         }
+        // Rolling peak for the level meter.
+        let mut peak = 0.0_f32;
+        for &s in &floats {
+            let a = s.abs();
+            if a > peak {
+                peak = a;
+            }
+        }
+        // Decay towards the new value so brief silence still reads as quiet
+        // without the meter feeling twitchy.
+        let prev = f32::from_bits(level_bits.load(Ordering::Relaxed));
+        let smoothed = if peak > prev { peak } else { prev * 0.7 + peak * 0.3 };
+        level_bits.store(smoothed.to_bits(), Ordering::Relaxed);
+
         f32_to_alsa(spec.alsa_format, &floats, &mut raw);
         match io.writei(&raw) {
             Ok(_) => {}
             Err(err) => {
                 if pcm.try_recover(err, false).is_ok() {
+                    xruns.fetch_add(1, Ordering::Relaxed);
                     tracing::warn!("playback xrun recovered");
                     continue;
                 }

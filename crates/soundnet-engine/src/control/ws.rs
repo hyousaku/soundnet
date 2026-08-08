@@ -9,7 +9,7 @@ use futures_util::{SinkExt, StreamExt};
 use soundnet_protocol::{ClientMsg, ServerMsg};
 use std::sync::Arc;
 
-use crate::routing;
+use crate::{discovery, routing};
 use crate::state::EngineState;
 
 pub async fn ws_handler(
@@ -67,8 +67,11 @@ async fn serve_socket(socket: WebSocket, state: Arc<EngineState>) {
                     }
                 }
             }
-            Ok(ClientMsg::AddManualHost { .. }) | Ok(ClientMsg::RemoveManualHost { .. }) => {
-                // TODO: manual peer support (out of MVP scope).
+            Ok(ClientMsg::AddManualHost { addr, port }) => {
+                discovery::add_manual(&state, addr, port).await;
+            }
+            Ok(ClientMsg::RemoveManualHost { addr, port }) => {
+                discovery::remove_manual(&state, &addr, port).await;
             }
             Err(err) => {
                 tracing::warn!("ws bad message: {err}");

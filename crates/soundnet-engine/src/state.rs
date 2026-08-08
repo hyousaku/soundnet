@@ -3,9 +3,11 @@
 use dashmap::DashMap;
 use soundnet_protocol::{LocalPort, Node, PortId, Route, RouteId, StreamStats};
 use std::net::IpAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::{broadcast, RwLock};
 
+use crate::config::ManualHost;
 use crate::routing::RunningRoute;
 
 #[derive(Debug, Clone)]
@@ -34,8 +36,11 @@ pub struct EngineState {
     /// Rolling per-route stats (updated by workers).
     pub stats: DashMap<RouteId, StreamStats>,
 
-    /// Persisted config path we write back to on route changes.
-    pub config_path: RwLock<Option<std::path::PathBuf>>,
+    /// Persisted config path we write back to on route/manual-host changes.
+    pub config_path: RwLock<Option<PathBuf>>,
+
+    /// Manually added hosts (fallback when mDNS is blocked).
+    pub manual_hosts: RwLock<Vec<ManualHost>>,
 
     /// Broadcasted server messages to all connected WebSocket clients.
     pub events: broadcast::Sender<soundnet_protocol::ServerMsg>,
@@ -59,6 +64,7 @@ impl EngineState {
             running: DashMap::new(),
             stats: DashMap::new(),
             config_path: RwLock::new(None),
+            manual_hosts: RwLock::new(Vec::new()),
             events: tx,
         })
     }

@@ -5,7 +5,7 @@ use anyhow::{anyhow, Result};
 use roc_sys as roc;
 use rtrb::Producer;
 use soundnet_protocol::StreamSpec;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 
@@ -14,6 +14,9 @@ use super::{endpoint_free, endpoint_from_uri, RocContext};
 pub struct ReceiverHandle {
     pub stop: Arc<AtomicBool>,
     pub thread: JoinHandle<()>,
+    /// Last observed end-to-end latency in nanoseconds, refreshed every ~200ms
+    /// by the receiver thread via `roc_receiver_query`.
+    pub e2e_latency_ns: Arc<AtomicU64>,
 }
 
 impl ReceiverHandle {
@@ -32,17 +35,19 @@ pub fn spawn(
 ) -> Result<ReceiverHandle> {
     let stop = Arc::new(AtomicBool::new(false));
     let stop_worker = stop.clone();
+    let e2e = Arc::new(AtomicU64::new(0));
+    let e2e_worker = e2e.clone();
     let bind_host = bind_host.to_string();
     let spec = spec.clone();
 
     let thread = thread::Builder::new()
         .name(format!("roc-rx-{bind_host}-{bind_port}"))
         .spawn(move || {
-            if let Err(err) = run(&ctx, &bind_host, bind_port, &spec, &mut producer, &stop_worker) {
+            if let Err(err) = run(&ctx, &bind_host, bind_port, &spec, &mut producer, &stop_worker, &e2e_worker) {
                 tracing::error!("receiver on {bind_host}:{bind_port} failed: {err:#}");
             }
         })?;
-    Ok(ReceiverHandle { stop, thread })
+    Ok(ReceiverHandle { stop, thread, e2e_latency_ns: e2e })
 }
 
 fn run(
@@ -52,6 +57,7 @@ fn run(
     spec: &StreamSpec,
     producer: &mut Producer<f32>,
     stop: &Arc<AtomicBool>,
+    e2e_out: &Arc<AtomicU64>,
 ) -> Result<()> {
     let channels = super::sender::channel_layout_for(spec.channels);
     let cfg = roc::roc_receiver_config {
@@ -139,6 +145,10 @@ fn run(
     let period_samples = period_frames * spec.channels as usize;
     let mut buf: Vec<f32> = vec![0.0; period_samples];
 
+    // How many periods between metric snapshots (~200ms cadence).
+    let metrics_every = (spec.rate as usize / 5 / period_frames.max(1)).max(1);
+    let mut ticks = 0_usize;
+
     while !stop.load(Ordering::Relaxed) {
         let mut frame = roc::roc_frame {
             samples: buf.as_mut_ptr() as *mut _,
@@ -152,6 +162,26 @@ fn run(
         for &s in &buf {
             // Drop if playback fell behind — never block roc.
             let _ = producer.push(s);
+        }
+
+        ticks += 1;
+        if ticks >= metrics_every {
+            ticks = 0;
+            let mut sessions = [roc::roc_session_metrics::default(); 4];
+            let mut metrics = roc::roc_receiver_metrics {
+                num_sessions: 0,
+                sessions: sessions.as_mut_ptr(),
+                sessions_size: sessions.len(),
+            };
+            let rc = unsafe {
+                roc::roc_receiver_query(receiver, roc::ROC_SLOT_DEFAULT, &mut metrics)
+            };
+            if rc == 0 {
+                let n = metrics.num_sessions.min(sessions.len() as u32) as usize;
+                // Report the largest e2e_latency across sessions (worst case).
+                let worst = sessions[..n].iter().map(|s| s.e2e_latency).max().unwrap_or(0);
+                e2e_out.store(worst, Ordering::Relaxed);
+            }
         }
     }
     Ok(())

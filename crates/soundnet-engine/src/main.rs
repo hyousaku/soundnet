@@ -55,7 +55,11 @@ async fn main() -> Result<()> {
     let bind_addr = cli.bind;
     let advertise_ip = pick_advertise_ip(bind_addr.ip()).context("pick advertise ip")?;
 
-    let cfg = config::Config::load_or_default(cli.config.as_deref())?;
+    let cfg_path = cli
+        .config
+        .clone()
+        .unwrap_or_else(config::default_path);
+    let cfg = config::Config::load_or_default(Some(&cfg_path))?;
 
     let state = state::EngineState::new(state::EngineIdentity {
         node_id,
@@ -70,6 +74,14 @@ async fn main() -> Result<()> {
     audio::devices::refresh(&state)?;
     tone::register_default_tones(&state);
 
+    // Remember where to persist changes.
+    *state.config_path.write().await = Some(cfg_path.clone());
+    *state.manual_hosts.write().await = cfg.manual_hosts.clone();
+    // Best-effort resolve of manual hosts (their state fetch happens in discovery::add_manual).
+    for mh in &cfg.manual_hosts {
+        discovery::probe_manual(state.clone(), mh.addr.clone(), mh.port);
+    }
+
     // Restore persisted routes.
     for route in cfg.routes.iter().cloned() {
         if let Err(err) = routing::apply_route(&state, route).await {
@@ -77,8 +89,9 @@ async fn main() -> Result<()> {
         }
     }
 
-    // Kick off discovery in the background.
+    // Kick off discovery + stats pump in the background.
     discovery::spawn(state.clone(), advertise_ip, bind_addr.port(), cli.audio_port);
+    routing::spawn_stats_pump(state.clone());
 
     // Control plane (HTTP + WebSocket + embedded web UI).
     let control_handle = tokio::spawn(control::serve(state.clone(), bind_addr));

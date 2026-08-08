@@ -9,6 +9,7 @@ const LATENCIES = [3, 5, 10, 20, 40, 80];
 export default function RouteEditor() {
   const routes = useStore((s) => s.routes);
   const nodes = useStore((s) => s.nodes);
+  const stats = useStore((s) => s.stats);
   const send = useStore((s) => s.send);
 
   const routeList = Object.values(routes);
@@ -37,6 +38,9 @@ export default function RouteEditor() {
             <th>Period</th>
             <th>Latency</th>
             <th>FEC</th>
+            <th>Level</th>
+            <th>e2e</th>
+            <th>xr</th>
             <th></th>
           </tr>
         </thead>
@@ -98,6 +102,11 @@ export default function RouteEditor() {
                   onChange={(e) => update(send, r.id, r.spec, { fec: e.target.checked })}
                 />
               </td>
+              <td style={{ width: 100 }}>
+                <LevelMeter db={stats[r.id]?.level_db ?? -120} />
+              </td>
+              <td>{stats[r.id] ? `${stats[r.id].e2e_latency_ms.toFixed(1)} ms` : "—"}</td>
+              <td>{stats[r.id]?.xruns ?? 0}</td>
               <td>
                 <button onClick={() => send({ type: "remove_route", id: r.id })}>
                   Remove
@@ -118,4 +127,23 @@ function update(
   patch: Partial<StreamSpec>,
 ): void {
   send({ type: "update_spec", id, spec: { ...spec, ...patch } });
+}
+
+function LevelMeter({ db }: { db: number }) {
+  // Map [-60, 0] dB → [0, 1].
+  const clamped = Math.max(-60, Math.min(0, db));
+  const norm = (clamped + 60) / 60;
+  const color = db > -3 ? "#ef5350" : db > -12 ? "#f59e0b" : "#4ade80";
+  return (
+    <div style={{ background: "#0b0d10", height: 10, borderRadius: 2, overflow: "hidden" }}>
+      <div
+        style={{
+          width: `${norm * 100}%`,
+          height: "100%",
+          background: color,
+          transition: "width 100ms linear",
+        }}
+      />
+    </div>
+  );
 }

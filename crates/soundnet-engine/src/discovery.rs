@@ -11,6 +11,7 @@ use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::routing;
 use crate::state::{EngineState, PeerRecord};
 
 const SERVICE_TYPE: &str = "_soundnet._udp.local.";
@@ -118,6 +119,61 @@ async fn run(
     Ok(())
 }
 
+/// Kick off a background fetch for a manually-added host. If the fetch
+/// succeeds, the peer is added to state and broadcast as if mDNS had found it.
+pub fn probe_manual(state: Arc<EngineState>, addr: String, port: u16) {
+    tokio::spawn(async move {
+        // We don't yet know the node id / audio port — start with placeholders
+        // and let fetch_peer_state overwrite once the snapshot lands.
+        let seed = Node {
+            id: format!("manual:{addr}:{port}"),
+            hostname: addr.clone(),
+            addr,
+            port,
+            audio_port: 10001,
+            version: "?".into(),
+        };
+        fetch_peer_state(&state, seed).await;
+    });
+}
+
+/// Add a manual host to persistent config and try to reach it now.
+pub async fn add_manual(state: &Arc<EngineState>, addr: String, port: u16) {
+    {
+        let mut hosts = state.manual_hosts.write().await;
+        let already = hosts.iter().any(|h| h.addr == addr && h.port == port);
+        if !already {
+            hosts.push(crate::config::ManualHost { addr: addr.clone(), port });
+        }
+    }
+    routing::persist(state).await;
+    probe_manual(state.clone(), addr, port);
+}
+
+pub async fn remove_manual(state: &Arc<EngineState>, addr: &str, port: u16) {
+    {
+        let mut hosts = state.manual_hosts.write().await;
+        hosts.retain(|h| !(h.addr == addr && h.port == port));
+    }
+    // Drop any peer entries pointing at this host.
+    let removed: Vec<String> = state
+        .peers
+        .iter()
+        .filter_map(|entry| {
+            if entry.node.addr == addr && entry.node.port == port {
+                Some(entry.key().clone())
+            } else {
+                None
+            }
+        })
+        .collect();
+    for id in removed {
+        state.peers.remove(&id);
+        let _ = state.events.send(ServerMsg::NodeDisappeared { node_id: id });
+    }
+    routing::persist(state).await;
+}
+
 async fn fetch_peer_state(state: &Arc<EngineState>, node: Node) {
     let url = format!("http://{}:{}/api/state", node.addr, node.port);
     let fetched = tokio::task::spawn_blocking(move || {
@@ -129,12 +185,14 @@ async fn fetch_peer_state(state: &Arc<EngineState>, node: Node) {
     .await;
     match fetched {
         Ok(Ok(snap)) => {
+            // Prefer the ids/ports the peer reports over whatever we had.
+            let node = snap.self_node.clone();
             let ports: Vec<LocalPort> = snap.local_ports;
             let record = PeerRecord { node: node.clone(), ports: ports.clone() };
             state.peers.insert(node.id.clone(), record);
             let _ = state.events.send(ServerMsg::NodeAppeared { node, ports });
         }
-        Ok(Err(err)) => tracing::warn!("failed to fetch peer state: {err:#}"),
+        Ok(Err(err)) => tracing::warn!("failed to fetch peer state from {}:{}: {err:#}", node.addr, node.port),
         Err(err) => tracing::warn!("peer state task panicked: {err}"),
     }
 }
