@@ -42,6 +42,34 @@ box.
 - **Single-binary distribution** — the SPA is baked into `soundnet-engine`
   via `rust-embed`
 
+## Install
+
+Fresh Debian / Ubuntu / Raspberry Pi OS machine, one command:
+
+```bash
+git clone https://github.com/hyousaku/soundnet.git
+cd soundnet
+packaging/install.sh          # --yes to skip prompts, --no-service to skip systemd
+```
+
+It installs the dependencies (including building roc-toolkit 0.4 from source if
+your distro only ships 0.3), builds the web UI and engine in the right order,
+installs them as a `.deb`, and enables `soundnet-engine@<you>.service`.
+
+Adding more machines of the same architecture? Don't repeat the build — copy
+the package it left in `dist/`:
+
+```bash
+scp dist/soundnet-engine_*_arm64.deb pi@other-pi:
+ssh pi@other-pi 'sudo apt install ./soundnet-engine_*_arm64.deb &&
+                 sudo usermod -aG audio $USER &&
+                 sudo systemctl enable --now soundnet-engine@$USER.service'
+```
+
+See [packaging/README.md](packaging/README.md) for the details — building the
+`.deb` yourself, what it installs, and the libroc 0.4 requirement. The rest of
+this section describes the same thing done by hand.
+
 ## Runtime dependencies
 
 - Linux kernel with ALSA (any modern distro)
@@ -71,7 +99,7 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 # Node via nvm or your distro's package
 ```
 
-## Build & run
+## Build & run by hand
 
 ```bash
 git clone https://github.com/hyousaku/soundnet.git
@@ -118,7 +146,7 @@ pgrep -f soundnet-engine || echo "nothing left running"
 
 sudo install -m 755 target/release/soundnet-engine /usr/local/bin/
 sudo cp packaging/soundnet-engine.service /etc/systemd/system/soundnet-engine@.service
-sudo cp packaging/99-realtime.conf /etc/security/limits.d/
+sudo cp packaging/99-realtime.conf /etc/security/limits.d/99-soundnet-realtime.conf
 sudo systemctl daemon-reload
 sudo usermod -aG audio $USER          # log out and back in after this
 sudo systemctl enable --now soundnet-engine@$USER.service
@@ -128,15 +156,21 @@ systemctl status soundnet-engine@$USER.service --no-pager
 ### Deploying a new build
 
 The web UI is compiled into the binary by `rust-embed`, so **build `web/` before
-building the engine** or the embedded UI will be the previous one:
+building the engine** or the embedded UI will be the previous one. On stable
+Rust, rust-embed also cannot tell cargo that `web/dist` changed, so the engine
+crate has to be invalidated by hand:
 
 ```bash
 git pull
 cd web && npm run build && cd ..
+touch crates/soundnet-engine/src/control/web.rs   # force the SPA re-embed
 cargo build --release -p soundnet-engine
 sudo install -m 755 target/release/soundnet-engine /usr/local/bin/
 sudo systemctl restart soundnet-engine@$USER.service
 ```
+
+`packaging/install.sh --yes` (or `packaging/build-deb.sh` + `apt install`) does
+all of that for you, in the right order.
 
 If a service has been failing repeatedly, systemd may refuse to start it until
 you clear the failure counter with
@@ -181,7 +215,7 @@ worker restarts transparently.
 
 ## Architecture
 
-- **`crates/roc-sys`** — minimal hand-written FFI to `libroc` (0.3.x).
+- **`crates/roc-sys`** — minimal hand-written FFI to `libroc` (0.4.x).
 - **`crates/soundnet-protocol`** — JSON types shared with the web UI.
 - **`crates/soundnet-engine`** — the daemon:
   - `audio/` — ALSA device enumeration and worker threads
