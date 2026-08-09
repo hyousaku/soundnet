@@ -59,7 +59,7 @@ fn run(
     // Always use MULTITRACK layout — same code path for 1..32 channels, and
     // we register a custom packet encoding below so libroc doesn't try to
     // pick a built-in that doesn't exist for our rate/format.
-    let packet_encoding = super::ensure_encoding(ctx.raw(), spec.rate, spec.channels);
+    let packet_encoding = ctx.ensure_encoding(spec.rate, spec.channels);
     let cfg = roc::roc_sender_config {
         frame_encoding: roc::roc_media_encoding {
             rate: spec.rate,

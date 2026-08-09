@@ -3,13 +3,18 @@ pub mod sender;
 
 use anyhow::{anyhow, Result};
 use roc_sys as roc;
+use std::collections::HashSet;
 use std::ffi::CString;
 use std::ptr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 /// One shared roc context per engine — pools packets, allocates worker threads.
 pub struct RocContext {
     ctx: *mut roc::roc_context,
+    /// (rate, channels) tuples we've already registered on this context so
+    /// we don't re-register on every route apply and spam libroc's log with
+    /// "payload type already exists" errors.
+    registered: Mutex<HashSet<(u32, u8)>>,
 }
 
 // SAFETY: roc_context is documented as thread-safe (see roc/context.h).
@@ -27,11 +32,39 @@ impl RocContext {
         if rc != 0 || ctx.is_null() {
             return Err(anyhow!("roc_context_open failed ({rc})"));
         }
-        Ok(Arc::new(Self { ctx }))
+        Ok(Arc::new(Self {
+            ctx,
+            registered: Mutex::new(HashSet::new()),
+        }))
     }
 
     pub fn raw(&self) -> *mut roc::roc_context {
         self.ctx
+    }
+
+    /// Register the packet encoding for `(rate, channels)` on this context
+    /// exactly once. Returns the encoding id both sender and receiver should
+    /// use for that tuple.
+    pub fn ensure_encoding(&self, rate: u32, channels: u8) -> i32 {
+        let id = encoding_id_for(rate, channels);
+        let mut seen = self.registered.lock().unwrap();
+        if seen.contains(&(rate, channels)) {
+            return id;
+        }
+        let enc = roc::roc_media_encoding {
+            rate,
+            format: roc::roc_format::ROC_FORMAT_PCM_FLOAT32,
+            channels: roc::roc_channel_layout::ROC_CHANNEL_LAYOUT_MULTITRACK,
+            tracks: channels as u32,
+        };
+        let rc = unsafe { roc::roc_context_register_encoding(self.ctx, id, &enc) };
+        if rc != 0 {
+            tracing::warn!(
+                "register_encoding({id}, rate={rate}, ch={channels}) rc={rc}"
+            );
+        }
+        seen.insert((rate, channels));
+        id
     }
 }
 
@@ -82,25 +115,6 @@ pub fn encoding_id_for(rate: u32, channels: u8) -> i32 {
     100 + (combo % 27) // stays in [100, 126]
 }
 
-/// Register (or re-register) a packet encoding matching our frame encoding
-/// so libroc doesn't have to guess. We use the **multitrack** channel
-/// layout for every route — it works for 1..32 channels without special
-/// casing, and both sender and receiver agree on the id we return here.
-///
-/// Registration is idempotent from libroc's perspective: a duplicate
-/// register returns a negative rc which we treat as "already registered,
-/// same shape" and log at debug only.
-pub fn ensure_encoding(ctx: *mut roc::roc_context, rate: u32, channels: u8) -> i32 {
-    let id = encoding_id_for(rate, channels);
-    let enc = roc::roc_media_encoding {
-        rate,
-        format: roc::roc_format::ROC_FORMAT_PCM_FLOAT32,
-        channels: roc::roc_channel_layout::ROC_CHANNEL_LAYOUT_MULTITRACK,
-        tracks: channels as u32,
-    };
-    let rc = unsafe { roc::roc_context_register_encoding(ctx, id, &enc) };
-    if rc != 0 {
-        tracing::debug!("register_encoding({id}, rate={rate}, ch={channels}) rc={rc} (likely already registered)");
-    }
-    id
-}
+// (encoding registration moved to RocContext::ensure_encoding so we can
+//  dedupe registrations per context and not re-register the same (rate,
+//  channels) tuple every time a route is applied.)

@@ -67,7 +67,7 @@ fn run(
 ) -> Result<()> {
     // Both sides register the same custom encoding for this (rate, channels)
     // tuple so packets round-trip without libroc having to guess a match.
-    super::ensure_encoding(ctx.raw(), spec.rate, spec.channels);
+    ctx.ensure_encoding(spec.rate, spec.channels);
     let cfg = roc::roc_receiver_config {
         frame_encoding: roc::roc_media_encoding {
             rate: spec.rate,
