@@ -93,7 +93,8 @@ export type ClientMsg =
   | { type: "remove_route"; id: RouteId }
   | { type: "update_spec"; id: RouteId; spec: StreamSpec }
   | { type: "add_manual_host"; addr: string; port: number }
-  | { type: "remove_manual_host"; addr: string; port: number };
+  | { type: "remove_manual_host"; addr: string; port: number }
+  | { type: "rescan_devices" };
 
 export const defaultSpec = (): StreamSpec => ({
   encoding: { kind: "pcm" },

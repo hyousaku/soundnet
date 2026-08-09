@@ -32,6 +32,7 @@ pub async fn serve(state: Arc<EngineState>, addr: SocketAddr) -> Result<()> {
         .route("/api/state", get(state_handler))
         .route("/api/routes", post(add_route_handler))
         .route("/api/routes/:id", delete(remove_route_handler))
+        .route("/api/rescan", post(rescan_handler))
         .route("/ws", get(ws::ws_handler))
         .fallback(web::static_handler)
         .layer(CorsLayer::new().allow_origin(Any).allow_methods(Any).allow_headers(Any))
@@ -97,4 +98,25 @@ async fn remove_route_handler(
 ) -> impl IntoResponse {
     routing::remove_route(&state, &id, q.gossip).await;
     StatusCode::NO_CONTENT
+}
+
+async fn rescan_handler(State(state): State<Arc<EngineState>>) -> impl IntoResponse {
+    match rescan_and_broadcast(&state).await {
+        Ok(count) => (StatusCode::OK, format!("{count}")).into_response(),
+        Err(err) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{err:#}")).into_response(),
+    }
+}
+
+/// Re-enumerate local ALSA ports and push a fresh state snapshot to every
+/// connected UI. Returns the new port count.
+pub async fn rescan_and_broadcast(state: &Arc<EngineState>) -> anyhow::Result<usize> {
+    crate::audio::devices::refresh(state)?;
+    // Tones are always registered; refresh() only drops non-tone entries.
+    crate::tone::register_default_tones(state);
+    let count = state.local_ports.len();
+    let snap = snapshot(state).await;
+    let _ = state
+        .events
+        .send(soundnet_protocol::ServerMsg::State { snapshot: snap });
+    Ok(count)
 }

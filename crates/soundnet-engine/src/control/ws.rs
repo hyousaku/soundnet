@@ -76,6 +76,11 @@ async fn serve_socket(socket: WebSocket, state: Arc<EngineState>) {
             Ok(ClientMsg::RemoveManualHost { addr, port }) => {
                 discovery::remove_manual(&state, &addr, port).await;
             }
+            Ok(ClientMsg::RescanDevices) => {
+                if let Err(err) = super::rescan_and_broadcast(&state).await {
+                    tracing::warn!("rescan failed: {err:#}");
+                }
+            }
             Err(err) => {
                 tracing::warn!("ws bad message: {err}");
             }

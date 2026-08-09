@@ -156,6 +156,9 @@ pub enum ClientMsg {
     UpdateSpec { id: RouteId, spec: StreamSpec },
     AddManualHost { addr: String, port: u16 },
     RemoveManualHost { addr: String, port: u16 },
+    /// Re-enumerate local ALSA devices (e.g. after plugging in a new USB
+    /// interface). The engine responds by broadcasting a fresh State snapshot.
+    RescanDevices,
 }
 
 // ---------- WS server -> client ----------
