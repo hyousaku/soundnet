@@ -16,7 +16,11 @@
 * { box-sizing: border-box; }
 html, body, #root { margin: 0; padding: 0; height: 100%; background: var(--bg); color: var(--text); }
 
-button {
+/* Scoped away from React Flow's own controls: those are sized and themed by
+   the library (26x26, no border, icons drawn with `fill: currentColor`), and
+   inheriting our padding/border/color here left white icons on React Flow's
+   white button background — invisible until hover changed the background. */
+button:not(.react-flow__controls-button) {
   background: var(--panel2);
   color: var(--text);
   border: 1px solid var(--border);
@@ -25,8 +29,8 @@ button {
   cursor: pointer;
   font: inherit;
 }
-button:hover:not(:disabled) { background: #253044; }
-button:disabled { opacity: 0.5; cursor: not-allowed; }
+button:not(.react-flow__controls-button):hover:not(:disabled) { background: #253044; }
+button:not(.react-flow__controls-button):disabled { opacity: 0.5; cursor: not-allowed; }
 
 select, input[type=number] {
   background: var(--panel2);
