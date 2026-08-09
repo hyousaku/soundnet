@@ -8,7 +8,7 @@
 use anyhow::{anyhow, Context, Result};
 use rtrb::{Producer, RingBuffer};
 use soundnet_protocol::StreamSpec;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 
@@ -18,6 +18,14 @@ use crate::tone;
 pub struct CaptureHandle {
     pub consumer: rtrb::Consumer<f32>,
     pub control: CaptureControl,
+    /// Rolling ALSA capture-buffer delay in nanoseconds — how much audio is
+    /// currently queued in the device, sampled every ~200ms via
+    /// `PCM::delay()` (see `alsa_worker`). This is the piece of latency
+    /// roc's own e2e metric doesn't cover: frames sit here *before*
+    /// `roc_sender_write` ever sees them. Stays at `u64::MAX` ("not
+    /// measured") for a tone source — there's no real ALSA buffer to
+    /// report — and until the ALSA worker's first sample for a real device.
+    pub buffer_ns: Arc<AtomicU64>,
 }
 
 /// Just the parts you keep once you've handed the consumer to a downstream worker.
@@ -46,6 +54,8 @@ pub fn spawn(alsa_name: &str, spec: &StreamSpec) -> Result<CaptureHandle> {
 
     let stop = Arc::new(AtomicBool::new(false));
     let stop_worker = stop.clone();
+    let buffer_ns = Arc::new(AtomicU64::new(u64::MAX));
+    let buffer_worker = buffer_ns.clone();
 
     let alsa_name = alsa_name.to_string();
     let spec = spec.clone();
@@ -58,7 +68,11 @@ pub fn spawn(alsa_name: &str, spec: &StreamSpec) -> Result<CaptureHandle> {
                 // The tone generator paces itself off a wall-clock sleep
                 // (see tone_worker below) exactly like a real ALSA period
                 // would, so it's just as exposed to scheduler jitter as the
-                // hardware path and gets the same treatment.
+                // hardware path and gets the same treatment. It never
+                // touches buffer_worker — a synthesized tone has no ALSA
+                // buffer, so the sentinel (u64::MAX == "not measured")
+                // stays in place for the life of the route, which is the
+                // honest answer.
                 crate::rt::raise_thread_priority("capture (tone)", crate::rt::PRIO_CAPTURE);
                 tone_worker(freq, spec, &mut prod, stop_worker)
             })?
@@ -67,7 +81,7 @@ pub fn spawn(alsa_name: &str, spec: &StreamSpec) -> Result<CaptureHandle> {
             .name(format!("cap-{alsa_name}"))
             .spawn(move || {
                 crate::rt::raise_thread_priority("capture", crate::rt::PRIO_CAPTURE);
-                if let Err(err) = alsa_worker(&alsa_name, &spec, &mut prod, &stop_worker) {
+                if let Err(err) = alsa_worker(&alsa_name, &spec, &mut prod, &stop_worker, &buffer_worker) {
                     tracing::error!("capture {alsa_name} failed: {err:#}");
                 }
             })?
@@ -76,6 +90,7 @@ pub fn spawn(alsa_name: &str, spec: &StreamSpec) -> Result<CaptureHandle> {
     Ok(CaptureHandle {
         consumer: cons,
         control: CaptureControl { stop, thread },
+        buffer_ns,
     })
 }
 
@@ -84,6 +99,7 @@ fn alsa_worker(
     spec: &StreamSpec,
     prod: &mut Producer<f32>,
     stop: &Arc<AtomicBool>,
+    buffer_ns: &Arc<AtomicU64>,
 ) -> Result<()> {
     let pcm = alsa::PCM::new(alsa_name, alsa::Direction::Capture, false)
         .with_context(|| format!("open capture {alsa_name}"))?;
@@ -127,6 +143,13 @@ fn alsa_worker(
     let mut raw = vec![0u8; period_frames * frame_bytes];
     let mut floats: Vec<f32> = Vec::with_capacity(period_frames * spec.channels as usize);
 
+    // How many periods between buffer-delay samples (~200ms cadence) — this
+    // thread runs SCHED_FIFO (see rt.rs), and `PCM::delay()` is a syscall,
+    // so it's sampled on the same cadence as the stats pump that consumes
+    // it rather than every period.
+    let metrics_every = (spec.rate as usize / 5 / period_frames.max(1)).max(1);
+    let mut ticks = 0_usize;
+
     while !stop.load(Ordering::Relaxed) {
         match io.readi(&mut raw) {
             Ok(_) => {}
@@ -145,6 +168,18 @@ fn alsa_worker(
             // Drop samples if the transport side has fallen behind — better a
             // brief glitch than an unbounded buffer.
             let _ = prod.push(s);
+        }
+
+        ticks += 1;
+        if ticks >= metrics_every {
+            ticks = 0;
+            if let Ok(frames) = pcm.delay() {
+                // Negative only transiently (e.g. right after an xrun
+                // recovery, before the driver's pointers resettle) — clamp
+                // instead of storing a bogus huge unsigned value.
+                let ns = (frames.max(0) as u64) * 1_000_000_000 / spec.rate as u64;
+                buffer_ns.store(ns, Ordering::Relaxed);
+            }
         }
     }
     Ok(())

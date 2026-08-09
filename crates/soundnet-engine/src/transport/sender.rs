@@ -193,6 +193,20 @@ fn run(
                 return Err(anyhow!("sender configure repair outgoing_address failed ({rc})"));
             }
         }
+        // Control (RTCP) is unconditional — unlike repair it doesn't depend
+        // on FEC being on, since it carries latency/clock-sync reports, not
+        // redundancy packets.
+        let rc = unsafe {
+            roc::roc_sender_configure(
+                sender,
+                roc::ROC_SLOT_DEFAULT,
+                roc::roc_interface::ROC_INTERFACE_AUDIO_CONTROL,
+                &iface_cfg,
+            )
+        };
+        if rc != 0 {
+            return Err(anyhow!("sender configure control outgoing_address failed ({rc})"));
+        }
     }
 
     // Source endpoint: rtp+rs8m://host:port (when FEC on) or rtp://host:port.
@@ -230,6 +244,28 @@ fn run(
         if rc != 0 {
             return Err(anyhow!("sender connect repair failed ({rc})"));
         }
+    }
+
+    // RTCP control endpoint. Without this, `roc_connection_metrics.e2e_latency`
+    // (what the receiver reports as end-to-end latency) is always zero —
+    // metrics.h is explicit that it needs RTCP + system clock to compute
+    // anything. Always connected, independent of FEC. `audio_port + 2` is
+    // the third port in this route's 3-port window; see
+    // `routing::route_port` for why the stride between routes has to leave
+    // room for it.
+    let control_uri = format!("rtcp://{host}:{}", audio_port + 2);
+    let control_ep = endpoint_from_uri(&control_uri)?;
+    let rc = unsafe {
+        roc::roc_sender_connect(
+            sender,
+            roc::ROC_SLOT_DEFAULT,
+            roc::roc_interface::ROC_INTERFACE_AUDIO_CONTROL,
+            control_ep,
+        )
+    };
+    endpoint_free(control_ep);
+    if rc != 0 {
+        return Err(anyhow!("sender connect control failed ({rc})"));
     }
 
     let period_frames = spec.frames_per_period as usize;

@@ -14,8 +14,14 @@ use super::{endpoint_free, endpoint_from_uri, RocContext};
 pub struct ReceiverHandle {
     pub stop: Arc<AtomicBool>,
     pub thread: JoinHandle<()>,
-    /// Last observed end-to-end latency in nanoseconds, refreshed every ~200ms
-    /// by the receiver thread via `roc_receiver_query`.
+    /// Last observed end-to-end latency in nanoseconds, refreshed every
+    /// ~200ms by the receiver thread via `roc_receiver_query`. Requires an
+    /// RTCP control endpoint (see `run` below) — without it libroc always
+    /// reports zero. Starts (and stays) at `u64::MAX` — "not measured yet"
+    /// — until the first query call sees an active connection; routing.rs's
+    /// `ns_to_ms` is what turns that sentinel back into `None` for the UI,
+    /// since a real zero is a value this metric can legitimately take and
+    /// so can't double as "no data".
     pub e2e_latency_ns: Arc<AtomicU64>,
     /// Rolling standard deviation of `niq_latency` in nanoseconds — a proxy
     /// for network jitter. Small = smooth stream, big = jittery.
@@ -38,7 +44,7 @@ pub fn spawn(
 ) -> Result<ReceiverHandle> {
     let stop = Arc::new(AtomicBool::new(false));
     let stop_worker = stop.clone();
-    let e2e = Arc::new(AtomicU64::new(0));
+    let e2e = Arc::new(AtomicU64::new(u64::MAX));
     let jitter = Arc::new(AtomicU64::new(0));
     let e2e_worker = e2e.clone();
     let jitter_worker = jitter.clone();
@@ -147,6 +153,24 @@ fn run(
         }
     }
 
+    // RTCP control endpoint — see transport/sender.rs for why this needs to
+    // exist at all (without it, e2e_latency below is always zero). `port +
+    // 2` is this route's third port; see `routing::route_port`.
+    let control_uri = format!("rtcp://{host}:{}", port + 2);
+    let control_ep = endpoint_from_uri(&control_uri)?;
+    let rc = unsafe {
+        roc::roc_receiver_bind(
+            receiver,
+            roc::ROC_SLOT_DEFAULT,
+            roc::roc_interface::ROC_INTERFACE_AUDIO_CONTROL,
+            control_ep,
+        )
+    };
+    endpoint_free(control_ep);
+    if rc != 0 {
+        return Err(anyhow!("receiver bind control failed ({rc})"));
+    }
+
     let period_frames = spec.frames_per_period as usize;
     let period_samples = period_frames * spec.channels as usize;
     let mut buf: Vec<f32> = vec![0.0; period_samples];
@@ -188,9 +212,16 @@ fn run(
             };
             if rc == 0 {
                 let n = conn_count.min(conn.len());
-                // Report the largest e2e_latency across connections.
-                let worst_e2e = conn[..n].iter().map(|c| c.e2e_latency).max().unwrap_or(0);
-                e2e_out.store(worst_e2e, Ordering::Relaxed);
+                // Only overwrite the sentinel once there's an actual
+                // connection to report on — an empty conn array (no sender
+                // has connected yet, or it dropped) would otherwise store a
+                // literal 0 that reads identically to "real measured zero
+                // latency" downstream instead of "no data".
+                if n > 0 {
+                    // Report the largest e2e_latency across connections.
+                    let worst_e2e = conn[..n].iter().map(|c| c.e2e_latency).max().unwrap_or(0);
+                    e2e_out.store(worst_e2e, Ordering::Relaxed);
+                }
             }
         }
     }

@@ -15,13 +15,14 @@ import "@xyflow/react/dist/style.css";
 import { useStore } from "./store";
 import PortNode, { type PortRFNode } from "./PortNode";
 import { defaultSpec, type PortRef, type Route } from "./protocol";
+import { summarizeLatency } from "./latency";
 
 const nodeTypes = { port: PortNode };
 
 // Horizontal spacing between node cards. Cards are 320px wide (see
 // PortNode.tsx) — the gap needs to be wide enough for a route's edge label
-// ("48k · 2ch · 256f · e2e 3.1ms") to render without overlapping the cards
-// on either side.
+// ("48k · 2ch · 256f · roc 3.1+pb 2.0ms partial") to render without
+// overlapping the cards on either side.
 const NODE_SPACING_X = 560;
 
 export default function Patchbay() {
@@ -63,12 +64,16 @@ export default function Patchbay() {
     return Object.values(routes).map((r) => {
       const s = stats[r.id];
       const failing = s?.health.type === "retrying";
-      const lat = s ? ` · e2e ${s.e2e_latency_ms.toFixed(1)}ms` : "";
+      const latSummary = summarizeLatency(s);
+      // "—" means no data at all (route has no local role on this engine)
+      // — don't clutter every unrelated edge with a dash.
+      const lat = latSummary.text !== "—" ? ` · ${latSummary.text}` : "";
       const xr = s && s.xruns > 0 ? ` · xr ${s.xruns}` : "";
       const label = failing && s?.health.type === "retrying"
         ? `retrying (${s.health.attempts}) — ${s.health.reason}`
         : `${r.spec.rate / 1000}k · ${r.spec.channels}ch · ${r.spec.frames_per_period}f${lat}${xr}`;
       const color = failing ? "#ef5350" : "#6cf";
+      const labelColor = failing ? "#ef5350" : latSummary.partial ? "#f59e0b" : "#e6e9ef";
       return {
         id: r.id,
         source: r.src.node_id,
@@ -79,7 +84,7 @@ export default function Patchbay() {
         labelBgStyle: { fill: "#151920", stroke: "#262d38", strokeWidth: 1 },
         labelBgPadding: [6, 4] as [number, number],
         labelBgBorderRadius: 4,
-        labelStyle: { fill: failing ? "#ef5350" : "#e6e9ef", fontSize: 11 },
+        labelStyle: { fill: labelColor, fontSize: 11 },
         style: { stroke: color, strokeWidth: 2 },
         markerEnd: { type: MarkerType.ArrowClosed, color },
       };

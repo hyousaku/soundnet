@@ -1,5 +1,6 @@
 import { useStore } from "./store";
 import type { SampleFormat, StreamSpec } from "./protocol";
+import { summarizeLatency } from "./latency";
 
 const RATES = [44100, 48000, 88200, 96000];
 const FORMATS: SampleFormat[] = ["S16_LE", "S24_LE3", "S32_LE", "F32_LE"];
@@ -39,7 +40,9 @@ export default function RouteEditor() {
             <th>Latency</th>
             <th>FEC</th>
             <th>Level</th>
-            <th>e2e</th>
+            <th title="Latency this engine can actually account for — see the cell tooltips for what's missing on a partial figure.">
+              latency
+            </th>
             <th>jitter</th>
             <th>xr</th>
             <th>health</th>
@@ -110,7 +113,16 @@ export default function RouteEditor() {
               <td style={{ width: 100 }}>
                 <LevelMeter db={stats[r.id]?.level_db ?? -120} />
               </td>
-              <td>{stats[r.id] ? `${stats[r.id].e2e_latency_ms.toFixed(1)} ms` : "—"}</td>
+              <td>
+                {(() => {
+                  const lat = summarizeLatency(stats[r.id]);
+                  return (
+                    <span title={lat.title} style={lat.partial ? { color: "#f59e0b" } : undefined}>
+                      {lat.text}
+                    </span>
+                  );
+                })()}
+              </td>
               <td>{stats[r.id] ? `${stats[r.id].jitter_ms.toFixed(2)} ms` : "—"}</td>
               <td>{stats[r.id]?.xruns ?? 0}</td>
               <td style={{ maxWidth: 220 }}>

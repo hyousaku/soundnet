@@ -3,7 +3,7 @@
 use anyhow::{anyhow, Context, Result};
 use rtrb::{Consumer, RingBuffer, Producer};
 use soundnet_protocol::StreamSpec;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 
@@ -17,6 +17,13 @@ pub struct PlaybackHandle {
     pub level_bits: Arc<AtomicU32>,
     /// Monotonic counter of xruns since the worker started.
     pub xruns: Arc<AtomicUsize>,
+    /// Rolling ALSA playback-buffer delay in nanoseconds — how much audio
+    /// is currently queued in the device, sampled every ~200ms via
+    /// `PCM::delay()`. This is the piece of latency roc's own e2e metric
+    /// doesn't cover: frames sit here *after* `roc_receiver_read` and
+    /// before they actually reach the speaker. `u64::MAX` means "not
+    /// measured yet".
+    pub buffer_ns: Arc<AtomicU64>,
 }
 
 pub struct PlaybackControl {
@@ -45,13 +52,15 @@ pub fn spawn(alsa_name: &str, spec: &StreamSpec) -> Result<PlaybackHandle> {
     let spec = spec.clone();
     let level_bits = Arc::new(AtomicU32::new(0));
     let xruns = Arc::new(AtomicUsize::new(0));
+    let buffer_ns = Arc::new(AtomicU64::new(u64::MAX));
     let level_worker = level_bits.clone();
     let xruns_worker = xruns.clone();
+    let buffer_worker = buffer_ns.clone();
     let thread = thread::Builder::new()
         .name(format!("pb-{alsa_name}"))
         .spawn(move || {
             crate::rt::raise_thread_priority("playback", crate::rt::PRIO_PLAYBACK);
-            if let Err(err) = worker(&alsa_name, &spec, cons, &stop_worker, &level_worker, &xruns_worker) {
+            if let Err(err) = worker(&alsa_name, &spec, cons, &stop_worker, &level_worker, &xruns_worker, &buffer_worker) {
                 tracing::error!("playback {alsa_name} failed: {err:#}");
             }
         })?;
@@ -61,6 +70,7 @@ pub fn spawn(alsa_name: &str, spec: &StreamSpec) -> Result<PlaybackHandle> {
         control: PlaybackControl { stop, thread },
         level_bits,
         xruns,
+        buffer_ns,
     })
 }
 
@@ -71,6 +81,7 @@ fn worker(
     stop: &Arc<AtomicBool>,
     level_bits: &Arc<AtomicU32>,
     xruns: &Arc<AtomicUsize>,
+    buffer_ns: &Arc<AtomicU64>,
 ) -> Result<()> {
     let pcm = alsa::PCM::new(alsa_name, alsa::Direction::Playback, false)
         .with_context(|| format!("open playback {alsa_name}"))?;
@@ -109,6 +120,12 @@ fn worker(
     let mut floats: Vec<f32> = vec![0.0; period_samples];
     let mut raw: Vec<u8> = Vec::with_capacity(period_frames * frame_bytes);
 
+    // How many periods between buffer-delay samples (~200ms cadence) — see
+    // capture.rs's identical reasoning: this thread runs SCHED_FIFO and
+    // PCM::delay() is a syscall, so it doesn't belong in every period.
+    let metrics_every = (spec.rate as usize / 5 / period_frames.max(1)).max(1);
+    let mut ticks = 0_usize;
+
     while !stop.load(Ordering::Relaxed) {
         // If the roc receiver worker died, don't spin forever writing silence.
         if cons.is_abandoned() && cons.slots() == 0 {
@@ -143,6 +160,17 @@ fn worker(
                     continue;
                 }
                 return Err(anyhow!("playback write: {err}"));
+            }
+        }
+
+        ticks += 1;
+        if ticks >= metrics_every {
+            ticks = 0;
+            if let Ok(frames) = pcm.delay() {
+                // See capture.rs: negative only transiently, clamp rather
+                // than store a bogus huge unsigned value.
+                let ns = (frames.max(0) as u64) * 1_000_000_000 / spec.rate as u64;
+                buffer_ns.store(ns, Ordering::Relaxed);
             }
         }
     }

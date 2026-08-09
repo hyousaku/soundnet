@@ -60,12 +60,21 @@ export type RouteHealth =
   | { type: "ok" }
   | { type: "retrying"; attempts: number; reason: string; next_retry_ms: number };
 
+// No single engine can measure a route's whole path: the sender engine
+// only ever knows its own ALSA capture buffering, the receiver engine only
+// ever knows roc's own e2e figure (via RTCP) plus its ALSA playback
+// buffering. `null` means "this engine doesn't know" — never treat it as
+// zero, and never sum whatever fields happen to be present and present the
+// result as a total unless all three are non-null. See the doc comment on
+// StreamStats in crates/soundnet-protocol/src/lib.rs and latency.ts.
 export interface StreamStats {
   xruns: number;
   jitter_ms: number;
   level_db: number;
-  e2e_latency_ms: number;
   health: RouteHealth;
+  roc_e2e_ms: number | null;
+  capture_buffer_ms: number | null;
+  playback_buffer_ms: number | null;
 }
 
 export interface ManualHost {

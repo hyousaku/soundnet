@@ -135,13 +135,45 @@ pub enum RouteHealth {
 }
 
 /// Live per-route runtime stats streamed on the WS.
+///
+/// **No engine can measure a route's whole path.** `RunningRoute` on the
+/// source machine holds the capture + roc-sender handles; on the
+/// destination machine it holds the roc-receiver + playback handles. So the
+/// sender engine can only ever know its own ALSA capture buffering, and the
+/// receiver engine can only ever know roc's own end-to-end figure (via
+/// RTCP) plus its ALSA playback buffering. A browser is connected to
+/// exactly one engine and only ever sees that engine's half.
+///
+/// This is why latency is three separate optional fields rather than one
+/// combined figure: summing whatever a single engine happens to know and
+/// presenting it as "end-to-end latency" would be worse than showing
+/// nothing, because an operator tuning against it would believe they're at
+/// the partial number when they're actually higher. `None` means "this
+/// engine doesn't know" — either because it has no local role in that half
+/// of the route, or because nothing's been sampled yet — and the UI is
+/// expected to say so rather than treating it as zero (see RouteEditor.tsx
+/// / Patchbay.tsx).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StreamStats {
     pub xruns: u32,
     pub jitter_ms: f32,
     pub level_db: f32,
-    pub e2e_latency_ms: f32,
     pub health: RouteHealth,
+    /// Roc's own end-to-end latency (frame written by the sender's
+    /// `roc_sender_write` → frame read by the receiver's `roc_receiver_read`),
+    /// computed by libroc from RTCP + system clock. Only ever populated by
+    /// the engine holding this route's roc receiver.
+    #[serde(default)]
+    pub roc_e2e_ms: Option<f32>,
+    /// Frames currently queued in the local ALSA capture device. Only ever
+    /// populated by the engine holding this route's capture side (never for
+    /// a Tone source, which has no ALSA buffer to report).
+    #[serde(default)]
+    pub capture_buffer_ms: Option<f32>,
+    /// Frames currently queued in the local ALSA playback device. Only ever
+    /// populated by the engine holding this route's playback side.
+    #[serde(default)]
+    pub playback_buffer_ms: Option<f32>,
 }
 
 /// A host the user added manually (mDNS was blocked / offline). Rendered in

@@ -40,6 +40,12 @@ pub struct RunningRoute {
     pub xruns: Option<Arc<AtomicUsize>>,
     pub e2e_ns: Option<Arc<AtomicU64>>,
     pub jitter_ns: Option<Arc<AtomicU64>>,
+    /// ALSA capture-buffer delay, only ever set when this engine holds the
+    /// route's capture side (see the honesty note on `StreamStats`).
+    pub cap_buffer_ns: Option<Arc<AtomicU64>>,
+    /// ALSA playback-buffer delay, only ever set when this engine holds the
+    /// route's playback side.
+    pub pb_buffer_ns: Option<Arc<AtomicU64>>,
 }
 
 impl RunningRoute {
@@ -119,16 +125,29 @@ async fn roc_context() -> Result<Arc<RocContext>> {
 
 /// Deterministic port offset from a route id. Both sender and receiver
 /// engines derive the same value so they meet on the same UDP port without
-/// needing to negotiate it. Repair packets take `+1`, so we step by 2.
+/// needing to negotiate it. Each route now claims *three* consecutive
+/// ports: the value returned here (source), `+1` (FEC repair), and `+2`
+/// (RTCP control — see transport/sender.rs and transport/receiver.rs). The
+/// stride between routes therefore has to be (at least) 3, not 2: at
+/// stride 2, a route's control port at `+2` would land exactly on the next
+/// route's source port, silently pulling audio into what's supposed to be
+/// a control channel. Widening the stride to 3 keeps each route's 3-port
+/// window disjoint from its neighbors' by construction.
 ///
-/// Range: `audio_port + 2 * (0..1000)` — that's 1000 concurrent inbound
-/// routes per engine before collisions become likely.
+/// Range: `audio_port + 3 * (1..=1000)` — that's still 1000 concurrent
+/// inbound routes per engine before same-bucket collisions become likely
+/// (see `route_ports_never_partially_overlap` for what "collide" does and
+/// doesn't mean here).
+///
+/// This is a pure function of `route_id` and the peer's advertised
+/// `audio_port` — it has to stay that way, since both engines derive it
+/// independently with no negotiation.
 pub fn route_port(audio_port_base: u16, route_id: &str) -> u16 {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     route_id.hash(&mut hasher);
     let h = hasher.finish();
-    audio_port_base.saturating_add(2 + ((h % 1000) as u16) * 2)
+    audio_port_base.saturating_add(3 + ((h % 1000) as u16) * 3)
 }
 
 /// Whether this route asks for a route source and this engine is the sender.
@@ -270,6 +289,7 @@ async fn try_start_inner(state: &Arc<EngineState>, route: &Route) -> Result<Opti
     let mut running = RunningRoute {
         cap: None, tx: None, rx: None, pb: None,
         level_bits: None, xruns: None, e2e_ns: None, jitter_ns: None,
+        cap_buffer_ns: None, pb_buffer_ns: None,
     };
 
     if is_local_src(state, route) {
@@ -309,6 +329,7 @@ async fn try_start_inner(state: &Arc<EngineState>, route: &Route) -> Result<Opti
             cap.consumer,
             outgoing,
         )?;
+        running.cap_buffer_ns = Some(cap.buffer_ns.clone());
         running.cap = Some(cap.control);
         running.tx = Some(sender);
     }
@@ -333,6 +354,7 @@ async fn try_start_inner(state: &Arc<EngineState>, route: &Route) -> Result<Opti
         running.xruns = Some(pb.xruns.clone());
         running.e2e_ns = Some(receiver.e2e_latency_ns.clone());
         running.jitter_ns = Some(receiver.jitter_ns.clone());
+        running.pb_buffer_ns = Some(pb.buffer_ns.clone());
         running.rx = Some(receiver);
         running.pb = Some(pb.control);
     }
@@ -495,6 +517,24 @@ fn routes_equal(a: &Route, b: &Route) -> bool {
     serde_json::to_string(a).ok() == serde_json::to_string(b).ok()
 }
 
+/// Convert a nanosecond atomic reading to milliseconds, treating `u64::MAX`
+/// as the shared sentinel worker threads use for "nothing sampled yet"
+/// (see the doc comments on `ReceiverHandle::e2e_latency_ns` and
+/// `CaptureHandle`/`PlaybackHandle::buffer_ns`). A real latency or buffer
+/// depth is never anywhere close to `u64::MAX` ns (~584 years), so it's an
+/// otherwise-unused corner of the value space rather than a plausible
+/// duration — using it instead of 0 matters here specifically because 0 is
+/// a value these metrics can genuinely take (an empty ALSA buffer, a
+/// freshly-connected RTCP session), so it can't double as "no data".
+fn ns_to_ms(atomic: &Arc<AtomicU64>) -> Option<f32> {
+    let raw = atomic.load(Ordering::Relaxed);
+    if raw == u64::MAX {
+        None
+    } else {
+        Some(raw as f32 / 1_000_000.0)
+    }
+}
+
 /// Every 200ms, sample the live stats atomics for every running Route and
 /// broadcast a `Stats` message.
 pub fn spawn_stats_pump(state: Arc<EngineState>) {
@@ -520,16 +560,21 @@ pub fn spawn_stats_pump(state: Arc<EngineState>) {
                     .as_ref()
                     .map(|c| c.load(Ordering::Relaxed) as u32)
                     .unwrap_or(0);
-                let e2e_ms = running
-                    .e2e_ns
-                    .as_ref()
-                    .map(|n| n.load(Ordering::Relaxed) as f32 / 1_000_000.0)
-                    .unwrap_or(0.0);
                 let jitter_ms = running
                     .jitter_ns
                     .as_ref()
                     .map(|n| n.load(Ordering::Relaxed) as f32 / 1_000_000.0)
                     .unwrap_or(0.0);
+                // Each of these is only ever populated on the engine that
+                // holds the corresponding half of the route — see the
+                // honesty note on StreamStats. `None` covers two distinct
+                // cases the browser can't tell apart from here (this engine
+                // has no role for that component at all, vs. it has the
+                // role but nothing's been sampled yet) — both mean "don't
+                // show a number", so collapsing them is fine.
+                let roc_e2e_ms = running.e2e_ns.as_ref().and_then(|n| ns_to_ms(n));
+                let capture_buffer_ms = running.cap_buffer_ns.as_ref().and_then(|n| ns_to_ms(n));
+                let playback_buffer_ms = running.pb_buffer_ns.as_ref().and_then(|n| ns_to_ms(n));
                 // A worker can have died since the last try_start check (that
                 // only happens on the next discovery event or supervisor
                 // tick) — report it as retrying immediately rather than
@@ -547,8 +592,10 @@ pub fn spawn_stats_pump(state: Arc<EngineState>) {
                     xruns,
                     jitter_ms,
                     level_db: if level > 0.0 { 20.0 * level.log10() } else { -120.0 },
-                    e2e_latency_ms: e2e_ms,
                     health,
+                    roc_e2e_ms,
+                    capture_buffer_ms,
+                    playback_buffer_ms,
                 };
                 map.insert(route_id, stats);
             }
@@ -567,8 +614,10 @@ pub fn spawn_stats_pump(state: Arc<EngineState>) {
                         xruns: 0,
                         jitter_ms: 0.0,
                         level_db: -120.0,
-                        e2e_latency_ms: 0.0,
                         health: entry.value().to_health(),
+                        roc_e2e_ms: None,
+                        capture_buffer_ms: None,
+                        playback_buffer_ms: None,
                     },
                 );
             }
@@ -638,17 +687,52 @@ mod tests {
         let a = route_port(10_001, id);
         let b = route_port(10_001, id);
         assert_eq!(a, b, "same id must produce same port on both engines");
-        assert!(a >= 10_003 && a <= 10_001 + 2 + 998 * 2, "port {a} out of range");
+        assert!(a >= 10_001 + 3 && a <= 10_001 + 3 + 999 * 3, "port {a} out of range");
     }
 
     #[test]
-    fn route_port_leaves_room_for_repair() {
-        // Repair packets take audio_port + 1, so per-route ports must be even
-        // offsets to avoid the repair port clashing with the next route's
-        // source port.
+    fn route_port_leaves_room_for_repair_and_control() {
+        // A route uses 3 consecutive ports: source (returned here), +1
+        // repair, +2 RTCP control. Per-route base offsets must therefore be
+        // 3-aligned, or a route's control (or repair) port would clash with
+        // a neighboring route's source port.
         for id in ["r1", "r2", "12345", "550e8400-e29b-41d4-a716-446655440000"] {
             let p = route_port(10_001, id);
-            assert_eq!((p - 10_001) % 2, 0, "port for {id} = {p} is not even offset");
+            assert_eq!((p - 10_001) % 3, 0, "port for {id} = {p} is not a 3-aligned offset");
+        }
+    }
+
+    /// The part of `route_port` most likely to break silently in
+    /// production: verify that for a large sample of *distinct* route ids,
+    /// no route's {source, repair, control} 3-port window partially
+    /// overlaps another's. Two different ids landing on the exact same
+    /// bucket (`h % 1000`) is a separate, pre-existing, and much rarer risk
+    /// documented on `route_port` itself — indistinguishable from two
+    /// routes that are genuinely the same route, so it's not a bug. A
+    /// *partial* overlap (e.g. one route's control port landing on
+    /// another's source port) is exactly the class of bug this stride
+    /// widening (2 -> 3) was meant to fix, and is what this test targets.
+    #[test]
+    fn route_ports_never_partially_overlap() {
+        let base = 10_001u16;
+        let ids: Vec<String> = (0..300).map(|i| format!("route-{i}")).collect();
+        for a in &ids {
+            let pa = route_port(base, a);
+            assert!(pa >= base + 3, "{a}: port {pa} must land at or after base+3");
+            for b in &ids {
+                if a == b {
+                    continue;
+                }
+                let pb = route_port(base, b);
+                let diff = pa.abs_diff(pb);
+                assert!(
+                    diff == 0 || diff >= 3,
+                    "routes {a:?} (port {pa}) and {b:?} (port {pb}) partially overlap \
+                     (diff {diff}); each route's 3-port window must be fully identical \
+                     to another's (same hash bucket) or fully disjoint, never overlapping \
+                     at just one or two ports"
+                );
+            }
         }
     }
 }
