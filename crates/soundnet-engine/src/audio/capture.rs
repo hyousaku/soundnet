@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 
-use crate::audio::format::{alsa_to_f32, to_alsa_format};
+use crate::audio::format::{alsa_to_f32, pick_format, to_alsa_format};
 use crate::tone;
 
 pub struct CaptureHandle {
@@ -74,10 +74,25 @@ fn alsa_worker(
 ) -> Result<()> {
     let pcm = alsa::PCM::new(alsa_name, alsa::Direction::Capture, false)
         .with_context(|| format!("open capture {alsa_name}"))?;
+    let format;
     {
         let hwp = alsa::pcm::HwParams::any(&pcm)?;
         hwp.set_access(alsa::pcm::Access::RWInterleaved)?;
-        hwp.set_format(to_alsa_format(spec.alsa_format))?;
+        // Unlike channels/rate/period below, ALSA has no "_near" for format —
+        // an exact mismatch (e.g. a raw hw: device that only does S24_3LE
+        // when the route asked for S16LE) would otherwise kill the worker
+        // outright. Substituting is safe because the wire format is always
+        // f32; we just need to convert using whatever we actually opened.
+        format = pick_format(spec.alsa_format, |f| hwp.test_format(to_alsa_format(f)).is_ok())
+            .ok_or_else(|| anyhow!("{alsa_name}: no supported capture format"))?;
+        if format != spec.alsa_format {
+            tracing::warn!(
+                "capture {alsa_name}: requested format {:?} unsupported, using {:?} instead",
+                spec.alsa_format,
+                format
+            );
+        }
+        hwp.set_format(to_alsa_format(format))?;
         // *_near variants let the driver pick the closest supported value —
         // USB DACs commonly reject exact rate/period requests.
         hwp.set_channels_near(spec.channels as u32)?;
@@ -89,7 +104,7 @@ fn alsa_worker(
     let io = pcm.io_bytes();
     pcm.start().ok(); // Ignore EAGAIN — first read will start it.
 
-    let frame_bytes = spec.channels as usize * spec.alsa_format.bytes_per_sample();
+    let frame_bytes = spec.channels as usize * format.bytes_per_sample();
     let period_frames = spec.frames_per_period as usize;
     let mut raw = vec![0u8; period_frames * frame_bytes];
     let mut floats: Vec<f32> = Vec::with_capacity(period_frames * spec.channels as usize);
@@ -107,7 +122,7 @@ fn alsa_worker(
                 return Err(anyhow!("capture read: {err}"));
             }
         }
-        alsa_to_f32(spec.alsa_format, &raw, &mut floats);
+        alsa_to_f32(format, &raw, &mut floats);
         for &s in &floats {
             // Drop samples if the transport side has fallen behind — better a
             // brief glitch than an unbounded buffer.

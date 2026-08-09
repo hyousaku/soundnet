@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 
-use crate::audio::format::{f32_to_alsa, to_alsa_format};
+use crate::audio::format::{f32_to_alsa, pick_format, to_alsa_format};
 
 pub struct PlaybackHandle {
     pub producer: Producer<f32>,
@@ -70,10 +70,24 @@ fn worker(
 ) -> Result<()> {
     let pcm = alsa::PCM::new(alsa_name, alsa::Direction::Playback, false)
         .with_context(|| format!("open playback {alsa_name}"))?;
+    let format;
     {
         let hwp = alsa::pcm::HwParams::any(&pcm)?;
         hwp.set_access(alsa::pcm::Access::RWInterleaved)?;
-        hwp.set_format(to_alsa_format(spec.alsa_format))?;
+        // See capture.rs: format has no "_near" fallback in ALSA itself, so
+        // a raw hw: device that doesn't natively support the requested
+        // format would otherwise kill the worker instead of just using
+        // whatever it does support (transparent, since the wire is f32).
+        format = pick_format(spec.alsa_format, |f| hwp.test_format(to_alsa_format(f)).is_ok())
+            .ok_or_else(|| anyhow!("{alsa_name}: no supported playback format"))?;
+        if format != spec.alsa_format {
+            tracing::warn!(
+                "playback {alsa_name}: requested format {:?} unsupported, using {:?} instead",
+                spec.alsa_format,
+                format
+            );
+        }
+        hwp.set_format(to_alsa_format(format))?;
         hwp.set_channels_near(spec.channels as u32)?;
         hwp.set_rate_near(spec.rate, alsa::ValueOr::Nearest)?;
         hwp.set_period_size_near(spec.frames_per_period as i64, alsa::ValueOr::Nearest)?;
@@ -82,7 +96,7 @@ fn worker(
     }
     let io = pcm.io_bytes();
 
-    let frame_bytes = spec.channels as usize * spec.alsa_format.bytes_per_sample();
+    let frame_bytes = spec.channels as usize * format.bytes_per_sample();
     let period_frames = spec.frames_per_period as usize;
     let period_samples = period_frames * spec.channels as usize;
 
@@ -113,7 +127,7 @@ fn worker(
         let smoothed = if peak > prev { peak } else { prev * 0.7 + peak * 0.3 };
         level_bits.store(smoothed.to_bits(), Ordering::Relaxed);
 
-        f32_to_alsa(spec.alsa_format, &floats, &mut raw);
+        f32_to_alsa(format, &floats, &mut raw);
         match io.writei(&raw) {
             Ok(_) => {}
             Err(err) => {

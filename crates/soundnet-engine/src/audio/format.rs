@@ -14,6 +14,42 @@ pub fn to_alsa_format(fmt: SampleFormat) -> alsa::pcm::Format {
     }
 }
 
+/// Fallback order to try when a device rejects the format a route asked
+/// for. Mirrors `devices::CANDIDATE_FORMATS` — the same four formats we
+/// already probe for when enumerating ports — so runtime substitution never
+/// picks a format the UI wouldn't also have listed as supported.
+const FALLBACK_FORMATS: &[SampleFormat] = &[
+    SampleFormat::S24Le3,
+    SampleFormat::S16Le,
+    SampleFormat::S32Le,
+    SampleFormat::F32Le,
+];
+
+/// Pick the ALSA format to actually open a device with. `requested` is what
+/// the route's spec asks for; `supported` reports whether a given format is
+/// usable (backed by `HwParams::test_format` at the call sites — kept as a
+/// closure here so the selection logic is testable without a live ALSA
+/// device). The requested format wins if the hardware takes it; otherwise
+/// this falls through `FALLBACK_FORMATS` and returns the first alternative
+/// that works. The wire format is always f32 (see module docs), so
+/// substituting the ALSA-side format is transparent to everything except
+/// the conversion routines below — callers must thread the *returned*
+/// format into `alsa_to_f32`/`f32_to_alsa` and buffer-size arithmetic, not
+/// the originally requested one. Returns `None` only if the device accepts
+/// none of the candidates, which the caller should treat as fatal.
+pub fn pick_format(
+    requested: SampleFormat,
+    supported: impl Fn(SampleFormat) -> bool,
+) -> Option<SampleFormat> {
+    if supported(requested) {
+        return Some(requested);
+    }
+    FALLBACK_FORMATS
+        .iter()
+        .copied()
+        .find(|&fmt| fmt != requested && supported(fmt))
+}
+
 /// Convert a raw ALSA byte buffer (little-endian, interleaved) into f32.
 pub fn alsa_to_f32(fmt: SampleFormat, bytes: &[u8], out: &mut Vec<f32>) {
     out.clear();
@@ -109,6 +145,28 @@ mod tests {
         for (a, b) in src.iter().zip(back.iter()) {
             assert!((a - b).abs() < 1.0 / i16::MAX as f32);
         }
+    }
+
+    #[test]
+    fn pick_format_falls_back_when_requested_unsupported() {
+        // AG06MK2-shaped case from the bug report: route wants S16LE, the
+        // raw device only does S24_3LE.
+        let chosen = pick_format(SampleFormat::S16Le, |f| f == SampleFormat::S24Le3);
+        assert_eq!(chosen, Some(SampleFormat::S24Le3));
+    }
+
+    #[test]
+    fn pick_format_keeps_requested_when_supported() {
+        let chosen = pick_format(SampleFormat::S16Le, |f| {
+            matches!(f, SampleFormat::S16Le | SampleFormat::S24Le3)
+        });
+        assert_eq!(chosen, Some(SampleFormat::S16Le));
+    }
+
+    #[test]
+    fn pick_format_fails_when_nothing_matches() {
+        let chosen = pick_format(SampleFormat::S16Le, |_| false);
+        assert_eq!(chosen, None);
     }
 
     #[test]
