@@ -9,7 +9,7 @@ use std::sync::Arc;
 use tokio::sync::{broadcast, RwLock};
 
 use crate::config::ManualHost;
-use crate::routing::RunningRoute;
+use crate::routing::{RouteFailure, RunningRoute};
 
 #[derive(Debug, Clone)]
 pub struct EngineIdentity {
@@ -33,6 +33,10 @@ pub struct EngineState {
     /// Routes we're currently running (RouteId → running task handle).
     pub routes: DashMap<RouteId, Route>,
     pub running: DashMap<RouteId, RunningRoute>,
+
+    /// Backoff bookkeeping for routes this engine has a local role in but
+    /// that failed to start (or whose workers died) — see `routing::try_start`.
+    pub failures: DashMap<RouteId, RouteFailure>,
 
     /// Rolling per-route stats (updated by workers).
     pub stats: DashMap<RouteId, StreamStats>,
@@ -76,6 +80,7 @@ impl EngineState {
             peers: DashMap::new(),
             routes: DashMap::new(),
             running: DashMap::new(),
+            failures: DashMap::new(),
             stats: DashMap::new(),
             config_path: RwLock::new(None),
             manual_hosts: RwLock::new(Vec::new()),

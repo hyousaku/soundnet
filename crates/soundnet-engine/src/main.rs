@@ -119,6 +119,11 @@ async fn main() -> Result<()> {
     // forever. Poll each known peer's HTTP endpoint so dead ones eventually
     // get pruned even without a goodbye packet.
     discovery::spawn_liveness_checker(state.clone());
+    // Retries driven purely by peer (re-)discovery miss two cases: a route
+    // whose peer never flaps again after the route dies, and one that never
+    // had a working peer-independent cause (e.g. the audio device) fixed
+    // except by operator action unrelated to mDNS. This sweep catches both.
+    routing::spawn_route_supervisor(state.clone());
 
     // Control plane (HTTP + WebSocket + embedded web UI).
     let control_handle = tokio::spawn(control::serve(state.clone(), bind_addr));

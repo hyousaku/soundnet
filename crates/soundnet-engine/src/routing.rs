@@ -16,10 +16,10 @@
 
 use anyhow::{anyhow, bail, Context, Result};
 use once_cell::sync::Lazy;
-use soundnet_protocol::{PortKind, Route, ServerMsg, StreamStats};
+use soundnet_protocol::{PortKind, Route, RouteHealth, ServerMsg, StreamStats};
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 
 use crate::audio::{
@@ -40,6 +40,67 @@ pub struct RunningRoute {
     pub xruns: Option<Arc<AtomicUsize>>,
     pub e2e_ns: Option<Arc<AtomicU64>>,
     pub jitter_ns: Option<Arc<AtomicU64>>,
+}
+
+impl RunningRoute {
+    /// A worker thread can outlive its usefulness silently: `capture::spawn`
+    /// (and its tx/rx/playback counterparts) return `Ok` the moment the OS
+    /// thread is created, well before the ALSA/roc call inside it has had a
+    /// chance to fail. `JoinHandle::is_finished` is the only way to notice
+    /// after the fact that a "running" route's worker actually died.
+    fn is_dead(&self) -> bool {
+        self.cap.as_ref().map(|c| c.thread.is_finished()).unwrap_or(false)
+            || self.tx.as_ref().map(|t| t.thread.is_finished()).unwrap_or(false)
+            || self.rx.as_ref().map(|r| r.thread.is_finished()).unwrap_or(false)
+            || self.pb.as_ref().map(|p| p.thread.is_finished()).unwrap_or(false)
+    }
+}
+
+/// Backoff bookkeeping for a route this engine has a local role in but
+/// couldn't (or couldn't keep) running. Kept separate from `RunningRoute`
+/// because it must persist across the route *not* being in `state.running`
+/// at all (e.g. the peer has never been discovered).
+pub struct RouteFailure {
+    attempts: u32,
+    reason: String,
+    next_retry_at: Instant,
+}
+
+impl RouteFailure {
+    fn to_health(&self) -> RouteHealth {
+        RouteHealth::Retrying {
+            attempts: self.attempts,
+            reason: self.reason.clone(),
+            next_retry_ms: self
+                .next_retry_at
+                .saturating_duration_since(Instant::now())
+                .as_millis() as u64,
+        }
+    }
+}
+
+/// Exponential backoff for repeated route-start failures: doubles from 2s,
+/// capped at 60s so a route with a persistent problem (bad format, unplugged
+/// device, peer that's gone for good) stops burning CPU/threads on every
+/// mDNS resolve, while still trying again eventually in case the operator
+/// fixes it — without needing to delete and recreate the route.
+fn backoff_for_attempts(attempts: u32) -> Duration {
+    let shift = attempts.saturating_sub(1).min(5); // 2,4,8,16,32,60(capped)
+    let secs = 2u64.checked_shl(shift).unwrap_or(u64::MAX);
+    Duration::from_secs(secs.min(60))
+}
+
+/// Record (or extend) a failure for `id`, bumping its attempt count and
+/// pushing `next_retry_at` out by the backoff for that attempt count.
+fn record_failure(state: &Arc<EngineState>, id: &str, reason: &str) {
+    let mut entry = state.failures.entry(id.to_string()).or_insert_with(|| RouteFailure {
+        attempts: 0,
+        reason: String::new(),
+        next_retry_at: Instant::now(),
+    });
+    entry.attempts += 1;
+    entry.reason = reason.to_string();
+    entry.next_retry_at = Instant::now() + backoff_for_attempts(entry.attempts);
 }
 
 /// One process-wide roc context — allocating per Route would explode the
@@ -98,11 +159,15 @@ pub async fn apply_route(state: &Arc<EngineState>, route: Route, gossip: bool) -
     persist(state).await;
 
     // If the running config no longer matches (or nothing was running yet),
-    // reboot the workers.
+    // reboot the workers. Also clear any backoff from a prior failure — the
+    // operator just changed something (e.g. picked a format the device
+    // actually supports), so this deserves an immediate attempt rather than
+    // waiting out whatever window the last failure scheduled.
     if is_new_or_changed {
         if let Some((_, existing)) = state.running.remove(&route.id) {
             shutdown_running(existing);
         }
+        state.failures.remove(&route.id);
         if let Err(err) = try_start(state, &route).await {
             tracing::warn!("route {} could not start yet: {err:#}", route.id);
         }
@@ -149,10 +214,59 @@ fn validate_route(state: &Arc<EngineState>, route: &Route) -> Result<()> {
 /// Try to spawn the local workers for this route. Returns an error if the
 /// required endpoints aren't currently available (e.g. the peer hasn't been
 /// discovered yet); callers should keep the route in state and retry later.
+///
+/// Throttled: a route that just failed (or whose workers were just found
+/// dead) won't be re-attempted again until its backoff window elapses — see
+/// `record_failure`/`backoff_for_attempts`. Called both on-demand (peer
+/// discovery) and from a periodic sweep (`spawn_route_supervisor`), so this
+/// needs to be cheap to call repeatedly when there's nothing to do.
 pub async fn try_start(state: &Arc<EngineState>, route: &Route) -> Result<()> {
-    if state.running.contains_key(&route.id) {
-        return Ok(());
+    if let Some(entry) = state.running.get(&route.id) {
+        let dead = entry.is_dead();
+        drop(entry);
+        if !dead {
+            // Confirmed alive as of this check — any backoff from an earlier
+            // failure no longer applies.
+            state.failures.remove(&route.id);
+            return Ok(());
+        }
+        if let Some((_, dead_route)) = state.running.remove(&route.id) {
+            shutdown_running(dead_route);
+        }
+        record_failure(state, &route.id, "worker exited unexpectedly");
+        tracing::warn!(
+            "route {} worker(s) exited unexpectedly; backing off before retry",
+            route.id
+        );
     }
+
+    if let Some(failure) = state.failures.get(&route.id) {
+        if Instant::now() < failure.next_retry_at {
+            return Ok(());
+        }
+    }
+
+    match try_start_inner(state, route).await {
+        Ok(Some(running)) => {
+            // Don't clear the failure entry yet: a worker that dies right
+            // after spawning (the ALSA-format case) looks identical to a
+            // healthy start from here. It's cleared above once a later check
+            // finds the route still alive.
+            state.running.insert(route.id.clone(), running);
+            Ok(())
+        }
+        Ok(None) => Ok(()),
+        Err(err) => {
+            record_failure(state, &route.id, &format!("{err:#}"));
+            Err(err)
+        }
+    }
+}
+
+/// Does the actual work of spawning local workers for `route`. `Ok(None)`
+/// means this route has no local role at all (both endpoints are other
+/// peers) — not a failure, nothing to retry.
+async fn try_start_inner(state: &Arc<EngineState>, route: &Route) -> Result<Option<RunningRoute>> {
     let mut running = RunningRoute {
         cap: None, tx: None, rx: None, pb: None,
         level_bits: None, xruns: None, e2e_ns: None, jitter_ns: None,
@@ -215,21 +329,23 @@ pub async fn try_start(state: &Arc<EngineState>, route: &Route) -> Result<()> {
     }
 
     if running.cap.is_some() || running.pb.is_some() {
-        state.running.insert(route.id.clone(), running);
+        Ok(Some(running))
+    } else {
+        Ok(None)
     }
-    Ok(())
 }
 
-/// After a new peer is discovered, walk existing routes and start any that
-/// were waiting for this peer.
+/// After a new peer is discovered, walk existing routes and (re-)try any
+/// that reference it. `try_start` is cheap to call when there's nothing to
+/// do (already running and healthy, or still backing off from a recent
+/// failure), so no need to pre-filter beyond the peer match.
 pub async fn retry_pending_for_peer(state: &Arc<EngineState>, peer_id: &str) {
     let candidates: Vec<Route> = state
         .routes
         .iter()
         .filter(|entry| {
             let r = entry.value();
-            !state.running.contains_key(&r.id)
-                && (r.src.node_id == peer_id || r.dst.node_id == peer_id)
+            r.src.node_id == peer_id || r.dst.node_id == peer_id
         })
         .map(|e| e.value().clone())
         .collect();
@@ -240,11 +356,35 @@ pub async fn retry_pending_for_peer(state: &Arc<EngineState>, peer_id: &str) {
     }
 }
 
+/// Periodic safety net so a failing route recovers on its own once its
+/// underlying problem clears (device replugged, format changed in the UI,
+/// peer's engine restarted) without requiring a fresh mDNS resolve to drive
+/// `retry_pending_for_peer` — discovery only calls that for routes touching
+/// the specific peer that was just (re-)resolved. Each tick's calls are
+/// throttled the same way as any other `try_start` call, so this stays cheap
+/// even with many routes.
+pub fn spawn_route_supervisor(state: Arc<EngineState>) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(3));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            interval.tick().await;
+            let routes: Vec<Route> = state.routes.iter().map(|e| e.value().clone()).collect();
+            for route in routes {
+                if let Err(err) = try_start(&state, &route).await {
+                    tracing::debug!("route supervisor: route {} still failing: {err:#}", route.id);
+                }
+            }
+        }
+    });
+}
+
 pub async fn remove_route(state: &Arc<EngineState>, id: &str, gossip: bool) {
     let route = state.routes.remove(id).map(|(_, r)| r);
     if let Some((_, running)) = state.running.remove(id) {
         shutdown_running(running);
     }
+    state.failures.remove(id);
     state.stats.remove(id);
     persist(state).await;
     if gossip {
@@ -375,13 +515,47 @@ pub fn spawn_stats_pump(state: Arc<EngineState>) {
                     .as_ref()
                     .map(|n| n.load(Ordering::Relaxed) as f32 / 1_000_000.0)
                     .unwrap_or(0.0);
+                // A worker can have died since the last try_start check (that
+                // only happens on the next discovery event or supervisor
+                // tick) — report it as retrying immediately rather than
+                // waiting for eviction to catch up.
+                let health = if running.is_dead() {
+                    state
+                        .failures
+                        .get(&route_id)
+                        .map(|f| f.to_health())
+                        .unwrap_or(RouteHealth::Ok)
+                } else {
+                    RouteHealth::Ok
+                };
                 let stats = StreamStats {
                     xruns,
                     jitter_ms,
                     level_db: if level > 0.0 { 20.0 * level.log10() } else { -120.0 },
                     e2e_latency_ms: e2e_ms,
+                    health,
                 };
                 map.insert(route_id, stats);
+            }
+            // Routes that never made it into `running` at all (peer never
+            // discovered, or evicted after dying and not yet retried) still
+            // need to be visible — otherwise they just look identical to a
+            // route this engine has no local role in.
+            for entry in state.failures.iter() {
+                let route_id = entry.key().clone();
+                if map.contains_key(&route_id) {
+                    continue;
+                }
+                map.insert(
+                    route_id,
+                    StreamStats {
+                        xruns: 0,
+                        jitter_ms: 0.0,
+                        level_db: -120.0,
+                        e2e_latency_ms: 0.0,
+                        health: entry.value().to_health(),
+                    },
+                );
             }
             if !map.is_empty() {
                 let _ = state.events.send(ServerMsg::Stats { stats: map });
@@ -418,7 +592,30 @@ fn shutdown_running(running: RunningRoute) {
 
 #[cfg(test)]
 mod tests {
-    use super::route_port;
+    use super::{backoff_for_attempts, route_port};
+    use std::time::Duration;
+
+    #[test]
+    fn backoff_doubles_then_caps() {
+        assert_eq!(backoff_for_attempts(1), Duration::from_secs(2));
+        assert_eq!(backoff_for_attempts(2), Duration::from_secs(4));
+        assert_eq!(backoff_for_attempts(3), Duration::from_secs(8));
+        assert_eq!(backoff_for_attempts(4), Duration::from_secs(16));
+        assert_eq!(backoff_for_attempts(5), Duration::from_secs(32));
+        // 2 * 2^5 = 64, which is where the 60s ceiling kicks in.
+        assert_eq!(backoff_for_attempts(6), Duration::from_secs(60));
+        assert_eq!(backoff_for_attempts(20), Duration::from_secs(60));
+    }
+
+    #[test]
+    fn backoff_is_monotonically_nondecreasing() {
+        let mut prev = Duration::from_secs(0);
+        for attempt in 1..30 {
+            let cur = backoff_for_attempts(attempt);
+            assert!(cur >= prev, "backoff decreased at attempt {attempt}");
+            prev = cur;
+        }
+    }
 
     #[test]
     fn route_port_is_deterministic_and_in_range() {

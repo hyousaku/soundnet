@@ -42,12 +42,16 @@ export default function RouteEditor() {
             <th>e2e</th>
             <th>jitter</th>
             <th>xr</th>
+            <th>health</th>
             <th></th>
           </tr>
         </thead>
         <tbody>
-          {routeList.map((r) => (
-            <tr key={r.id}>
+          {routeList.map((r) => {
+            const health = stats[r.id]?.health;
+            const failing = health?.type === "retrying";
+            return (
+            <tr key={r.id} style={failing ? { background: "rgba(239, 83, 80, 0.08)" } : undefined}>
               <td>
                 {nodes[r.src.node_id]?.hostname ?? r.src.node_id.slice(0, 8)} →{" "}
                 {nodes[r.dst.node_id]?.hostname ?? r.dst.node_id.slice(0, 8)}
@@ -109,13 +113,25 @@ export default function RouteEditor() {
               <td>{stats[r.id] ? `${stats[r.id].e2e_latency_ms.toFixed(1)} ms` : "—"}</td>
               <td>{stats[r.id] ? `${stats[r.id].jitter_ms.toFixed(2)} ms` : "—"}</td>
               <td>{stats[r.id]?.xruns ?? 0}</td>
+              <td style={{ maxWidth: 220 }}>
+                {failing && health?.type === "retrying" ? (
+                  <span title={health.reason} style={{ color: "#ef5350" }}>
+                    retrying ({health.attempts}) — {health.reason}
+                  </span>
+                ) : health ? (
+                  <span style={{ color: "#4ade80" }}>ok</span>
+                ) : (
+                  "—"
+                )}
+              </td>
               <td>
                 <button onClick={() => send({ type: "remove_route", id: r.id })}>
                   Remove
                 </button>
               </td>
             </tr>
-          ))}
+            );
+          })}
         </tbody>
       </table>
     </div>

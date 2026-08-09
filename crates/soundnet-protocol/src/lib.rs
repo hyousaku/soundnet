@@ -116,13 +116,32 @@ pub struct Route {
     pub spec: StreamSpec,
 }
 
+/// Local-engine assessment of a route's health. Carried alongside its stats
+/// so the UI can show *why* audio has gone quiet instead of just going quiet
+/// itself. `Retrying` covers everything from "the peer isn't discovered yet"
+/// to "the capture/playback worker crashed" — those are indistinguishable
+/// from here (a worker can fail on its own thread well after the engine
+/// already reported it started), so `reason` is best-effort context, not a
+/// stable error code.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum RouteHealth {
+    Ok,
+    Retrying {
+        attempts: u32,
+        reason: String,
+        next_retry_ms: u64,
+    },
+}
+
 /// Live per-route runtime stats streamed on the WS.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StreamStats {
     pub xruns: u32,
     pub jitter_ms: f32,
     pub level_db: f32,
     pub e2e_latency_ms: f32,
+    pub health: RouteHealth,
 }
 
 /// A host the user added manually (mDNS was blocked / offline). Rendered in

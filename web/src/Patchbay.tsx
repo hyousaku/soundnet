@@ -62,21 +62,26 @@ export default function Patchbay() {
   const rfEdges: Edge[] = useMemo(() => {
     return Object.values(routes).map((r) => {
       const s = stats[r.id];
+      const failing = s?.health.type === "retrying";
       const lat = s ? ` · e2e ${s.e2e_latency_ms.toFixed(1)}ms` : "";
       const xr = s && s.xruns > 0 ? ` · xr ${s.xruns}` : "";
+      const label = failing && s?.health.type === "retrying"
+        ? `retrying (${s.health.attempts}) — ${s.health.reason}`
+        : `${r.spec.rate / 1000}k · ${r.spec.channels}ch · ${r.spec.frames_per_period}f${lat}${xr}`;
+      const color = failing ? "#ef5350" : "#6cf";
       return {
         id: r.id,
         source: r.src.node_id,
         sourceHandle: r.src.port_id,
         target: r.dst.node_id,
         targetHandle: r.dst.port_id,
-        label: `${r.spec.rate / 1000}k · ${r.spec.channels}ch · ${r.spec.frames_per_period}f${lat}${xr}`,
+        label,
         labelBgStyle: { fill: "#151920", stroke: "#262d38", strokeWidth: 1 },
         labelBgPadding: [6, 4] as [number, number],
         labelBgBorderRadius: 4,
-        labelStyle: { fill: "#e6e9ef", fontSize: 11 },
-        style: { stroke: "#6cf", strokeWidth: 2 },
-        markerEnd: { type: MarkerType.ArrowClosed, color: "#6cf" },
+        labelStyle: { fill: failing ? "#ef5350" : "#e6e9ef", fontSize: 11 },
+        style: { stroke: color, strokeWidth: 2 },
+        markerEnd: { type: MarkerType.ArrowClosed, color },
       };
     });
   }, [routes, stats]);

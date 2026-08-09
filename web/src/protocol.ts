@@ -56,11 +56,16 @@ export interface Route {
   spec: StreamSpec;
 }
 
+export type RouteHealth =
+  | { type: "ok" }
+  | { type: "retrying"; attempts: number; reason: string; next_retry_ms: number };
+
 export interface StreamStats {
   xruns: number;
   jitter_ms: number;
   level_db: number;
   e2e_latency_ms: number;
+  health: RouteHealth;
 }
 
 export interface ManualHost {
