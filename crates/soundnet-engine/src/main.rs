@@ -50,7 +50,6 @@ async fn main() -> Result<()> {
         .unwrap_or_else(|| "localhost".to_string());
 
     let node_name = cli.name.clone().unwrap_or_else(|| hostname.clone());
-    let node_id = uuid::Uuid::new_v4().to_string();
 
     let bind_addr = cli.bind;
     let advertise_ip = pick_advertise_ip(bind_addr.ip()).context("pick advertise ip")?;
@@ -59,7 +58,27 @@ async fn main() -> Result<()> {
         .config
         .clone()
         .unwrap_or_else(config::default_path);
-    let cfg = config::Config::load_or_default(Some(&cfg_path))?;
+    let mut cfg = config::Config::load_or_default(Some(&cfg_path))?;
+
+    // Node identity must survive restarts (crash, `systemctl restart`, a
+    // rebuild) or every peer keeps showing both the old and new instance
+    // forever — nothing ever tells them the old id is gone. Generate one
+    // only on first run, and save it back immediately so a crash on the
+    // very next line still finds it on disk next time.
+    let node_id = match cfg.node_id.clone() {
+        Some(id) => id,
+        None => {
+            let id = uuid::Uuid::new_v4().to_string();
+            cfg.node_id = Some(id.clone());
+            if let Err(err) = cfg.save(&cfg_path) {
+                tracing::warn!(
+                    "failed to persist new node_id to {}: {err:#}",
+                    cfg_path.display()
+                );
+            }
+            id
+        }
+    };
 
     let state = state::EngineState::new(state::EngineIdentity {
         node_id,
@@ -95,6 +114,11 @@ async fn main() -> Result<()> {
     // Kick off discovery + stats pump in the background.
     discovery::spawn(state.clone(), advertise_ip, bind_addr.port(), cli.audio_port);
     routing::spawn_stats_pump(state.clone());
+    // mDNS ServiceRemoved only fires on a graceful goodbye; a crash, SIGKILL,
+    // or re-IP via DHCP just leaves the old peer record in state.peers
+    // forever. Poll each known peer's HTTP endpoint so dead ones eventually
+    // get pruned even without a goodbye packet.
+    discovery::spawn_liveness_checker(state.clone());
 
     // Control plane (HTTP + WebSocket + embedded web UI).
     let control_handle = tokio::spawn(control::serve(state.clone(), bind_addr));

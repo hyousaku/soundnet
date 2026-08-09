@@ -261,6 +261,12 @@ pub async fn persist(state: &Arc<EngineState>) {
     let path = state.config_path.read().await.clone();
     let Some(path) = path else { return };
     let cfg = Config {
+        // The identity is set once at startup (see main.rs) and never
+        // changes at runtime, but persist() rebuilds the whole Config from
+        // scratch — leaving this out would silently erase the stored
+        // node_id the next time a route or manual host change triggers a
+        // save, reintroducing the "new UUID every restart" bug.
+        node_id: Some(state.identity.node_id.clone()),
         routes: state.routes.iter().map(|e| e.value().clone()).collect(),
         manual_hosts: state.manual_hosts.read().await.clone(),
     };

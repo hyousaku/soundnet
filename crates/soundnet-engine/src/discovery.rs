@@ -7,6 +7,7 @@
 
 use mdns_sd::{ServiceDaemon, ServiceEvent, ServiceInfo};
 use soundnet_protocol::{LocalPort, Node, PeerPortsPush, ServerMsg};
+use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -15,6 +16,16 @@ use crate::routing;
 use crate::state::{EngineState, MdnsHandle, PeerRecord};
 
 const SERVICE_TYPE: &str = "_soundnet._udp.local.";
+
+/// How often we poll each known peer's `/api/state` to check it's still
+/// alive. mDNS's ServiceRemoved only fires on a graceful goodbye, so this is
+/// the only thing that notices a peer that crashed, got unplugged, or moved
+/// to a new IP via DHCP.
+const LIVENESS_INTERVAL: Duration = Duration::from_secs(10);
+/// A single dropped request could just be a busy peer or a lost packet — wait
+/// for three in a row (~30s) before declaring the peer gone.
+const LIVENESS_FAILURE_THRESHOLD: u32 = 3;
+const LIVENESS_TIMEOUT: Duration = Duration::from_secs(2);
 
 pub fn spawn(state: Arc<EngineState>, ip: IpAddr, control_port: u16, audio_port: u16) {
     tokio::spawn(async move {
@@ -123,6 +134,86 @@ async fn run(
         }
     }
     Ok(())
+}
+
+/// Periodically probe every known peer's control plane and drop the ones
+/// that stop answering. This is what actually gets rid of a peer record once
+/// its process is gone — mDNS ServiceRemoved only covers a clean shutdown,
+/// and the previous ServiceRemoved matching (fullname substring on the first
+/// 8 chars of a node id) wasn't reliable enough to depend on for that either.
+pub fn spawn_liveness_checker(state: Arc<EngineState>) {
+    tokio::spawn(async move {
+        // Failure counts live only in this task; nothing else needs to see
+        // them, and keeping them here avoids putting transient bookkeeping
+        // on EngineState.
+        let mut failures: HashMap<String, u32> = HashMap::new();
+        let mut interval = tokio::time::interval(LIVENESS_INTERVAL);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            interval.tick().await;
+            check_peers_once(&state, &mut failures).await;
+        }
+    });
+}
+
+async fn check_peers_once(state: &Arc<EngineState>, failures: &mut HashMap<String, u32>) {
+    let snapshot: Vec<(String, Node)> =
+        state.peers.iter().map(|e| (e.key().clone(), e.value().node.clone())).collect();
+    // Drop stale bookkeeping for ids that already left state.peers by some
+    // other path (e.g. remove_manual) so the map doesn't grow forever.
+    failures.retain(|id, _| snapshot.iter().any(|(pid, _)| pid == id));
+
+    for (id, node) in snapshot {
+        let url = format!("http://{}:{}/api/state", node.addr, node.port);
+        let fetched = tokio::task::spawn_blocking(move || {
+            ureq::get(&url)
+                .timeout(LIVENESS_TIMEOUT)
+                .call()
+                .and_then(|resp| resp.into_json::<soundnet_protocol::StateSnapshot>().map_err(Into::into))
+        })
+        .await;
+
+        match fetched {
+            Ok(Ok(snap)) => {
+                failures.remove(&id);
+                let real_id = snap.self_node.id.clone();
+                if real_id != id {
+                    // The address we had cached for `id` now answers as a
+                    // different node id — the classic ghost case, e.g. this
+                    // engine restarted with a new identity while this
+                    // machine still had the old record cached (or, before
+                    // the node_id persistence fix, just restarted at all).
+                    // The id that's actually reachable wins; drop the stale
+                    // one instead of leaving both permanently in the list.
+                    tracing::info!(
+                        "liveness: {}:{} now answers as {} (was cached as {}); dropping the stale record",
+                        node.addr, node.port, real_id, id
+                    );
+                    state.peers.remove(&id);
+                    let _ = state.events.send(ServerMsg::NodeDisappeared { node_id: id });
+                }
+                // Refresh the cached record either way — ports may have
+                // changed since we first saw this peer, and this is cheap.
+                state.peers.insert(
+                    real_id,
+                    PeerRecord { node: snap.self_node.clone(), ports: snap.local_ports },
+                );
+            }
+            _ => {
+                let count = failures.entry(id.clone()).or_insert(0);
+                *count += 1;
+                if *count >= LIVENESS_FAILURE_THRESHOLD {
+                    if state.peers.remove(&id).is_some() {
+                        tracing::info!(
+                            "liveness: peer {id} unreachable after {count} checks, dropping"
+                        );
+                        let _ = state.events.send(ServerMsg::NodeDisappeared { node_id: id.clone() });
+                    }
+                    failures.remove(&id);
+                }
+            }
+        }
+    }
 }
 
 /// Kick off a background fetch for a manually-added host. If the fetch
