@@ -48,6 +48,7 @@ pub fn spawn(
     let thread = thread::Builder::new()
         .name(format!("roc-rx-{bind_host}-{bind_port}"))
         .spawn(move || {
+            crate::rt::raise_thread_priority("roc receiver", crate::rt::PRIO_RECEIVER);
             if let Err(err) = run(&ctx, &bind_host, bind_port, &spec, &mut producer, &stop_worker, &e2e_worker, &jitter_worker) {
                 tracing::error!("receiver on {bind_host}:{bind_port} failed: {err:#}");
             }

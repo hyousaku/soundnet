@@ -34,9 +34,14 @@ impl CaptureControl {
 }
 
 pub fn spawn(alsa_name: &str, spec: &StreamSpec) -> Result<CaptureHandle> {
-    // Ring holds ~4 periods worth of interleaved samples — plenty of slack
-    // between the capture worker and the transport pump.
-    let ring_cap = (spec.frames_per_period as usize) * (spec.channels as usize) * 8;
+    // Ring holds 3 periods worth of interleaved samples: enough that one
+    // scheduling hiccup on either side of the ring doesn't instantly drop
+    // samples, but not so much that a ring that stays full (the steady
+    // state under normal load) becomes latency of its own. This ring is
+    // the added-latency budget between ALSA and the network, so it's worth
+    // keeping tight now that the audio threads run SCHED_FIFO and rarely
+    // need the slack a normal-priority thread would.
+    let ring_cap = (spec.frames_per_period as usize) * (spec.channels as usize) * 3;
     let (mut prod, cons) = RingBuffer::<f32>::new(ring_cap);
 
     let stop = Arc::new(AtomicBool::new(false));
@@ -49,11 +54,19 @@ pub fn spawn(alsa_name: &str, spec: &StreamSpec) -> Result<CaptureHandle> {
         let freq: f32 = freq.parse().unwrap_or(440.0);
         thread::Builder::new()
             .name(format!("cap-tone-{alsa_name}"))
-            .spawn(move || tone_worker(freq, spec, &mut prod, stop_worker))?
+            .spawn(move || {
+                // The tone generator paces itself off a wall-clock sleep
+                // (see tone_worker below) exactly like a real ALSA period
+                // would, so it's just as exposed to scheduler jitter as the
+                // hardware path and gets the same treatment.
+                crate::rt::raise_thread_priority("capture (tone)", crate::rt::PRIO_CAPTURE);
+                tone_worker(freq, spec, &mut prod, stop_worker)
+            })?
     } else {
         thread::Builder::new()
             .name(format!("cap-{alsa_name}"))
             .spawn(move || {
+                crate::rt::raise_thread_priority("capture", crate::rt::PRIO_CAPTURE);
                 if let Err(err) = alsa_worker(&alsa_name, &spec, &mut prod, &stop_worker) {
                     tracing::error!("capture {alsa_name} failed: {err:#}");
                 }
@@ -98,7 +111,12 @@ fn alsa_worker(
         hwp.set_channels_near(spec.channels as u32)?;
         hwp.set_rate_near(spec.rate, alsa::ValueOr::Nearest)?;
         hwp.set_period_size_near(spec.frames_per_period as i64, alsa::ValueOr::Nearest)?;
-        hwp.set_periods(3, alsa::ValueOr::Nearest)?;
+        // Two periods (double buffering) is the standard low-latency
+        // choice — one period's worth of hardware buffer being drained
+        // while the other fills, vs. three periods of slack we don't need.
+        // ValueOr::Nearest means a device that insists on more (some cheap
+        // USB DACs refuse 2) gets bumped up instead of failing to open.
+        hwp.set_periods(2, alsa::ValueOr::Nearest)?;
         pcm.hw_params(&hwp)?;
     }
     let io = pcm.io_bytes();

@@ -32,7 +32,10 @@ impl PlaybackControl {
 }
 
 pub fn spawn(alsa_name: &str, spec: &StreamSpec) -> Result<PlaybackHandle> {
-    let ring_cap = (spec.frames_per_period as usize) * (spec.channels as usize) * 8;
+    // See capture.rs: 3 periods of slack between the transport pump and
+    // ALSA is enough to absorb a single scheduling hiccup without becoming
+    // steady-state latency of its own.
+    let ring_cap = (spec.frames_per_period as usize) * (spec.channels as usize) * 3;
     let (prod, cons) = RingBuffer::<f32>::new(ring_cap);
 
     let stop = Arc::new(AtomicBool::new(false));
@@ -47,6 +50,7 @@ pub fn spawn(alsa_name: &str, spec: &StreamSpec) -> Result<PlaybackHandle> {
     let thread = thread::Builder::new()
         .name(format!("pb-{alsa_name}"))
         .spawn(move || {
+            crate::rt::raise_thread_priority("playback", crate::rt::PRIO_PLAYBACK);
             if let Err(err) = worker(&alsa_name, &spec, cons, &stop_worker, &level_worker, &xruns_worker) {
                 tracing::error!("playback {alsa_name} failed: {err:#}");
             }
@@ -91,7 +95,9 @@ fn worker(
         hwp.set_channels_near(spec.channels as u32)?;
         hwp.set_rate_near(spec.rate, alsa::ValueOr::Nearest)?;
         hwp.set_period_size_near(spec.frames_per_period as i64, alsa::ValueOr::Nearest)?;
-        hwp.set_periods(3, alsa::ValueOr::Nearest)?;
+        // See capture.rs: 2 periods is the low-latency default; Nearest
+        // falls back to whatever the device actually supports.
+        hwp.set_periods(2, alsa::ValueOr::Nearest)?;
         pcm.hw_params(&hwp)?;
     }
     let io = pcm.io_bytes();

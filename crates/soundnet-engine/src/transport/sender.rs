@@ -44,6 +44,7 @@ pub fn spawn(
     let thread = thread::Builder::new()
         .name(format!("roc-tx-{remote_host}"))
         .spawn(move || {
+            crate::rt::raise_thread_priority("roc sender", crate::rt::PRIO_SENDER);
             if let Err(err) =
                 run(&ctx, &remote_host, remote_audio_port, &spec, consumer, &stop_worker, outgoing)
             {
@@ -74,6 +75,26 @@ fn interface_config_for(ip: IpAddr) -> Result<roc::roc_interface_config> {
     })
 }
 
+/// Convert a period size in frames to roc's `packet_length` field, which is
+/// in nanoseconds rather than frames. Returns 0 — roc's own sentinel for
+/// "pick a default" — for inputs that can't produce a sane duration: a zero
+/// frame count or rate would otherwise divide into garbage, and a period
+/// long enough to exceed a full second is almost certainly a misconfigured
+/// `frames_per_period` rather than something worth handing to roc literally.
+/// Uses u128 for the intermediate product so a large `frames_per_period`
+/// can't silently wrap a 64-bit multiply before the divide brings it back
+/// down to a normal nanosecond count.
+fn packet_length_ns(frames_per_period: u32, rate: u32) -> u64 {
+    if frames_per_period == 0 || rate == 0 {
+        return 0;
+    }
+    let ns = (frames_per_period as u128 * 1_000_000_000u128) / rate as u128;
+    if ns == 0 || ns > 1_000_000_000 {
+        return 0;
+    }
+    ns as u64
+}
+
 fn run(
     ctx: &Arc<RocContext>,
     host: &str,
@@ -95,7 +116,11 @@ fn run(
             tracks: spec.channels as u32,
         },
         packet_encoding,
-        packet_length: 0,
+        // Match packetisation to the ALSA period instead of leaving it at
+        // roc's own (larger) default quantum — otherwise the network hop
+        // adds a chunking delay independent of, and typically bigger than,
+        // the one we already pay in the ALSA ring.
+        packet_length: packet_length_ns(spec.frames_per_period, spec.rate),
         packet_interleaving: 0,
         fec_encoding: if spec.fec {
             roc::roc_fec_encoding::ROC_FEC_ENCODING_RS8M
@@ -259,5 +284,23 @@ mod tests {
         }
         assert_eq!(cfg.multicast_group, [0 as c_char; 48]);
         assert_eq!(cfg.reuse_address, 0);
+    }
+
+    #[test]
+    fn packet_length_matches_period_duration() {
+        // 128 frames @ 48kHz is the default route spec (StreamSpec::default).
+        assert_eq!(packet_length_ns(128, 48_000), 2_666_666);
+        // Exact division should come out exact.
+        assert_eq!(packet_length_ns(480, 48_000), 10_000_000);
+        // Larger period / lower rate, still well under the 1s guard.
+        assert_eq!(packet_length_ns(4_410, 44_100), 100_000_000);
+    }
+
+    #[test]
+    fn packet_length_falls_back_to_default_on_bad_input() {
+        assert_eq!(packet_length_ns(0, 48_000), 0, "zero frames");
+        assert_eq!(packet_length_ns(128, 0), 0, "zero rate");
+        // A period this long is a misconfiguration, not a real packet size.
+        assert_eq!(packet_length_ns(u32::MAX, 1), 0, "absurdly long period");
     }
 }

@@ -4,6 +4,7 @@ mod control;
 mod discovery;
 mod iface;
 mod routing;
+mod rt;
 mod state;
 mod tone;
 mod transport;
@@ -42,6 +43,11 @@ async fn main() -> Result<()> {
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,soundnet_engine=debug")),
         )
         .init();
+
+    // Lock audio buffers into RAM before anything else starts allocating.
+    // Whole-process, once — see rt.rs for why this degrades gracefully
+    // instead of failing startup on boxes without the MEMLOCK rlimit.
+    rt::lock_memory();
 
     let cli = Cli::parse();
 
