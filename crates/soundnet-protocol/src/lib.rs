@@ -133,6 +133,17 @@ pub struct ManualHost {
     pub port: u16,
 }
 
+/// Pushed by an engine to every peer it knows about whenever its local port
+/// list changes (e.g. after a rescan). Lets peers refresh their cached copy
+/// without waiting for mDNS to re-resolve — mDNS TXT records don't carry the
+/// port list, so a silent local change would otherwise go unnoticed by
+/// anyone who discovered this node earlier.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PeerPortsPush {
+    pub node: Node,
+    pub ports: Vec<LocalPort>,
+}
+
 /// Full state snapshot pushed on connect.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StateSnapshot {

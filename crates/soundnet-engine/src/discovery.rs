@@ -6,7 +6,7 @@
 //! render everything.
 
 use mdns_sd::{ServiceDaemon, ServiceEvent, ServiceInfo};
-use soundnet_protocol::{LocalPort, Node, ServerMsg};
+use soundnet_protocol::{LocalPort, Node, PeerPortsPush, ServerMsg};
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -172,6 +172,41 @@ pub async fn remove_manual(state: &Arc<EngineState>, addr: &str, port: u16) {
         let _ = state.events.send(ServerMsg::NodeDisappeared { node_id: id });
     }
     routing::persist(state).await;
+}
+
+/// Push our current port list to every peer we know about. Fire-and-forget:
+/// best effort, no retry — a peer that's down or unreachable just keeps its
+/// stale copy until it next re-fetches on its own (e.g. its own rescan, or
+/// the next time mDNS resolves us fresh on its end).
+pub fn push_ports_to_peers(state: &Arc<EngineState>) {
+    let self_node = state.self_node();
+    let ports: Vec<LocalPort> = state.local_ports.iter().map(|e| e.value().clone()).collect();
+    let targets: Vec<(String, u16)> = state
+        .peers
+        .iter()
+        .map(|e| (e.node.addr.clone(), e.node.port))
+        .collect();
+
+    for (addr, port) in targets {
+        let push = PeerPortsPush { node: self_node.clone(), ports: ports.clone() };
+        let body = match serde_json::to_string(&push) {
+            Ok(s) => s,
+            Err(err) => {
+                tracing::warn!("push_ports_to_peers: serialize failed: {err}");
+                continue;
+            }
+        };
+        tokio::task::spawn_blocking(move || {
+            let url = format!("http://{addr}:{port}/api/peer-ports");
+            if let Err(err) = ureq::post(&url)
+                .set("content-type", "application/json")
+                .timeout(Duration::from_secs(3))
+                .send_string(&body)
+            {
+                tracing::debug!("push_ports_to_peers: {addr}:{port} unreachable: {err}");
+            }
+        });
+    }
 }
 
 async fn fetch_peer_state(state: &Arc<EngineState>, node: Node) {

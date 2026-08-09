@@ -8,11 +8,13 @@ use axum::response::{IntoResponse, Json};
 use axum::routing::{delete, get, post};
 use axum::Router;
 use serde::Deserialize;
-use soundnet_protocol::{Route, StateSnapshot};
+use soundnet_protocol::{PeerPortsPush, Route, ServerMsg, StateSnapshot};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::trace::TraceLayer;
+
+use crate::state::PeerRecord;
 
 #[derive(Debug, Deserialize)]
 pub struct GossipQuery {
@@ -33,6 +35,7 @@ pub async fn serve(state: Arc<EngineState>, addr: SocketAddr) -> Result<()> {
         .route("/api/routes", post(add_route_handler))
         .route("/api/routes/:id", delete(remove_route_handler))
         .route("/api/rescan", post(rescan_handler))
+        .route("/api/peer-ports", post(peer_ports_handler))
         .route("/ws", get(ws::ws_handler))
         .fallback(web::static_handler)
         .layer(CorsLayer::new().allow_origin(Any).allow_methods(Any).allow_headers(Any))
@@ -107,8 +110,11 @@ async fn rescan_handler(State(state): State<Arc<EngineState>>) -> impl IntoRespo
     }
 }
 
-/// Re-enumerate local ALSA ports and push a fresh state snapshot to every
-/// connected UI. Returns the new port count.
+/// Re-enumerate local ALSA ports, push a fresh state snapshot to every
+/// connected UI, and tell every known peer about the new port list (mDNS
+/// TXT records don't carry ports, so peers who discovered us earlier would
+/// otherwise keep showing our stale port list forever). Returns the new
+/// port count.
 pub async fn rescan_and_broadcast(state: &Arc<EngineState>) -> anyhow::Result<usize> {
     crate::audio::devices::refresh(state)?;
     // Tones are always registered; refresh() only drops non-tone entries.
@@ -118,5 +124,27 @@ pub async fn rescan_and_broadcast(state: &Arc<EngineState>) -> anyhow::Result<us
     let _ = state
         .events
         .send(soundnet_protocol::ServerMsg::State { snapshot: snap });
+    crate::discovery::push_ports_to_peers(state);
     Ok(count)
+}
+
+/// Receive a peer's updated port list (see `discovery::push_ports_to_peers`)
+/// and refresh our cached copy of it.
+async fn peer_ports_handler(
+    State(state): State<Arc<EngineState>>,
+    Json(push): Json<PeerPortsPush>,
+) -> impl IntoResponse {
+    if push.node.id == state.identity.node_id {
+        // Shouldn't happen, but never let a node overwrite its own record.
+        return StatusCode::BAD_REQUEST;
+    }
+    state.peers.insert(
+        push.node.id.clone(),
+        PeerRecord { node: push.node.clone(), ports: push.ports.clone() },
+    );
+    let _ = state.events.send(ServerMsg::NodeAppeared {
+        node: push.node,
+        ports: push.ports,
+    });
+    StatusCode::NO_CONTENT
 }
