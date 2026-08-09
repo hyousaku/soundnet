@@ -104,14 +104,43 @@ soundnet-engine [--bind 0.0.0.0:7788] [--name my-node] [--audio-port 10001]
 
 ## Running as a systemd service
 
+If you have been running the engine by hand (`./target/release/soundnet-engine`,
+possibly under `nohup`), **stop it first**. systemd cannot bind port 7788 while
+another copy holds it, and the failure is easy to misread: the service enters a
+restart loop logging `Address already in use (os error 98)` while the old
+process keeps serving the UI perfectly well — so the web page looks fine and it
+appears as though a freshly built binary simply had no effect.
+
 ```bash
+pkill -f soundnet-engine
+sleep 1
+pgrep -f soundnet-engine || echo "nothing left running"
+
 sudo install -m 755 target/release/soundnet-engine /usr/local/bin/
 sudo cp packaging/soundnet-engine.service /etc/systemd/system/soundnet-engine@.service
 sudo cp packaging/99-realtime.conf /etc/security/limits.d/
 sudo systemctl daemon-reload
 sudo usermod -aG audio $USER          # log out and back in after this
 sudo systemctl enable --now soundnet-engine@$USER.service
+systemctl status soundnet-engine@$USER.service --no-pager
 ```
+
+### Deploying a new build
+
+The web UI is compiled into the binary by `rust-embed`, so **build `web/` before
+building the engine** or the embedded UI will be the previous one:
+
+```bash
+git pull
+cd web && npm run build && cd ..
+cargo build --release -p soundnet-engine
+sudo install -m 755 target/release/soundnet-engine /usr/local/bin/
+sudo systemctl restart soundnet-engine@$USER.service
+```
+
+If a service has been failing repeatedly, systemd may refuse to start it until
+you clear the failure counter with
+`sudo systemctl reset-failed soundnet-engine@$USER.service`.
 
 ## Development
 
