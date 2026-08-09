@@ -79,8 +79,15 @@ fn run(
         fec_block_repair_packets: 0,
         clock_source: roc::roc_clock_source::ROC_CLOCK_SOURCE_INTERNAL,
         latency_tuner_backend: roc::roc_latency_tuner_backend::ROC_LATENCY_TUNER_BACKEND_DEFAULT,
+        // Sender-side latency tuning stays off (target_latency/tolerance are
+        // 0 below, which keeps INTACT profile in effect), but we still pin
+        // resampler_backend away from DEFAULT/BUILTIN for consistency with
+        // the receiver — see the long comment in receiver.rs for why: a
+        // roc-toolkit 0.4.0 bug in the builtin resampler can abort() the
+        // whole process, and there's no reason to leave that door open on
+        // the sender side too if we ever enable sender-side tuning later.
         latency_tuner_profile: roc::roc_latency_tuner_profile::ROC_LATENCY_TUNER_PROFILE_DEFAULT,
-        resampler_backend: roc::roc_resampler_backend::ROC_RESAMPLER_BACKEND_DEFAULT,
+        resampler_backend: roc::roc_resampler_backend::ROC_RESAMPLER_BACKEND_SPEEX,
         resampler_profile: roc::roc_resampler_profile::ROC_RESAMPLER_PROFILE_DEFAULT,
         // Latency tuning defaults are managed on the receiver side; keep
         // sender-side tuning disabled by leaving these zero.

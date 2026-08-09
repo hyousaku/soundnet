@@ -77,8 +77,19 @@ fn run(
         },
         clock_source: roc::roc_clock_source::ROC_CLOCK_SOURCE_INTERNAL,
         latency_tuner_backend: roc::roc_latency_tuner_backend::ROC_LATENCY_TUNER_BACKEND_DEFAULT,
-        latency_tuner_profile: roc::roc_latency_tuner_profile::ROC_LATENCY_TUNER_PROFILE_DEFAULT,
-        resampler_backend: roc::roc_resampler_backend::ROC_RESAMPLER_BACKEND_DEFAULT,
+        // Explicitly GRADUAL + SPEEX rather than DEFAULT: with a low
+        // target_latency, DEFAULT auto-selects RESPONSIVE, which in turn
+        // pulls in the BUILTIN resampler. That combination has a known
+        // crash in roc-toolkit 0.4.0 (`roc_panic()` in
+        // builtin_resampler.cpp: "ind_begin_prev > frame_size_ch_"), which
+        // takes down the whole engine process via SIGABRT — not something
+        // we can catch from Rust since it's a C++ abort(). GRADUAL+SPEEX is
+        // roc's own recommended pairing for "cheap CPU" / non-extreme
+        // latency use, and avoids the buggy code path entirely. Costs a few
+        // ms of extra clock-sync smoothing, which is a fine trade for "the
+        // process doesn't crash."
+        latency_tuner_profile: roc::roc_latency_tuner_profile::ROC_LATENCY_TUNER_PROFILE_GRADUAL,
+        resampler_backend: roc::roc_resampler_backend::ROC_RESAMPLER_BACKEND_SPEEX,
         resampler_profile: roc::roc_resampler_profile::ROC_RESAMPLER_PROFILE_DEFAULT,
         target_latency: (spec.target_latency_ms as u64) * 1_000_000,
         latency_tolerance: 0,
