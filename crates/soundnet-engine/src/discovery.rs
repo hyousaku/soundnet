@@ -35,14 +35,14 @@ pub fn spawn(state: Arc<EngineState>, ip: IpAddr, control_port: u16, audio_port:
     });
 }
 
-async fn run(
-    state: Arc<EngineState>,
-    ip: IpAddr,
-    control_port: u16,
-    audio_port: u16,
-) -> anyhow::Result<()> {
-    let daemon = ServiceDaemon::new()?;
-
+/// Build the `ServiceInfo` this engine advertises for a given address.
+/// Deliberately does **not** call `enable_addr_auto()`: that registers every
+/// interface IP on the box, and on a multi-homed host (wired + wireless on
+/// the same subnet) peers then get re-resolved every ~2s alternating between
+/// addresses, forever. We always advertise exactly one address — either the
+/// pinned interface's or the automatically-chosen one — and it's the caller's
+/// job to have already picked which.
+fn build_service_info(state: &EngineState, ip: IpAddr, audio_port: u16) -> anyhow::Result<ServiceInfo> {
     let host_label = format!("{}-{}", state.identity.hostname, &state.identity.node_id[..8]);
     let instance = &state.identity.node_id;
     let mut props = std::collections::HashMap::new();
@@ -51,15 +51,26 @@ async fn run(
     props.insert("version".to_string(), state.identity.version.clone());
     props.insert("hostname".to_string(), state.identity.hostname.clone());
 
-    let mut info = ServiceInfo::new(
+    let info = ServiceInfo::new(
         SERVICE_TYPE,
         instance,
         &format!("{host_label}.local."),
         ip.to_string().as_str(),
-        control_port,
+        state.identity.control_port,
         Some(props),
     )?;
-    info = info.enable_addr_auto();
+    Ok(info)
+}
+
+async fn run(
+    state: Arc<EngineState>,
+    ip: IpAddr,
+    control_port: u16,
+    audio_port: u16,
+) -> anyhow::Result<()> {
+    let daemon = ServiceDaemon::new()?;
+
+    let info = build_service_info(&state, ip, audio_port)?;
     let fullname = info.get_fullname().to_string();
     daemon.register(info)?;
     tracing::info!("mDNS: advertising {SERVICE_TYPE} on {ip}:{control_port}");
@@ -133,6 +144,42 @@ async fn run(
             _ => {}
         }
     }
+    Ok(())
+}
+
+/// Re-register this engine's mDNS record under a new address — used when the
+/// operator pins (or un-pins) a network interface at runtime (see
+/// `iface::set_selected`). Unregisters the old record first so peers pick up
+/// the new address promptly instead of caching the old one until its TTL
+/// expires with two records momentarily in flight.
+pub async fn reregister(state: &Arc<EngineState>, ip: IpAddr) -> anyhow::Result<()> {
+    let mut guard = state.mdns.write().await;
+    let Some(handle) = guard.as_ref() else {
+        // Discovery hasn't finished its own initial registration yet (a
+        // narrow startup race). Nothing to re-register — that first
+        // registration reads the current address when it runs, so it'll
+        // already be correct.
+        return Ok(());
+    };
+    let daemon = handle.daemon.clone();
+    let old_fullname = handle.fullname.clone();
+
+    let info = build_service_info(state, ip, state.identity.audio_port)?;
+    let new_fullname = info.get_fullname().to_string();
+
+    if let Ok(rx) = daemon.unregister(&old_fullname) {
+        // Best-effort wait for the goodbye to actually go out before we
+        // advertise the replacement, capped so a slow/stuck mDNS event loop
+        // can't hang an interface switch indefinitely.
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(500), async {
+            let _ = tokio::task::spawn_blocking(move || rx.recv()).await;
+        })
+        .await;
+    }
+    daemon.register(info)?;
+    tracing::info!("mDNS: re-advertising {SERVICE_TYPE} on {ip}");
+
+    *guard = Some(MdnsHandle { daemon, fullname: new_fullname });
     Ok(())
 }
 

@@ -2,6 +2,7 @@ mod audio;
 mod config;
 mod control;
 mod discovery;
+mod iface;
 mod routing;
 mod state;
 mod tone;
@@ -52,13 +53,14 @@ async fn main() -> Result<()> {
     let node_name = cli.name.clone().unwrap_or_else(|| hostname.clone());
 
     let bind_addr = cli.bind;
-    let advertise_ip = pick_advertise_ip(bind_addr.ip()).context("pick advertise ip")?;
 
     let cfg_path = cli
         .config
         .clone()
         .unwrap_or_else(config::default_path);
     let mut cfg = config::Config::load_or_default(Some(&cfg_path))?;
+
+    let advertise_ip = pick_advertise_ip(bind_addr.ip(), cfg.interface.as_deref());
 
     // Node identity must survive restarts (crash, `systemctl restart`, a
     // rebuild) or every peer keeps showing both the old and new instance
@@ -83,7 +85,7 @@ async fn main() -> Result<()> {
     let state = state::EngineState::new(state::EngineIdentity {
         node_id,
         hostname: node_name,
-        addr: advertise_ip,
+        addr: std::sync::RwLock::new(advertise_ip),
         control_port: bind_addr.port(),
         audio_port: cli.audio_port,
         version: env!("CARGO_PKG_VERSION").to_string(),
@@ -96,6 +98,11 @@ async fn main() -> Result<()> {
     // Remember where to persist changes.
     *state.config_path.write().await = Some(cfg_path.clone());
     *state.manual_hosts.write().await = cfg.manual_hosts.clone();
+    // Keep the pinned name itself (not whether it currently resolved) so a
+    // temporarily-missing NIC (unplugged, mid-rename) doesn't get silently
+    // forgotten the next time something calls routing::persist() — only an
+    // explicit operator action (or it resolving again) should change this.
+    *state.selected_interface.write().await = cfg.interface.clone();
     // Best-effort resolve of manual hosts (their state fetch happens in discovery::add_manual).
     for mh in &cfg.manual_hosts {
         discovery::probe_manual(state.clone(), mh.addr.clone(), mh.port);
@@ -170,24 +177,29 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-/// Choose which IP to advertise in mDNS records. If the user bound to 0.0.0.0
-/// we pick the first non-loopback IPv4 interface; otherwise we honour the bind.
-fn pick_advertise_ip(bound: IpAddr) -> Result<IpAddr> {
-    match bound {
-        IpAddr::V4(v4) if v4 != Ipv4Addr::UNSPECIFIED => Ok(IpAddr::V4(v4)),
-        _ => Ok(first_non_loopback_ipv4().unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST))),
-    }
-}
-
-fn first_non_loopback_ipv4() -> Option<IpAddr> {
-    // if-addrs (transitively pulled by mdns-sd) gives us portable enumeration.
-    for iface in if_addrs::get_if_addrs().ok()? {
-        let ip = iface.ip();
-        if let IpAddr::V4(v4) = ip {
-            if !v4.is_loopback() && !v4.is_unspecified() && !v4.is_link_local() {
-                return Some(IpAddr::V4(v4));
-            }
+/// Choose which IP to advertise in mDNS records and to bind audio egress to.
+/// Priority: an explicit non-wildcard `--bind` always wins (the operator
+/// already told us exactly which address to use); otherwise the pinned
+/// interface from Config, resolved to its current IP; otherwise the first
+/// non-loopback IPv4 interface the OS lists (unchanged fallback behaviour
+/// from before interface pinning existed).
+///
+/// A pinned name that doesn't currently resolve (renamed NIC, unplugged, or
+/// a config copied from the other deployed machine) must not prevent
+/// startup — fall back to automatic and say so.
+fn pick_advertise_ip(bound: IpAddr, pinned_name: Option<&str>) -> IpAddr {
+    if let IpAddr::V4(v4) = bound {
+        if v4 != Ipv4Addr::UNSPECIFIED {
+            return IpAddr::V4(v4);
         }
     }
-    None
+    if let Some(name) = pinned_name {
+        match iface::resolve(name) {
+            Some(ip) => return ip,
+            None => tracing::warn!(
+                "configured interface {name:?} not found on this host; falling back to automatic selection"
+            ),
+        }
+    }
+    iface::first_non_loopback_ipv4().unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST))
 }

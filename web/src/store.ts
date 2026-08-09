@@ -3,6 +3,7 @@ import type {
   ClientMsg,
   LocalPort,
   ManualHost,
+  NetInterface,
   Node,
   NodeId,
   Route,
@@ -20,6 +21,8 @@ interface Store {
   routes: Record<RouteId, Route>;
   stats: Record<RouteId, StreamStats>;
   manualHosts: ManualHost[];
+  interfaces: NetInterface[];
+  selectedInterface: string | null;
   send: (msg: ClientMsg) => void;
   _socket?: WebSocket;
   _connect: () => void;
@@ -32,6 +35,8 @@ export const useStore = create<Store>((set, get) => ({
   routes: {},
   stats: {},
   manualHosts: [],
+  interfaces: [],
+  selectedInterface: null,
   send: (msg) => {
     const ws = get()._socket;
     if (ws && ws.readyState === WebSocket.OPEN) {
@@ -89,6 +94,8 @@ function applyServerMsg(
         ports,
         routes,
         manualHosts: snap.manual_hosts ?? [],
+        interfaces: snap.interfaces ?? [],
+        selectedInterface: snap.selected_interface ?? null,
       });
       break;
     }

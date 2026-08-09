@@ -1,10 +1,12 @@
 //! Roc sender wrapper: pulls f32 frames from a consumer ring and pushes them
 //! to a remote receiver via UDP+RTP (+FEC when enabled).
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, bail, Result};
+use core::ffi::c_char;
 use roc_sys as roc;
 use rtrb::Consumer;
 use soundnet_protocol::StreamSpec;
+use std::net::IpAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
@@ -24,13 +26,15 @@ impl SenderHandle {
 }
 
 /// Spawn a roc sender that connects to `remote_host:remote_port` and forwards
-/// samples from `consumer`.
+/// samples from `consumer`. `outgoing` pins the local address packets are
+/// sent from (a specific NIC's IP); `None` leaves it to the OS routing table.
 pub fn spawn(
     ctx: Arc<RocContext>,
     remote_host: &str,
     remote_audio_port: u16,
     spec: &StreamSpec,
     consumer: Consumer<f32>,
+    outgoing: Option<IpAddr>,
 ) -> Result<SenderHandle> {
     let stop = Arc::new(AtomicBool::new(false));
     let stop_worker = stop.clone();
@@ -40,12 +44,34 @@ pub fn spawn(
     let thread = thread::Builder::new()
         .name(format!("roc-tx-{remote_host}"))
         .spawn(move || {
-            if let Err(err) = run(&ctx, &remote_host, remote_audio_port, &spec, consumer, &stop_worker) {
+            if let Err(err) =
+                run(&ctx, &remote_host, remote_audio_port, &spec, consumer, &stop_worker, outgoing)
+            {
                 tracing::error!("sender to {remote_host}:{remote_audio_port} failed: {err:#}");
             }
         })?;
 
     Ok(SenderHandle { stop, thread })
+}
+
+/// Fill a `roc_interface_config` pinning egress to `ip`. `outgoing_address`
+/// is a fixed 48-byte NUL-terminated C string field — an IPv4 dotted-quad
+/// (max 15 chars) or IPv6 address (max 45) both fit comfortably, but this
+/// checks rather than trusts that silently.
+fn interface_config_for(ip: IpAddr) -> Result<roc::roc_interface_config> {
+    let addr = ip.to_string();
+    if addr.len() >= 48 {
+        bail!("address {addr} too long for roc_interface_config::outgoing_address");
+    }
+    let mut outgoing_address = [0 as c_char; 48];
+    for (dst, src) in outgoing_address.iter_mut().zip(addr.as_bytes()) {
+        *dst = *src as c_char;
+    }
+    Ok(roc::roc_interface_config {
+        outgoing_address,
+        multicast_group: [0 as c_char; 48],
+        reuse_address: 0,
+    })
 }
 
 fn run(
@@ -55,6 +81,7 @@ fn run(
     spec: &StreamSpec,
     mut consumer: Consumer<f32>,
     stop: &Arc<AtomicBool>,
+    outgoing: Option<IpAddr>,
 ) -> Result<()> {
     // Always use MULTITRACK layout — same code path for 1..32 channels, and
     // we register a custom packet encoding below so libroc doesn't try to
@@ -108,6 +135,40 @@ fn run(
         }
     }
     let _drop_sender = DropSender(sender);
+
+    // Pin egress before connecting, per interface — source and repair are
+    // separate sockets, and an unpinned one would leave repair packets free
+    // to go out whichever NIC the OS picks even with the source pinned.
+    // libroc treats an empty outgoing_address as "let the OS decide" (the
+    // pre-existing behaviour), so this is skipped entirely when nothing's
+    // pinned.
+    if let Some(ip) = outgoing {
+        let iface_cfg = interface_config_for(ip)?;
+        let rc = unsafe {
+            roc::roc_sender_configure(
+                sender,
+                roc::ROC_SLOT_DEFAULT,
+                roc::roc_interface::ROC_INTERFACE_AUDIO_SOURCE,
+                &iface_cfg,
+            )
+        };
+        if rc != 0 {
+            return Err(anyhow!("sender configure source outgoing_address failed ({rc})"));
+        }
+        if spec.fec {
+            let rc = unsafe {
+                roc::roc_sender_configure(
+                    sender,
+                    roc::ROC_SLOT_DEFAULT,
+                    roc::roc_interface::ROC_INTERFACE_AUDIO_REPAIR,
+                    &iface_cfg,
+                )
+            };
+            if rc != 0 {
+                return Err(anyhow!("sender configure repair outgoing_address failed ({rc})"));
+            }
+        }
+    }
 
     // Source endpoint: rtp+rs8m://host:port (when FEC on) or rtp://host:port.
     let source_uri = if spec.fec {
@@ -174,3 +235,29 @@ fn run(
 
 // (Channel-layout helpers are no longer needed — we always use MULTITRACK
 // with a custom packet encoding registered per (rate, channels) tuple.)
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::Ipv4Addr;
+
+    /// `outgoing_address` is a fixed 48-byte NUL-terminated C string that
+    /// libroc reads directly — this checks the byte-by-byte fill lands the
+    /// address correctly and leaves everything after it (the NUL terminator
+    /// included) zeroed, rather than trusting that by inspection.
+    #[test]
+    fn interface_config_encodes_address_and_nul_terminates() {
+        let ip = IpAddr::V4(Ipv4Addr::new(192, 168, 10, 135));
+        let cfg = interface_config_for(ip).expect("well within the 48-byte limit");
+
+        let addr_str = "192.168.10.135";
+        for (i, expected) in addr_str.bytes().enumerate() {
+            assert_eq!(cfg.outgoing_address[i], expected as c_char, "byte {i}");
+        }
+        for b in &cfg.outgoing_address[addr_str.len()..] {
+            assert_eq!(*b, 0, "bytes after the address must stay zero");
+        }
+        assert_eq!(cfg.multicast_group, [0 as c_char; 48]);
+        assert_eq!(cfg.reuse_address, 0);
+    }
+}

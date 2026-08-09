@@ -73,6 +73,13 @@ export interface ManualHost {
   port: number;
 }
 
+// A usable local network interface, for the "This node" interface-pinning
+// control. Only meaningful for self_node — see StateSnapshot.interfaces.
+export interface NetInterface {
+  name: string;
+  addr: string;
+}
+
 export interface StateSnapshot {
   self_node: Node;
   nodes: Node[];
@@ -80,6 +87,9 @@ export interface StateSnapshot {
   remote_ports: LocalPort[];
   routes: Route[];
   manual_hosts: ManualHost[];
+  // Describes self_node only: a peer's own snapshot describes itself, not us.
+  interfaces: NetInterface[];
+  selected_interface: string | null;
 }
 
 export type ServerMsg =
@@ -99,7 +109,11 @@ export type ClientMsg =
   | { type: "update_spec"; id: RouteId; spec: StreamSpec }
   | { type: "add_manual_host"; addr: string; port: number }
   | { type: "remove_manual_host"; addr: string; port: number }
-  | { type: "rescan_devices" };
+  | { type: "rescan_devices" }
+  // Pin (or, with name: null, un-pin back to automatic) the network
+  // interface this engine advertises over mDNS and sends audio out of. Only
+  // meaningful sent to the engine that owns the interface.
+  | { type: "set_interface"; name: string | null };
 
 export const defaultSpec = (): StreamSpec => ({
   encoding: { kind: "pcm" },

@@ -13,7 +13,10 @@ export default function Sidebar() {
     <aside className="sidebar">
       <h2>This node</h2>
       {self ? (
-        <NodeSection node={self} ports={ports[self.id] ?? []} />
+        <>
+          <NodeSection node={self} ports={ports[self.id] ?? []} />
+          <InterfacePicker />
+        </>
       ) : (
         <div className="hint">Connecting…</div>
       )}
@@ -49,6 +52,36 @@ export default function Sidebar() {
         </>
       )}
     </aside>
+  );
+}
+
+// Network interface picker for THIS engine only — the browser talks to one
+// engine, and that engine can only reconfigure itself, not a peer. Rendered
+// solely under "This node" (never inside NodeSection, which is also used for
+// peers) so it can't be mistaken for controlling anyone else.
+function InterfacePicker() {
+  const interfaces = useStore((s) => s.interfaces);
+  const selectedInterface = useStore((s) => s.selectedInterface);
+  const send = useStore((s) => s.send);
+
+  return (
+    <div className="node-card">
+      <div className="hint" style={{ marginBottom: 6 }}>
+        Egress interface (this node only)
+      </div>
+      <select
+        value={selectedInterface ?? ""}
+        onChange={(e) => send({ type: "set_interface", name: e.target.value || null })}
+        style={{ width: "100%" }}
+      >
+        <option value="">Automatic</option>
+        {interfaces.map((i) => (
+          <option key={i.name} value={i.name}>
+            {i.name} — {i.addr}
+          </option>
+        ))}
+      </select>
+    </div>
   );
 }
 

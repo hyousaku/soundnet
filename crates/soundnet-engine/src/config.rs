@@ -14,6 +14,12 @@ pub struct Config {
     /// old and new identity as two permanently-stale nodes side by side.
     #[serde(default)]
     pub node_id: Option<String>,
+    /// Name (not IP — DHCP can reassign the IP but not the NIC) of the
+    /// network interface pinned for mDNS advertisement and audio egress on
+    /// multi-homed hosts. `None` means pick automatically, the same
+    /// behaviour as before this field existed.
+    #[serde(default)]
+    pub interface: Option<String>,
     #[serde(default)]
     pub routes: Vec<Route>,
     #[serde(default)]
@@ -78,10 +84,10 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    /// A config file written before node_id existed (or one hand-edited
-    /// without it) must still load — `#[serde(default)]` is what lets old
-    /// on-disk configs on the two already-deployed machines keep working
-    /// after this upgrade.
+    /// A config file written before node_id (or interface) existed, or one
+    /// hand-edited without them, must still load — `#[serde(default)]` is
+    /// what lets old on-disk configs on the two already-deployed machines
+    /// keep working after each upgrade that adds a field here.
     #[test]
     fn missing_node_id_defaults_to_none() {
         let path = std::env::temp_dir().join(format!(
@@ -92,6 +98,30 @@ mod tests {
 
         let loaded = Config::load_or_default(Some(&path)).expect("load");
         assert_eq!(loaded.node_id, None);
+        assert_eq!(loaded.interface, None);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Same round-trip guarantee as `node_id`: the interface field holds a
+    /// NIC *name*, not an IP, and `routing::persist()` rebuilds the whole
+    /// Config from live state on every route/manual-host change — if this
+    /// field isn't threaded through there too, a pinned interface would get
+    /// silently wiped back to "automatic" the next time the operator adds a
+    /// route. See `routing::persist` for the other half of this guarantee.
+    #[test]
+    fn interface_round_trips_through_save_and_load() {
+        let path = std::env::temp_dir().join(format!(
+            "soundnet-config-test-{}-interface.toml",
+            std::process::id()
+        ));
+
+        let mut cfg = Config::default();
+        cfg.interface = Some("eth0".to_string());
+        cfg.save(&path).expect("save");
+
+        let loaded = Config::load_or_default(Some(&path)).expect("load");
+        assert_eq!(loaded.interface.as_deref(), Some("eth0"));
 
         let _ = std::fs::remove_file(&path);
     }

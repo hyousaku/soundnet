@@ -5,17 +5,23 @@ use mdns_sd::ServiceDaemon;
 use soundnet_protocol::{LocalPort, Node, PortId, Route, RouteId, StreamStats};
 use std::net::IpAddr;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock as StdRwLock};
 use tokio::sync::{broadcast, RwLock};
 
 use crate::config::ManualHost;
 use crate::routing::{RouteFailure, RunningRoute};
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct EngineIdentity {
     pub node_id: String,
     pub hostname: String,
-    pub addr: IpAddr,
+    /// Effective advertised/egress address. Behind a lock (not `Arc`-and-done
+    /// like the rest of identity) because the operator can pin a different
+    /// interface at runtime — see `iface::set_selected` — and every reader
+    /// (mDNS, `self_node()`, route senders) needs to see the change without
+    /// a restart. A plain `std::sync::RwLock` is enough: reads/writes are
+    /// brief and never held across an `.await`.
+    pub addr: StdRwLock<IpAddr>,
     pub control_port: u16,
     pub audio_port: u16,
     pub version: String,
@@ -46,6 +52,12 @@ pub struct EngineState {
 
     /// Manually added hosts (fallback when mDNS is blocked).
     pub manual_hosts: RwLock<Vec<ManualHost>>,
+
+    /// Name of the interface pinned for mDNS/audio egress, or `None` for
+    /// automatic. Mirrors `Config::interface`; kept here (not just read from
+    /// disk on demand) so handlers can read/change it without file I/O, and
+    /// so `routing::persist()` can write it back out on every save.
+    pub selected_interface: RwLock<Option<String>>,
 
     /// Broadcasted server messages to all connected WebSocket clients.
     pub events: broadcast::Sender<soundnet_protocol::ServerMsg>,
@@ -84,6 +96,7 @@ impl EngineState {
             stats: DashMap::new(),
             config_path: RwLock::new(None),
             manual_hosts: RwLock::new(Vec::new()),
+            selected_interface: RwLock::new(None),
             events: tx,
             mdns: RwLock::new(None),
         })
@@ -93,7 +106,7 @@ impl EngineState {
         Node {
             id: self.identity.node_id.clone(),
             hostname: self.identity.hostname.clone(),
-            addr: self.identity.addr.to_string(),
+            addr: self.identity.addr.read().unwrap().to_string(),
             port: self.identity.control_port,
             audio_port: self.identity.audio_port,
             version: self.identity.version.clone(),

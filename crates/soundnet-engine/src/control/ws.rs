@@ -81,6 +81,14 @@ async fn serve_socket(socket: WebSocket, state: Arc<EngineState>) {
                     tracing::warn!("rescan failed: {err:#}");
                 }
             }
+            Ok(ClientMsg::SetInterface { name }) => {
+                if let Err(err) = super::set_interface_and_broadcast(&state, name).await {
+                    tracing::warn!("ws set_interface failed: {err:#}");
+                    let _ = state
+                        .events
+                        .send(ServerMsg::Error { message: format!("{err:#}") });
+                }
+            }
             Err(err) => {
                 tracing::warn!("ws bad message: {err}");
             }

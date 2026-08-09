@@ -152,6 +152,15 @@ pub struct ManualHost {
     pub port: u16,
 }
 
+/// A usable local network interface, offered to the operator so they can pin
+/// mDNS advertisement + audio egress to a specific NIC on multi-homed hosts
+/// (e.g. wired and wireless on the same subnet).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NetInterface {
+    pub name: String,
+    pub addr: String,
+}
+
 /// Pushed by an engine to every peer it knows about whenever its local port
 /// list changes (e.g. after a rescan). Lets peers refresh their cached copy
 /// without waiting for mDNS to re-resolve — mDNS TXT records don't carry the
@@ -173,6 +182,19 @@ pub struct StateSnapshot {
     pub routes: Vec<Route>,
     #[serde(default)]
     pub manual_hosts: Vec<ManualHost>,
+    /// Usable network interfaces on *this* node, for the interface-pinning
+    /// control in the UI. Describes `self_node` only — a peer's own snapshot
+    /// (fetched during discovery) describes itself, not us, so this can't be
+    /// used to control anything but the local engine. `#[serde(default)]`
+    /// because it's fetched from peers that may still be running an older
+    /// build without this field.
+    #[serde(default)]
+    pub interfaces: Vec<NetInterface>,
+    /// Name of the interface currently pinned for mDNS/audio egress, or
+    /// `None` for automatic selection. Mirrors `Config::interface` on the
+    /// engine this snapshot came from.
+    #[serde(default)]
+    pub selected_interface: Option<String>,
 }
 
 // ---------- WS client -> server ----------
@@ -189,6 +211,11 @@ pub enum ClientMsg {
     /// Re-enumerate local ALSA devices (e.g. after plugging in a new USB
     /// interface). The engine responds by broadcasting a fresh State snapshot.
     RescanDevices,
+    /// Pin (or, with `name: None`, un-pin back to automatic) the network
+    /// interface this engine advertises over mDNS and sends audio out of.
+    /// Only ever meaningful sent to the engine that owns the interface — an
+    /// engine can only reconfigure itself, not a peer.
+    SetInterface { name: Option<String> },
 }
 
 // ---------- WS server -> client ----------

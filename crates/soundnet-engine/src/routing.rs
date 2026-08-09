@@ -293,12 +293,21 @@ async fn try_start_inner(state: &Arc<EngineState>, route: &Route) -> Result<Opti
         let dst_port = route_port(dst_node.audio_port, &route.id);
         let cap = capture::spawn(&port.alsa_name, &route.spec)?;
         let ctx = roc_context().await?;
+        // Only pin the sender's outgoing interface when the operator
+        // explicitly chose one; otherwise leave it to the OS routing table,
+        // same as before this feature existed (see transport/sender.rs).
+        let outgoing = if state.selected_interface.read().await.is_some() {
+            Some(*state.identity.addr.read().unwrap())
+        } else {
+            None
+        };
         let sender = tx::spawn(
             ctx,
             &dst_node.addr,
             dst_port,
             &route.spec,
             cap.consumer,
+            outgoing,
         )?;
         running.cap = Some(cap.control);
         running.tx = Some(sender);
@@ -407,6 +416,12 @@ pub async fn persist(state: &Arc<EngineState>) {
         // node_id the next time a route or manual host change triggers a
         // save, reintroducing the "new UUID every restart" bug.
         node_id: Some(state.identity.node_id.clone()),
+        // Same trap as node_id: this rebuilds the whole Config from live
+        // state on every route/manual-host change, so a field left out here
+        // gets silently wiped back to its default the next time the operator
+        // does anything else — see the interface field's own comment on
+        // `Config` and the `interface_round_trips_through_save_and_load` test.
+        interface: state.selected_interface.read().await.clone(),
         routes: state.routes.iter().map(|e| e.value().clone()).collect(),
         manual_hosts: state.manual_hosts.read().await.clone(),
     };
