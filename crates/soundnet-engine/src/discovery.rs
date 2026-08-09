@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::routing;
-use crate::state::{EngineState, PeerRecord};
+use crate::state::{EngineState, MdnsHandle, PeerRecord};
 
 const SERVICE_TYPE: &str = "_soundnet._udp.local.";
 
@@ -49,8 +49,14 @@ async fn run(
         Some(props),
     )?;
     info = info.enable_addr_auto();
+    let fullname = info.get_fullname().to_string();
     daemon.register(info)?;
     tracing::info!("mDNS: advertising {SERVICE_TYPE} on {ip}:{control_port}");
+
+    // Stash the daemon + fullname so main.rs can send a graceful goodbye on
+    // shutdown (SIGTERM from systemd, or Ctrl-C) instead of leaving a ghost
+    // record for peers to time out on.
+    *state.mdns.write().await = Some(MdnsHandle { daemon: daemon.clone(), fullname });
 
     // Start browsing for peers.
     let receiver = daemon.browse(SERVICE_TYPE)?;

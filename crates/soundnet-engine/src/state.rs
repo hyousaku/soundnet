@@ -1,6 +1,7 @@
 //! In-memory engine state shared across HTTP handlers, discovery, and workers.
 
 use dashmap::DashMap;
+use mdns_sd::ServiceDaemon;
 use soundnet_protocol::{LocalPort, Node, PortId, Route, RouteId, StreamStats};
 use std::net::IpAddr;
 use std::path::PathBuf;
@@ -44,6 +45,19 @@ pub struct EngineState {
 
     /// Broadcasted server messages to all connected WebSocket clients.
     pub events: broadcast::Sender<soundnet_protocol::ServerMsg>,
+
+    /// Set once discovery has registered us with mDNS. Used on shutdown to
+    /// send a graceful "goodbye" (unregister) so peers drop us immediately
+    /// instead of waiting out the mDNS record TTL — otherwise every
+    /// `systemctl restart` (SIGTERM, not SIGINT) leaves a ghost node in
+    /// every other engine's peer list until the stale record expires.
+    pub mdns: RwLock<Option<MdnsHandle>>,
+}
+
+#[derive(Clone)]
+pub struct MdnsHandle {
+    pub daemon: ServiceDaemon,
+    pub fullname: String,
 }
 
 #[derive(Debug, Clone)]
@@ -66,6 +80,7 @@ impl EngineState {
             config_path: RwLock::new(None),
             manual_hosts: RwLock::new(Vec::new()),
             events: tx,
+            mdns: RwLock::new(None),
         })
     }
 

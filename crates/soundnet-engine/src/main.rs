@@ -104,10 +104,36 @@ async fn main() -> Result<()> {
         bind_addr, advertise_ip, cli.audio_port
     );
 
+    // systemd sends SIGTERM on `stop`/`restart`, not SIGINT — without a
+    // handler for it, the process gets killed before it can send an mDNS
+    // "goodbye", leaving a ghost node in every peer's list until the stale
+    // record's TTL finally expires. Listen for both.
+    #[cfg(unix)]
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .context("install SIGTERM handler")?;
+    #[cfg(unix)]
+    let sigterm_recv = sigterm.recv();
+    #[cfg(not(unix))]
+    let sigterm_recv = std::future::pending::<Option<()>>();
+
     tokio::select! {
         r = control_handle => r??,
         _ = tokio::signal::ctrl_c() => {
             tracing::info!("Ctrl-C received, shutting down");
+        }
+        _ = sigterm_recv => {
+            tracing::info!("SIGTERM received, shutting down");
+        }
+    }
+
+    if let Some(mdns) = state.mdns.write().await.take() {
+        if let Ok(rx) = mdns.daemon.unregister(&mdns.fullname) {
+            // Give the goodbye packet a moment to actually go out before we
+            // exit; ignore the result either way — this is best-effort.
+            let _ = tokio::time::timeout(std::time::Duration::from_millis(500), async {
+                let _ = tokio::task::spawn_blocking(move || rx.recv()).await;
+            })
+            .await;
         }
     }
 
