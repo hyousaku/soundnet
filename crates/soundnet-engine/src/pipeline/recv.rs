@@ -17,8 +17,8 @@
 //! Keep exactly one blocking point in the loop.
 
 use anyhow::{bail, Result};
-use soundnet_protocol::StreamSpec;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use soundnet_protocol::{StreamSpec, UNKNOWN_FORMAT};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 
@@ -47,6 +47,9 @@ pub struct RecvHandle {
     /// field the old estimate was derived from, so this stays at 0 rather
     /// than reporting a number nothing computes.
     pub jitter_ns: Arc<AtomicU64>,
+    /// The format the playback device was actually opened with, as
+    /// `SampleFormat::as_u8`; `UNKNOWN_FORMAT` until the device is open.
+    pub format: Arc<AtomicU8>,
 }
 
 impl RecvHandle {
@@ -71,6 +74,7 @@ pub fn spawn(
     let buffer_ns = Arc::new(AtomicU64::new(u64::MAX));
     let e2e_ns = Arc::new(AtomicU64::new(u64::MAX));
     let jitter_ns = Arc::new(AtomicU64::new(0));
+    let format = Arc::new(AtomicU8::new(UNKNOWN_FORMAT));
 
     let worker = Worker {
         stop: stop.clone(),
@@ -78,6 +82,7 @@ pub fn spawn(
         xruns: xruns.clone(),
         buffer_ns: buffer_ns.clone(),
         e2e_ns: e2e_ns.clone(),
+        format: format.clone(),
     };
     let alsa_name = alsa_name.to_string();
     let bind_host = bind_host.to_string();
@@ -92,7 +97,7 @@ pub fn spawn(
             }
         })?;
 
-    Ok(RecvHandle { stop, thread, level_bits, xruns, buffer_ns, e2e_ns, jitter_ns })
+    Ok(RecvHandle { stop, thread, level_bits, xruns, buffer_ns, e2e_ns, jitter_ns, format })
 }
 
 /// The atomics the worker publishes into, grouped so the loop signature
@@ -103,6 +108,7 @@ struct Worker {
     xruns: Arc<AtomicUsize>,
     buffer_ns: Arc<AtomicU64>,
     e2e_ns: Arc<AtomicU64>,
+    format: Arc<AtomicU8>,
 }
 
 fn run(
@@ -114,6 +120,7 @@ fn run(
     w: &Worker,
 ) -> Result<()> {
     let (pcm, format) = pcm::open(alsa_name, alsa::Direction::Playback, spec)?;
+    w.format.store(format.as_u8(), Ordering::Relaxed);
     let io = pcm.io_bytes();
 
     let mut rx = receiver::open(ctx, bind_host, bind_port, spec)?;

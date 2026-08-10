@@ -36,7 +36,34 @@ impl SampleFormat {
             SampleFormat::F32Le => 4,
         }
     }
+
+    /// Compact encoding so a pipeline thread can publish the format it
+    /// actually negotiated through an `AtomicU8`, which is the only kind of
+    /// shared state cheap enough to touch from a `SCHED_FIFO` audio thread.
+    /// `UNKNOWN_FORMAT` covers "the device hasn't been opened yet" — and,
+    /// permanently, a tone source, which has no device to negotiate with.
+    pub fn as_u8(self) -> u8 {
+        match self {
+            SampleFormat::S16Le => 0,
+            SampleFormat::S24Le3 => 1,
+            SampleFormat::S32Le => 2,
+            SampleFormat::F32Le => 3,
+        }
+    }
+
+    pub fn from_u8(v: u8) -> Option<Self> {
+        match v {
+            0 => Some(SampleFormat::S16Le),
+            1 => Some(SampleFormat::S24Le3),
+            2 => Some(SampleFormat::S32Le),
+            3 => Some(SampleFormat::F32Le),
+            _ => None,
+        }
+    }
 }
+
+/// Sentinel for `SampleFormat::from_u8`: nothing negotiated (yet).
+pub const UNKNOWN_FORMAT: u8 = u8::MAX;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Node {
@@ -174,6 +201,19 @@ pub struct StreamStats {
     /// populated by the engine holding this route's playback side.
     #[serde(default)]
     pub playback_buffer_ms: Option<f32>,
+    /// The format the capture device was actually opened with, which is not
+    /// always the one the route asked for: ALSA has no "nearest" fallback
+    /// for format the way it does for rate and period, so a device that
+    /// rejects the request gets substituted (see `audio::format::pick_format`).
+    /// Reporting only the requested format would hide that a route asking for
+    /// F32_LE is really running S24_LE3 — and then two settings that sound
+    /// identical look like a mystery instead of the same thing twice.
+    #[serde(default)]
+    pub capture_format: Option<SampleFormat>,
+    /// As `capture_format`, for the playback device. The two ends of a route
+    /// negotiate independently and can genuinely differ.
+    #[serde(default)]
+    pub playback_format: Option<SampleFormat>,
 }
 
 /// A host the user added manually (mDNS was blocked / offline). Rendered in

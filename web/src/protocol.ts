@@ -75,6 +75,14 @@ export interface StreamStats {
   roc_e2e_ms: number | null;
   capture_buffer_ms: number | null;
   playback_buffer_ms: number | null;
+  // The format each device was *actually* opened with. ALSA has no
+  // "nearest" fallback for format the way it does for rate and period, so a
+  // device that rejects the requested one gets substituted silently — and
+  // then two settings that land on the same substitute sound identical,
+  // which looks like a mystery until you can see this. `null` = this engine
+  // has no device on that side (or hasn't opened it yet).
+  capture_format: SampleFormat | null;
+  playback_format: SampleFormat | null;
 }
 
 export interface ManualHost {

@@ -20,9 +20,9 @@
 //! is written to preserve.
 
 use anyhow::{bail, Result};
-use soundnet_protocol::StreamSpec;
+use soundnet_protocol::{StreamSpec, UNKNOWN_FORMAT};
 use std::net::IpAddr;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 
@@ -43,6 +43,11 @@ pub struct SendHandle {
     /// is no ALSA buffer to report — and until the first sample for a real
     /// device.
     pub buffer_ns: Arc<AtomicU64>,
+    /// The format the capture device was actually opened with, as
+    /// `SampleFormat::as_u8`. Stays `UNKNOWN_FORMAT` until the device is
+    /// open, and for the whole life of a tone source — there is no device to
+    /// negotiate with, so there is no format to report.
+    pub format: Arc<AtomicU8>,
 }
 
 impl SendHandle {
@@ -66,9 +71,11 @@ pub fn spawn(
 ) -> Result<SendHandle> {
     let stop = Arc::new(AtomicBool::new(false));
     let buffer_ns = Arc::new(AtomicU64::new(u64::MAX));
+    let format = Arc::new(AtomicU8::new(UNKNOWN_FORMAT));
 
     let stop_worker = stop.clone();
     let buffer_worker = buffer_ns.clone();
+    let format_worker = format.clone();
     let alsa_name = alsa_name.to_string();
     let dst_host = dst_host.to_string();
     let spec = spec.clone();
@@ -96,6 +103,7 @@ pub fn spawn(
                     outgoing,
                     &stop_worker,
                     &buffer_worker,
+                    &format_worker,
                 ),
             };
             if let Err(err) = result {
@@ -103,7 +111,7 @@ pub fn spawn(
             }
         })?;
 
-    Ok(SendHandle { stop, thread, buffer_ns })
+    Ok(SendHandle { stop, thread, buffer_ns, format })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -116,8 +124,10 @@ fn alsa_loop(
     outgoing: Option<IpAddr>,
     stop: &Arc<AtomicBool>,
     buffer_ns: &Arc<AtomicU64>,
+    format_out: &Arc<AtomicU8>,
 ) -> Result<()> {
     let (pcm, format) = pcm::open(alsa_name, alsa::Direction::Capture, spec)?;
+    format_out.store(format.as_u8(), Ordering::Relaxed);
     let io = pcm.io_bytes();
     pcm.start().ok(); // Ignore EAGAIN — the first read will start it.
 

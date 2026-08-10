@@ -1,5 +1,5 @@
 import { useStore } from "./store";
-import type { SampleFormat, StreamSpec } from "./protocol";
+import type { SampleFormat, StreamSpec, StreamStats } from "./protocol";
 import { summarizeLatency } from "./latency";
 
 const RATES = [44100, 48000, 88200, 96000];
@@ -86,6 +86,7 @@ export default function RouteEditor() {
                 >
                   {FORMATS.map((v) => (<option key={v} value={v}>{v}</option>))}
                 </select>
+                <ActualFormat spec={r.spec} stats={stats[r.id]} />
               </td>
               <td>
                 <select
@@ -157,6 +158,37 @@ function update(
   patch: Partial<StreamSpec>,
 ): void {
   send({ type: "update_spec", id, spec: { ...spec, ...patch } });
+}
+
+/// Shows what the hardware actually got, whenever that isn't what was asked
+/// for. Silence here means "the request went through as-is" (or that this
+/// engine holds neither end of the route, which the latency column already
+/// makes obvious) — so the row only grows a marker when there's something to
+/// know. Without it, picking a format a device doesn't support looks like it
+/// applied, and two different settings that fall back to the same substitute
+/// are indistinguishable from a bug.
+function ActualFormat({ spec, stats }: { spec: StreamSpec; stats?: StreamStats }) {
+  if (!stats) return null;
+  const sides: Array<[string, SampleFormat | null]> = [
+    ["capture", stats.capture_format],
+    ["playback", stats.playback_format],
+  ];
+  const substituted = sides.filter(
+    ([, actual]) => actual != null && actual !== spec.alsa_format,
+  ) as Array<[string, SampleFormat]>;
+  if (substituted.length === 0) return null;
+  return (
+    <div
+      style={{ color: "#f59e0b", fontSize: 10, marginTop: 2 }}
+      title={
+        substituted
+          .map(([side, actual]) => `${side} device does not support ${spec.alsa_format}, opened ${actual} instead`)
+          .join("; ") + ". The network always carries f32, so this only affects the local device leg."
+      }
+    >
+      {substituted.map(([side, actual]) => `→ ${actual} (${side})`).join(" ")}
+    </div>
+  );
 }
 
 function LevelMeter({ db }: { db: number }) {

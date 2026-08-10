@@ -16,8 +16,10 @@
 
 use anyhow::{anyhow, bail, Context, Result};
 use once_cell::sync::Lazy;
-use soundnet_protocol::{PortKind, Route, RouteHealth, ServerMsg, StreamStats};
-use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use soundnet_protocol::{
+    PortKind, Route, RouteHealth, SampleFormat, ServerMsg, StreamStats,
+};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
@@ -43,6 +45,11 @@ pub struct RunningRoute {
     /// ALSA playback-buffer delay, only ever set when this engine holds the
     /// route's playback side.
     pub pb_buffer_ns: Option<Arc<AtomicU64>>,
+    /// Format the capture device was actually opened with (see the note on
+    /// `StreamStats::capture_format`).
+    pub cap_format: Option<Arc<AtomicU8>>,
+    /// Format the playback device was actually opened with.
+    pub pb_format: Option<Arc<AtomicU8>>,
 }
 
 impl RunningRoute {
@@ -285,6 +292,7 @@ async fn try_start_inner(state: &Arc<EngineState>, route: &Route) -> Result<Opti
         send: None, recv: None,
         level_bits: None, xruns: None, e2e_ns: None, jitter_ns: None,
         cap_buffer_ns: None, pb_buffer_ns: None,
+        cap_format: None, pb_format: None,
     };
 
     if is_local_src(state, route) {
@@ -324,6 +332,7 @@ async fn try_start_inner(state: &Arc<EngineState>, route: &Route) -> Result<Opti
             outgoing,
         )?;
         running.cap_buffer_ns = Some(pipeline.buffer_ns.clone());
+        running.cap_format = Some(pipeline.format.clone());
         running.send = Some(pipeline);
     }
 
@@ -341,6 +350,7 @@ async fn try_start_inner(state: &Arc<EngineState>, route: &Route) -> Result<Opti
         running.e2e_ns = Some(pipeline.e2e_ns.clone());
         running.jitter_ns = Some(pipeline.jitter_ns.clone());
         running.pb_buffer_ns = Some(pipeline.buffer_ns.clone());
+        running.pb_format = Some(pipeline.format.clone());
         running.recv = Some(pipeline);
     }
 
@@ -511,6 +521,14 @@ fn routes_equal(a: &Route, b: &Route) -> bool {
 /// duration — using it instead of 0 matters here specifically because 0 is
 /// a value these metrics can genuinely take (an empty ALSA buffer, a
 /// freshly-connected RTCP session), so it can't double as "no data".
+/// Read back a format an audio thread published. `None` covers both "this
+/// engine has no device on that side of the route" and "the device isn't
+/// open yet" — and, permanently, a tone source, which negotiates with
+/// nothing. See `StreamStats::capture_format`.
+fn atomic_format(atomic: &Arc<AtomicU8>) -> Option<SampleFormat> {
+    SampleFormat::from_u8(atomic.load(Ordering::Relaxed))
+}
+
 fn ns_to_ms(atomic: &Arc<AtomicU64>) -> Option<f32> {
     let raw = atomic.load(Ordering::Relaxed);
     if raw == u64::MAX {
@@ -560,6 +578,8 @@ pub fn spawn_stats_pump(state: Arc<EngineState>) {
                 let roc_e2e_ms = running.e2e_ns.as_ref().and_then(|n| ns_to_ms(n));
                 let capture_buffer_ms = running.cap_buffer_ns.as_ref().and_then(|n| ns_to_ms(n));
                 let playback_buffer_ms = running.pb_buffer_ns.as_ref().and_then(|n| ns_to_ms(n));
+                let capture_format = running.cap_format.as_ref().and_then(atomic_format);
+                let playback_format = running.pb_format.as_ref().and_then(atomic_format);
                 // A worker can have died since the last try_start check (that
                 // only happens on the next discovery event or supervisor
                 // tick) — report it as retrying immediately rather than
@@ -581,6 +601,8 @@ pub fn spawn_stats_pump(state: Arc<EngineState>) {
                     roc_e2e_ms,
                     capture_buffer_ms,
                     playback_buffer_ms,
+                    capture_format,
+                    playback_format,
                 };
                 map.insert(route_id, stats);
             }
@@ -603,6 +625,8 @@ pub fn spawn_stats_pump(state: Arc<EngineState>) {
                         roc_e2e_ms: None,
                         capture_buffer_ms: None,
                         playback_buffer_ms: None,
+                        capture_format: None,
+                        playback_format: None,
                     },
                 );
             }
