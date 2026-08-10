@@ -14,9 +14,16 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
+/// Package version plus the git commit stamped in by build.rs. "Is this
+/// machine running the build I just deployed?" has cost this project more
+/// time than any real bug, and `CARGO_PKG_VERSION` cannot answer it — it has
+/// said 0.1.0 since the first commit. This makes `--version`, the startup
+/// log line and the node list in the UI all answer it directly.
+const BUILD_ID: &str = concat!(env!("CARGO_PKG_VERSION"), " (", env!("SOUNDNET_BUILD"), ")");
+
 /// SoundNet — low-latency LAN audio engine.
 #[derive(Debug, Parser)]
-#[command(version, about)]
+#[command(version = BUILD_ID, about)]
 struct Cli {
     /// TCP address to bind the HTTP/WebSocket control plane to.
     /// Default is 0.0.0.0:7788 (reachable from any LAN peer).
@@ -95,7 +102,7 @@ async fn main() -> Result<()> {
         addr: std::sync::RwLock::new(advertise_ip),
         control_port: bind_addr.port(),
         audio_port: cli.audio_port,
-        version: env!("CARGO_PKG_VERSION").to_string(),
+        version: BUILD_ID.to_string(),
     });
 
     // Populate local ports (ALSA + tone) up front and remember them in state.
@@ -143,8 +150,8 @@ async fn main() -> Result<()> {
     let control_handle = tokio::spawn(control::serve(state.clone(), bind_addr));
 
     tracing::info!(
-        "soundnet-engine listening on http://{}  (advertise ip {}, audio {})",
-        bind_addr, advertise_ip, cli.audio_port
+        "soundnet-engine {} listening on http://{}  (advertise ip {}, audio {})",
+        BUILD_ID, bind_addr, advertise_ip, cli.audio_port
     );
 
     // systemd sends SIGTERM on `stop`/`restart`, not SIGINT — without a

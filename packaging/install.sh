@@ -155,7 +155,30 @@ echo "cargo $(cargo --version | awk '{print $2}') ok"
 # Prefer the .deb: it records what it installed, so `apt remove soundnet-engine`
 # is a clean uninstall, and the same file installs on every other machine of
 # this architecture without rebuilding.
+# A previous from-source install leaves a unit in /etc/systemd/system and a
+# binary in /usr/local/bin. systemd always prefers the unit in /etc, so those
+# two together silently pin the service to the old binary — the package
+# installs cleanly, the service restarts, and nothing changes. Clear them out
+# before installing the package that replaces them.
+remove_from_source_install() {
+    local unit=/etc/systemd/system/soundnet-engine@.service
+    local bin=/usr/local/bin/soundnet-engine
+    [ -e "$unit" ] || [ -e "$bin" ] || return 0
+
+    warn "found a previous from-source install:$([ -e "$unit" ] && echo " $unit")$([ -e "$bin" ] && echo " $bin")
+         The unit in /etc overrides the packaged one, so leaving it in place
+         would keep the service running the old binary."
+    confirm "Remove them and let the package take over?" || {
+        warn "left in place — the service will keep running the old binary"
+        return 0
+    }
+    $SUDO systemctl stop 'soundnet-engine@*.service' 2>/dev/null || true
+    $SUDO rm -f "$unit" "$bin"
+    $SUDO systemctl daemon-reload
+}
+
 if command -v dpkg-deb >/dev/null; then
+    remove_from_source_install
     say "building the Debian package"
     packaging/build-deb.sh
     DEB="$(ls -t dist/soundnet-engine_*_"$(dpkg --print-architecture)".deb | head -1)"

@@ -199,12 +199,24 @@ if [ "$1" = "configure" ]; then
         done
     fi
 
-    # A leftover from-source install shadows the packaged binary on $PATH
-    # (/usr/local/bin comes first), which makes an upgrade look like it did
-    # nothing when you run the engine by hand.
-    if [ -e /usr/local/bin/soundnet-engine ]; then
+    # A unit in /etc always wins over the packaged one in /usr/lib, so a
+    # leftover from-source install keeps the service pointed at
+    # /usr/local/bin no matter how many times this package is upgraded. The
+    # install looks like it worked and the old binary keeps running, which
+    # is the single most confusing failure this project has had.
+    if [ -e /etc/systemd/system/soundnet-engine@.service ]; then
+        echo "soundnet-engine: WARNING: /etc/systemd/system/soundnet-engine@.service exists" >&2
+        echo "  and OVERRIDES the unit this package just installed. The service will keep" >&2
+        echo "  running the old binary until you remove it:" >&2
+        echo "    sudo systemctl stop 'soundnet-engine@*'" >&2
+        echo "    sudo rm /etc/systemd/system/soundnet-engine@.service" >&2
+        echo "    sudo rm -f /usr/local/bin/soundnet-engine" >&2
+        echo "    sudo systemctl daemon-reload && sudo systemctl start soundnet-engine@\$USER" >&2
+    elif [ -e /usr/local/bin/soundnet-engine ]; then
+        # Same class of problem, milder: /usr/local/bin comes first on $PATH,
+        # so running the engine by hand gets the old build.
         echo "soundnet-engine: warning: /usr/local/bin/soundnet-engine still exists" >&2
-        echo "  and shadows the packaged /usr/bin/soundnet-engine. Remove it with:" >&2
+        echo "  and shadows the packaged /usr/bin/soundnet-engine on \$PATH. Remove it with:" >&2
         echo "    sudo rm /usr/local/bin/soundnet-engine" >&2
     fi
 
