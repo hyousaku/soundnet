@@ -4,10 +4,10 @@
 //! Each engine decides its own responsibility based on where it sits in the
 //! Route:
 //!
-//! * If `route.src.node_id == self`, spawn a local capture worker (ALSA or
-//!   tone) and a roc sender that connects to the destination's audio port.
-//! * If `route.dst.node_id == self`, spawn a roc receiver bound to our audio
-//!   port and a playback worker that plays into local ALSA.
+//! * If `route.src.node_id == self`, spawn a send pipeline: one thread that
+//!   reads the local device (ALSA or tone) and streams to the destination.
+//! * If `route.dst.node_id == self`, spawn a receive pipeline: one thread
+//!   bound to our audio port that plays into the local device.
 //! * Otherwise the Route belongs to two other peers — nothing to do locally,
 //!   but the route still lives in state so the UI can render it.
 //!
@@ -22,20 +22,17 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 
-use crate::audio::{
-    capture::{self, CaptureControl},
-    playback::{self, PlaybackControl},
-};
 use crate::config::Config;
+use crate::pipeline::{recv, send};
 use crate::state::EngineState;
-use crate::transport::{receiver as rx, sender as tx, RocContext};
+use crate::transport::RocContext;
 
 /// Live handles for a Route on this engine.
 pub struct RunningRoute {
-    pub cap: Option<CaptureControl>,
-    pub tx: Option<tx::SenderHandle>,
-    pub rx: Option<rx::ReceiverHandle>,
-    pub pb: Option<PlaybackControl>,
+    /// Set when this engine is the route's source (capture/tone -> network).
+    pub send: Option<send::SendHandle>,
+    /// Set when this engine is the route's destination (network -> playback).
+    pub recv: Option<recv::RecvHandle>,
     pub level_bits: Option<Arc<AtomicU32>>,
     pub xruns: Option<Arc<AtomicUsize>>,
     pub e2e_ns: Option<Arc<AtomicU64>>,
@@ -49,16 +46,14 @@ pub struct RunningRoute {
 }
 
 impl RunningRoute {
-    /// A worker thread can outlive its usefulness silently: `capture::spawn`
-    /// (and its tx/rx/playback counterparts) return `Ok` the moment the OS
-    /// thread is created, well before the ALSA/roc call inside it has had a
-    /// chance to fail. `JoinHandle::is_finished` is the only way to notice
-    /// after the fact that a "running" route's worker actually died.
+    /// A pipeline thread can outlive its usefulness silently: `send::spawn`
+    /// and `recv::spawn` return `Ok` the moment the OS thread is created,
+    /// well before the ALSA or roc call inside it has had a chance to fail.
+    /// `JoinHandle::is_finished` is the only way to notice after the fact
+    /// that a "running" route's pipeline actually died.
     fn is_dead(&self) -> bool {
-        self.cap.as_ref().map(|c| c.thread.is_finished()).unwrap_or(false)
-            || self.tx.as_ref().map(|t| t.thread.is_finished()).unwrap_or(false)
-            || self.rx.as_ref().map(|r| r.thread.is_finished()).unwrap_or(false)
-            || self.pb.as_ref().map(|p| p.thread.is_finished()).unwrap_or(false)
+        self.send.as_ref().map(|s| s.thread.is_finished()).unwrap_or(false)
+            || self.recv.as_ref().map(|r| r.thread.is_finished()).unwrap_or(false)
     }
 }
 
@@ -287,7 +282,7 @@ pub async fn try_start(state: &Arc<EngineState>, route: &Route) -> Result<()> {
 /// peers) — not a failure, nothing to retry.
 async fn try_start_inner(state: &Arc<EngineState>, route: &Route) -> Result<Option<RunningRoute>> {
     let mut running = RunningRoute {
-        cap: None, tx: None, rx: None, pb: None,
+        send: None, recv: None,
         level_bits: None, xruns: None, e2e_ns: None, jitter_ns: None,
         cap_buffer_ns: None, pb_buffer_ns: None,
     };
@@ -311,7 +306,6 @@ async fn try_start_inner(state: &Arc<EngineState>, route: &Route) -> Result<Opti
         };
 
         let dst_port = route_port(dst_node.audio_port, &route.id);
-        let cap = capture::spawn(&port.alsa_name, &route.spec)?;
         let ctx = roc_context().await?;
         // Only pin the sender's outgoing interface when the operator
         // explicitly chose one; otherwise leave it to the OS routing table,
@@ -321,17 +315,16 @@ async fn try_start_inner(state: &Arc<EngineState>, route: &Route) -> Result<Opti
         } else {
             None
         };
-        let sender = tx::spawn(
+        let pipeline = send::spawn(
+            &port.alsa_name,
+            &route.spec,
             ctx,
             &dst_node.addr,
             dst_port,
-            &route.spec,
-            cap.consumer,
             outgoing,
         )?;
-        running.cap_buffer_ns = Some(cap.buffer_ns.clone());
-        running.cap = Some(cap.control);
-        running.tx = Some(sender);
+        running.cap_buffer_ns = Some(pipeline.buffer_ns.clone());
+        running.send = Some(pipeline);
     }
 
     if is_local_dst(state, route) {
@@ -342,24 +335,16 @@ async fn try_start_inner(state: &Arc<EngineState>, route: &Route) -> Result<Opti
             .ok_or_else(|| anyhow!("unknown local dst port {}", route.dst.port_id))?;
         let bind_port = route_port(state.identity.audio_port, &route.id);
         let ctx = roc_context().await?;
-        let pb = playback::spawn(&port.alsa_name, &route.spec)?;
-        let receiver = rx::spawn(
-            ctx,
-            "0.0.0.0",
-            bind_port,
-            &route.spec,
-            pb.producer,
-        )?;
-        running.level_bits = Some(pb.level_bits.clone());
-        running.xruns = Some(pb.xruns.clone());
-        running.e2e_ns = Some(receiver.e2e_latency_ns.clone());
-        running.jitter_ns = Some(receiver.jitter_ns.clone());
-        running.pb_buffer_ns = Some(pb.buffer_ns.clone());
-        running.rx = Some(receiver);
-        running.pb = Some(pb.control);
+        let pipeline = recv::spawn(&port.alsa_name, &route.spec, ctx, "0.0.0.0", bind_port)?;
+        running.level_bits = Some(pipeline.level_bits.clone());
+        running.xruns = Some(pipeline.xruns.clone());
+        running.e2e_ns = Some(pipeline.e2e_ns.clone());
+        running.jitter_ns = Some(pipeline.jitter_ns.clone());
+        running.pb_buffer_ns = Some(pipeline.buffer_ns.clone());
+        running.recv = Some(pipeline);
     }
 
-    if running.cap.is_some() || running.pb.is_some() {
+    if running.send.is_some() || running.recv.is_some() {
         Ok(Some(running))
     } else {
         Ok(None)
@@ -638,18 +623,13 @@ pub async fn shutdown_all(state: &Arc<EngineState>) {
 }
 
 fn shutdown_running(running: RunningRoute) {
-    // Stop transport first so we don't keep pumping into stale audio workers,
-    // then close the audio side.
-    if let Some(h) = running.tx {
+    // Each pipeline owns its device and its roc endpoint, so stopping the
+    // thread is the whole teardown — no ordering to get right between a
+    // transport worker and the audio worker feeding it any more.
+    if let Some(h) = running.send {
         h.stop_and_join();
     }
-    if let Some(h) = running.cap {
-        h.stop_and_join();
-    }
-    if let Some(h) = running.rx {
-        h.stop_and_join();
-    }
-    if let Some(h) = running.pb {
+    if let Some(h) = running.recv {
         h.stop_and_join();
     }
 }

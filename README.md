@@ -218,8 +218,12 @@ worker restarts transparently.
 - **`crates/roc-sys`** — minimal hand-written FFI to `libroc` (0.4.x).
 - **`crates/soundnet-protocol`** — JSON types shared with the web UI.
 - **`crates/soundnet-engine`** — the daemon:
-  - `audio/` — ALSA device enumeration and worker threads
-  - `transport/` — roc sender/receiver wrappers
+  - `audio/` — ALSA device enumeration, hardware-parameter negotiation, format conversion
+  - `transport/` — roc sender/receiver handles (open/connect/read/write, no threads)
+  - `pipeline/` — one thread per route direction, owning both its sound
+    device and its roc endpoint. The device's clock paces the loop and roc
+    runs `ROC_CLOCK_SOURCE_EXTERNAL`, so there is no buffer — and no second
+    clock — between ALSA and the network.
   - `routing.rs` — Route state machine (this-node-plays-src / this-node-plays-dst)
   - `discovery.rs` — mDNS registration + browsing
   - `control/` — axum REST + WebSocket + embedded SPA

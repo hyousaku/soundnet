@@ -3,6 +3,7 @@ mod config;
 mod control;
 mod discovery;
 mod iface;
+mod pipeline;
 mod routing;
 mod rt;
 mod state;

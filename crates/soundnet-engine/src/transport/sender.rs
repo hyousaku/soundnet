@@ -1,58 +1,58 @@
-//! Roc sender wrapper: pulls f32 frames from a consumer ring and pushes them
-//! to a remote receiver via UDP+RTP (+FEC when enabled).
+//! Roc sender: packetises f32 frames and pushes them to a remote receiver
+//! via UDP+RTP (+FEC when enabled).
+//!
+//! This is a handle, not a worker. The thread that owns it is the send
+//! pipeline (see `pipeline/send.rs`), which reads a period from ALSA and
+//! hands it straight here — there is deliberately no buffer in between, so
+//! the sound card's clock is the only clock in the path.
 
 use anyhow::{anyhow, bail, Result};
 use core::ffi::c_char;
 use roc_sys as roc;
-use rtrb::Consumer;
 use soundnet_protocol::StreamSpec;
 use std::net::IpAddr;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::thread::{self, JoinHandle};
 
 use super::{endpoint_free, endpoint_from_uri, RocContext};
 
-pub struct SenderHandle {
-    pub stop: Arc<AtomicBool>,
-    pub thread: JoinHandle<()>,
+/// An open roc sender, connected to one destination.
+///
+/// Not `Send`: `roc_sender` is documented as thread-safe, but this type is
+/// deliberately confined to the single pipeline thread that opened it, which
+/// is what makes "the sound card paces everything" true by construction.
+pub struct Sender {
+    raw: *mut roc::roc_sender,
+    /// Keeps the shared context alive for at least as long as this sender —
+    /// `roc_context_close` on a context with live senders is undefined.
+    _ctx: Arc<RocContext>,
 }
 
-impl SenderHandle {
-    pub fn stop_and_join(self) {
-        self.stop.store(true, Ordering::Relaxed);
-        let _ = self.thread.join();
+impl Drop for Sender {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = roc::roc_sender_close(self.raw);
+        }
     }
 }
 
-/// Spawn a roc sender that connects to `remote_host:remote_port` and forwards
-/// samples from `consumer`. `outgoing` pins the local address packets are
-/// sent from (a specific NIC's IP); `None` leaves it to the OS routing table.
-pub fn spawn(
-    ctx: Arc<RocContext>,
-    remote_host: &str,
-    remote_audio_port: u16,
-    spec: &StreamSpec,
-    consumer: Consumer<f32>,
-    outgoing: Option<IpAddr>,
-) -> Result<SenderHandle> {
-    let stop = Arc::new(AtomicBool::new(false));
-    let stop_worker = stop.clone();
-    let remote_host = remote_host.to_string();
-    let spec = spec.clone();
-
-    let thread = thread::Builder::new()
-        .name(format!("roc-tx-{remote_host}"))
-        .spawn(move || {
-            crate::rt::raise_thread_priority("roc sender", crate::rt::PRIO_SENDER);
-            if let Err(err) =
-                run(&ctx, &remote_host, remote_audio_port, &spec, consumer, &stop_worker, outgoing)
-            {
-                tracing::error!("sender to {remote_host}:{remote_audio_port} failed: {err:#}");
-            }
-        })?;
-
-    Ok(SenderHandle { stop, thread })
+impl Sender {
+    /// Hand one period of interleaved f32 samples to roc.
+    ///
+    /// Non-blocking: the sender is configured `ROC_CLOCK_SOURCE_EXTERNAL`, so
+    /// this packetises and returns rather than sleeping until the next
+    /// quantum. That is the whole point — the caller has already blocked in
+    /// ALSA for exactly one period, and a second clock here would fight it.
+    pub fn write(&mut self, samples: &mut [f32]) -> Result<()> {
+        let frame = roc::roc_frame {
+            samples: samples.as_mut_ptr() as *mut _,
+            samples_size: std::mem::size_of_val(samples),
+        };
+        let rc = unsafe { roc::roc_sender_write(self.raw, &frame) };
+        if rc != 0 {
+            bail!("roc_sender_write failed ({rc})");
+        }
+        Ok(())
+    }
 }
 
 /// Fill a `roc_interface_config` pinning egress to `ip`. `outgoing_address`
@@ -95,15 +95,16 @@ fn packet_length_ns(frames_per_period: u32, rate: u32) -> u64 {
     ns as u64
 }
 
-fn run(
-    ctx: &Arc<RocContext>,
+/// Open a sender connected to `host`'s audio port trio. `outgoing` pins the
+/// local address packets leave from (a specific NIC's IP); `None` leaves it
+/// to the OS routing table.
+pub fn open(
+    ctx: Arc<RocContext>,
     host: &str,
     audio_port: u16,
     spec: &StreamSpec,
-    mut consumer: Consumer<f32>,
-    stop: &Arc<AtomicBool>,
     outgoing: Option<IpAddr>,
-) -> Result<()> {
+) -> Result<Sender> {
     // Always use MULTITRACK layout — same code path for 1..32 channels, and
     // we register a custom packet encoding below so libroc doesn't try to
     // pick a built-in that doesn't exist for our rate/format.
@@ -119,7 +120,7 @@ fn run(
         // Match packetisation to the ALSA period instead of leaving it at
         // roc's own (larger) default quantum — otherwise the network hop
         // adds a chunking delay independent of, and typically bigger than,
-        // the one we already pay in the ALSA ring.
+        // the period itself.
         packet_length: packet_length_ns(spec.frames_per_period, spec.rate),
         packet_interleaving: 0,
         fec_encoding: if spec.fec {
@@ -129,7 +130,12 @@ fn run(
         },
         fec_block_source_packets: 0,
         fec_block_repair_packets: 0,
-        clock_source: roc::roc_clock_source::ROC_CLOCK_SOURCE_INTERNAL,
+        // The capture device's clock drives this pipeline: the thread blocks
+        // in `snd_pcm_readi` for exactly one period and then calls
+        // `Sender::write`. INTERNAL would add roc's own CPU-timer pacing on
+        // top of that, and two clocks with no buffer between them is a
+        // guaranteed under/overrun — see the module docs.
+        clock_source: roc::roc_clock_source::ROC_CLOCK_SOURCE_EXTERNAL,
         latency_tuner_backend: roc::roc_latency_tuner_backend::ROC_LATENCY_TUNER_BACKEND_DEFAULT,
         // Sender-side latency tuning stays off (target_latency/tolerance are
         // 0 below, which keeps INTACT profile in effect), but we still pin
@@ -147,19 +153,14 @@ fn run(
         latency_tolerance: 0,
     };
 
-    let mut sender: *mut roc::roc_sender = std::ptr::null_mut();
-    let rc = unsafe { roc::roc_sender_open(ctx.raw(), &cfg, &mut sender) };
-    if rc != 0 || sender.is_null() {
+    let mut raw: *mut roc::roc_sender = std::ptr::null_mut();
+    let rc = unsafe { roc::roc_sender_open(ctx.raw(), &cfg, &mut raw) };
+    if rc != 0 || raw.is_null() {
         return Err(anyhow!("roc_sender_open failed ({rc})"));
     }
-    // RAII drop guard so we always close on early return.
-    struct DropSender(*mut roc::roc_sender);
-    impl Drop for DropSender {
-        fn drop(&mut self) {
-            unsafe { let _ = roc::roc_sender_close(self.0); }
-        }
-    }
-    let _drop_sender = DropSender(sender);
+    // Wrap immediately: every early return below has to close the sender,
+    // and the Drop impl is the only way to not get that wrong once.
+    let sender = Sender { raw, _ctx: ctx };
 
     // Pin egress before connecting, per interface — source and repair are
     // separate sockets, and an unpinned one would leave repair packets free
@@ -169,45 +170,35 @@ fn run(
     // pinned.
     if let Some(ip) = outgoing {
         let iface_cfg = interface_config_for(ip)?;
-        let rc = unsafe {
-            roc::roc_sender_configure(
-                sender,
-                roc::ROC_SLOT_DEFAULT,
-                roc::roc_interface::ROC_INTERFACE_AUDIO_SOURCE,
-                &iface_cfg,
-            )
-        };
-        if rc != 0 {
-            return Err(anyhow!("sender configure source outgoing_address failed ({rc})"));
-        }
-        if spec.fec {
+        let pin = |iface: roc::roc_interface, what: &str| -> Result<()> {
             let rc = unsafe {
-                roc::roc_sender_configure(
-                    sender,
-                    roc::ROC_SLOT_DEFAULT,
-                    roc::roc_interface::ROC_INTERFACE_AUDIO_REPAIR,
-                    &iface_cfg,
-                )
+                roc::roc_sender_configure(sender.raw, roc::ROC_SLOT_DEFAULT, iface, &iface_cfg)
             };
             if rc != 0 {
-                return Err(anyhow!("sender configure repair outgoing_address failed ({rc})"));
+                bail!("sender configure {what} outgoing_address failed ({rc})");
             }
+            Ok(())
+        };
+        pin(roc::roc_interface::ROC_INTERFACE_AUDIO_SOURCE, "source")?;
+        if spec.fec {
+            pin(roc::roc_interface::ROC_INTERFACE_AUDIO_REPAIR, "repair")?;
         }
         // Control (RTCP) is unconditional — unlike repair it doesn't depend
         // on FEC being on, since it carries latency/clock-sync reports, not
         // redundancy packets.
-        let rc = unsafe {
-            roc::roc_sender_configure(
-                sender,
-                roc::ROC_SLOT_DEFAULT,
-                roc::roc_interface::ROC_INTERFACE_AUDIO_CONTROL,
-                &iface_cfg,
-            )
-        };
-        if rc != 0 {
-            return Err(anyhow!("sender configure control outgoing_address failed ({rc})"));
-        }
+        pin(roc::roc_interface::ROC_INTERFACE_AUDIO_CONTROL, "control")?;
     }
+
+    let connect = |uri: String, iface: roc::roc_interface, what: &str| -> Result<()> {
+        let ep = endpoint_from_uri(&uri)?;
+        let rc =
+            unsafe { roc::roc_sender_connect(sender.raw, roc::ROC_SLOT_DEFAULT, iface, ep) };
+        endpoint_free(ep);
+        if rc != 0 {
+            bail!("sender connect {what} failed ({rc})");
+        }
+        Ok(())
+    };
 
     // Source endpoint: rtp+rs8m://host:port (when FEC on) or rtp://host:port.
     let source_uri = if spec.fec {
@@ -215,35 +206,14 @@ fn run(
     } else {
         format!("rtp://{host}:{audio_port}")
     };
-    let source_ep = endpoint_from_uri(&source_uri)?;
-    let rc = unsafe {
-        roc::roc_sender_connect(
-            sender,
-            roc::ROC_SLOT_DEFAULT,
-            roc::roc_interface::ROC_INTERFACE_AUDIO_SOURCE,
-            source_ep,
-        )
-    };
-    endpoint_free(source_ep);
-    if rc != 0 {
-        return Err(anyhow!("sender connect source failed ({rc})"));
-    }
+    connect(source_uri, roc::roc_interface::ROC_INTERFACE_AUDIO_SOURCE, "source")?;
 
     if spec.fec {
-        let repair_uri = format!("rs8m://{host}:{}", audio_port + 1);
-        let repair_ep = endpoint_from_uri(&repair_uri)?;
-        let rc = unsafe {
-            roc::roc_sender_connect(
-                sender,
-                roc::ROC_SLOT_DEFAULT,
-                roc::roc_interface::ROC_INTERFACE_AUDIO_REPAIR,
-                repair_ep,
-            )
-        };
-        endpoint_free(repair_ep);
-        if rc != 0 {
-            return Err(anyhow!("sender connect repair failed ({rc})"));
-        }
+        connect(
+            format!("rs8m://{host}:{}", audio_port + 1),
+            roc::roc_interface::ROC_INTERFACE_AUDIO_REPAIR,
+            "repair",
+        )?;
     }
 
     // RTCP control endpoint. Without this, `roc_connection_metrics.e2e_latency`
@@ -253,49 +223,14 @@ fn run(
     // the third port in this route's 3-port window; see
     // `routing::route_port` for why the stride between routes has to leave
     // room for it.
-    let control_uri = format!("rtcp://{host}:{}", audio_port + 2);
-    let control_ep = endpoint_from_uri(&control_uri)?;
-    let rc = unsafe {
-        roc::roc_sender_connect(
-            sender,
-            roc::ROC_SLOT_DEFAULT,
-            roc::roc_interface::ROC_INTERFACE_AUDIO_CONTROL,
-            control_ep,
-        )
-    };
-    endpoint_free(control_ep);
-    if rc != 0 {
-        return Err(anyhow!("sender connect control failed ({rc})"));
-    }
+    connect(
+        format!("rtcp://{host}:{}", audio_port + 2),
+        roc::roc_interface::ROC_INTERFACE_AUDIO_CONTROL,
+        "control",
+    )?;
 
-    let period_frames = spec.frames_per_period as usize;
-    let period_samples = period_frames * spec.channels as usize;
-    let mut buf: Vec<f32> = vec![0.0; period_samples];
-
-    while !stop.load(Ordering::Relaxed) {
-        // If the capture worker died, its Producer has been dropped and the
-        // ring is abandoned — no point streaming silence forever.
-        if consumer.is_abandoned() && consumer.slots() == 0 {
-            tracing::info!("sender: capture upstream gone, exiting");
-            break;
-        }
-        for slot in buf.iter_mut() {
-            *slot = consumer.pop().unwrap_or(0.0);
-        }
-        let frame = roc::roc_frame {
-            samples: buf.as_mut_ptr() as *mut _,
-            samples_size: buf.len() * std::mem::size_of::<f32>(),
-        };
-        let rc = unsafe { roc::roc_sender_write(sender, &frame) };
-        if rc != 0 {
-            tracing::warn!("roc_sender_write returned {rc}");
-        }
-    }
-    Ok(())
+    Ok(sender)
 }
-
-// (Channel-layout helpers are no longer needed — we always use MULTITRACK
-// with a custom packet encoding registered per (rate, channels) tuple.)
 
 #[cfg(test)]
 mod tests {

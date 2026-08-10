@@ -19,16 +19,15 @@ use std::sync::Once;
 /// pro-audio convention on Linux is to leave headroom above your own
 /// threads for IRQ handling, not crowd right up against the rlimit.
 ///
-/// Capture and the roc sender sit one point above playback and the roc
-/// receiver. Capture/tx feed the network; playback/rx feed a physical DAC
-/// through a path that already degrades gracefully (silence-fill on
-/// underrun). If both sides ever contend for the CPU at once, losing a
-/// scheduling race should hit the side with the softer landing. The gap is
-/// a single point — this isn't a real priority band, just a tiebreaker.
-pub const PRIO_CAPTURE: i32 = 72;
-pub const PRIO_SENDER: i32 = 72;
-pub const PRIO_PLAYBACK: i32 = 71;
-pub const PRIO_RECEIVER: i32 = 71;
+/// The send pipeline sits one point above the receive pipeline. Send feeds
+/// the network, where a late frame becomes a gap every downstream listener
+/// hears; receive feeds a physical DAC through a path that already degrades
+/// gracefully (roc's jitter buffer absorbs a late read). If both contend for
+/// the CPU at once, losing the scheduling race should hit the side with the
+/// softer landing. The gap is a single point — this isn't a real priority
+/// band, just a tiebreaker.
+pub const PRIO_SEND: i32 = 72;
+pub const PRIO_RECV: i32 = 71;
 
 static WARN_ONCE: Once = Once::new();
 
