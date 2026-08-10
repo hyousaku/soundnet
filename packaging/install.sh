@@ -225,8 +225,25 @@ if [[ $WANT_SERVICE -eq 1 ]]; then
     $SUDO systemctl --no-pager --lines=10 status "soundnet-engine@${SERVICE_USER}.service" || true
 fi
 
+# Belt and braces: confirm the binary now on PATH is the one just built.
+# Every way this has gone wrong so far (a unit in /etc pinning an old path,
+# apt declining a same-version package, a stale /usr/local/bin) ended with an
+# install that reported success while the machine kept running the old build.
+# Comparing the build stamps catches all of them at the point of failure
+# instead of hours later.
+built_stamp="$(./target/release/soundnet-engine --version 2>/dev/null || true)"
+installed_stamp="$("$BINARY" --version 2>/dev/null || true)"
+if [[ -n "$built_stamp" && "$built_stamp" != "$installed_stamp" ]]; then
+    die "install did not take.
+  just built: $built_stamp
+  installed:  $installed_stamp ($BINARY)
+Something is shadowing the install. Try:
+    sudo apt install --reinstall ./$DEB
+and check for a leftover /etc/systemd/system/soundnet-engine@.service."
+fi
+
 say "done"
-echo "binary:  $BINARY ($("$BINARY" --version 2>/dev/null || echo 'version unknown'))"
+echo "binary:  $BINARY ($installed_stamp)"
 echo "web UI:  http://$(hostname).local:7788/   (or http://<this host's IP>:7788/)"
 if [[ $WANT_SERVICE -eq 0 ]]; then
     echo

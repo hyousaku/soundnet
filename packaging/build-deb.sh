@@ -17,7 +17,8 @@
 #
 #   sudo apt install ./soundnet-engine_<version>-<rev>_<arch>.deb
 #
-# Environment overrides: DEB_REVISION (default 1), DEB_MAINTAINER.
+# Environment overrides: DEB_REVISION (default: derived from git so every
+# build gets a distinct, increasing version), DEB_MAINTAINER.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -48,7 +49,28 @@ if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+ ]]; then
     echo "error: could not read workspace.package.version from Cargo.toml" >&2
     exit 1
 fi
-REVISION="${DEB_REVISION:-1}"
+# The package revision has to change whenever the binary does. It used to be
+# a hardcoded 1, which meant every build produced a package apt considered
+# identical to the installed one — so `apt install ./x.deb` printed "already
+# the newest version" and threw the build away, silently, leaving the machine
+# on whatever it had. Derive it from git instead: the commit count is
+# monotonic (so upgrades sort forwards, including from the old flat "1"), and
+# the hash makes the file name say which build it is.
+git_revision() {
+    local count hash rev
+    count="$(git rev-list --count HEAD 2>/dev/null)" || return 1
+    hash="$(git rev-parse --short=7 HEAD 2>/dev/null)" || return 1
+    [[ -n "$count" && -n "$hash" ]] || return 1
+    rev="${count}+g${hash}"
+    # A dirty tree can produce two different binaries at the same commit, so
+    # the commit alone is not a unique name for what was built. The timestamp
+    # keeps those distinguishable and still ordered.
+    if [[ -n "$(git status --porcelain --untracked-files=no 2>/dev/null)" ]]; then
+        rev="${rev}+dirty$(date -u +%Y%m%d%H%M%S)"
+    fi
+    echo "$rev"
+}
+REVISION="${DEB_REVISION:-$(git_revision || echo 1)}"
 ARCH="$(dpkg --print-architecture)"
 MAINTAINER="${DEB_MAINTAINER:-SoundNet packaging <root@localhost>}"
 PKGNAME="soundnet-engine_${VERSION}-${REVISION}_${ARCH}"
@@ -83,6 +105,24 @@ cargo build --release -p soundnet-engine
 
 BIN="target/release/soundnet-engine"
 [[ -x "$BIN" ]] || { echo "error: $BIN missing after build" >&2; exit 1; }
+
+# The package revision and the commit compiled into the binary are computed by
+# two different mechanisms (this script, and build.rs via cargo's rerun
+# tracking), so they can disagree — and they did: build.rs used to watch only
+# .git/HEAD, which a commit on the current branch never touches, so the stamp
+# froze at whatever commit the crate was first compiled at while the package
+# name moved on. A build stamp is worthless the moment it can be stale, so
+# check rather than assume.
+if [[ "$REVISION" == *"+g"* ]]; then
+    want_hash="${REVISION#*+g}"
+    want_hash="${want_hash%%+*}"
+    if ! "$BIN" --version | grep -qF "$want_hash"; then
+        echo "error: the built binary reports '$("$BIN" --version)' but this is a" >&2
+        echo "       package for $want_hash. build.rs did not pick up the current" >&2
+        echo "       commit. Run 'cargo clean -p soundnet-engine' and try again." >&2
+        exit 1
+    fi
+fi
 
 # --- 3. runtime dependencies ---------------------------------------------
 # Resolve the packages that actually own the shared libraries this binary
