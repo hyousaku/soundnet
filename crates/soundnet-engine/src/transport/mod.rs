@@ -21,8 +21,68 @@ pub struct RocContext {
 unsafe impl Send for RocContext {}
 unsafe impl Sync for RocContext {}
 
+/// Route libroc's internal diagnostics into `tracing` instead of letting
+/// them go to stderr at ERROR only.
+///
+/// libroc knows things about this stream that its public metrics API does
+/// not expose — roc 0.4's `roc_connection_metrics` carries `e2e_latency` and
+/// nothing else, so packet loss, jitter-buffer starvation and latency-tuner
+/// activity are only ever visible here. When a glitch has to be attributed
+/// to the network, the buffer, or the sound card, this is the only witness
+/// for the middle one.
+///
+/// Level comes from `SOUNDNET_ROC_LOG` (error/info/note/debug/trace),
+/// defaulting to `error` — roc's own default — because `debug` is per-packet
+/// chatty enough to affect the audio threads it is reporting on.
+fn install_roc_logger() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let level = match std::env::var("SOUNDNET_ROC_LOG").as_deref() {
+            Ok("none") => roc::roc_log_level::ROC_LOG_NONE,
+            Ok("info") => roc::roc_log_level::ROC_LOG_INFO,
+            Ok("note") => roc::roc_log_level::ROC_LOG_NOTE,
+            Ok("debug") => roc::roc_log_level::ROC_LOG_DEBUG,
+            Ok("trace") => roc::roc_log_level::ROC_LOG_TRACE,
+            _ => roc::roc_log_level::ROC_LOG_ERROR,
+        };
+        unsafe {
+            roc::roc_log_set_handler(Some(roc_log_handler), std::ptr::null_mut());
+            roc::roc_log_set_level(level);
+        }
+    });
+}
+
+/// # Safety
+/// Called by libroc with a message valid only for the duration of this call.
+/// Everything is read and formatted before returning; nothing is retained.
+/// Must not unwind into C — hence the `catch_unwind`, which is cheap next to
+/// the formatting we are already doing and turns a panic in a logging path
+/// into a lost log line rather than an aborted process.
+unsafe extern "C" fn roc_log_handler(msg: *const roc::roc_log_message, _arg: *mut std::ffi::c_void) {
+    let _ = std::panic::catch_unwind(|| {
+        let Some(msg) = msg.as_ref() else { return };
+        let cstr = |p: *const std::ffi::c_char| -> String {
+            if p.is_null() {
+                String::new()
+            } else {
+                std::ffi::CStr::from_ptr(p).to_string_lossy().into_owned()
+            }
+        };
+        let module = cstr(msg.module);
+        let text = cstr(msg.text);
+        match msg.level {
+            roc::roc_log_level::ROC_LOG_ERROR => tracing::error!(target: "roc", "{module}: {text}"),
+            roc::roc_log_level::ROC_LOG_INFO | roc::roc_log_level::ROC_LOG_NOTE => {
+                tracing::info!(target: "roc", "{module}: {text}")
+            }
+            _ => tracing::debug!(target: "roc", "{module}: {text}"),
+        }
+    });
+}
+
 impl RocContext {
     pub fn new() -> Result<Arc<Self>> {
+        install_roc_logger();
         let cfg = roc::roc_context_config {
             max_packet_size: 0,
             max_frame_size: 0,

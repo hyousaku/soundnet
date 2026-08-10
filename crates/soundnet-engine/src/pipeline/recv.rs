@@ -50,6 +50,10 @@ pub struct RecvHandle {
     /// The format the playback device was actually opened with, as
     /// `SampleFormat::as_u8`; `UNKNOWN_FORMAT` until the device is open.
     pub format: Arc<AtomicU8>,
+    /// Monotonic count of samples clamped at the rails on their way to the
+    /// device. See `StreamStats::clipped_samples` for why this earns a
+    /// counter of its own.
+    pub clipped: Arc<AtomicUsize>,
 }
 
 impl RecvHandle {
@@ -75,6 +79,7 @@ pub fn spawn(
     let e2e_ns = Arc::new(AtomicU64::new(u64::MAX));
     let jitter_ns = Arc::new(AtomicU64::new(0));
     let format = Arc::new(AtomicU8::new(UNKNOWN_FORMAT));
+    let clipped = Arc::new(AtomicUsize::new(0));
 
     let worker = Worker {
         stop: stop.clone(),
@@ -83,6 +88,7 @@ pub fn spawn(
         buffer_ns: buffer_ns.clone(),
         e2e_ns: e2e_ns.clone(),
         format: format.clone(),
+        clipped: clipped.clone(),
     };
     let alsa_name = alsa_name.to_string();
     let bind_host = bind_host.to_string();
@@ -97,7 +103,7 @@ pub fn spawn(
             }
         })?;
 
-    Ok(RecvHandle { stop, thread, level_bits, xruns, buffer_ns, e2e_ns, jitter_ns, format })
+    Ok(RecvHandle { stop, thread, level_bits, xruns, buffer_ns, e2e_ns, jitter_ns, format, clipped })
 }
 
 /// The atomics the worker publishes into, grouped so the loop signature
@@ -109,6 +115,7 @@ struct Worker {
     buffer_ns: Arc<AtomicU64>,
     e2e_ns: Arc<AtomicU64>,
     format: Arc<AtomicU8>,
+    clipped: Arc<AtomicUsize>,
 }
 
 fn run(
@@ -156,8 +163,23 @@ fn run(
         }
 
         // Rolling peak for the level meter, decayed so brief silence still
-        // reads as quiet without the meter feeling twitchy.
-        let peak = floats.iter().fold(0.0_f32, |acc, s| acc.max(s.abs()));
+        // reads as quiet without the meter feeling twitchy. The same pass
+        // counts samples past the rails, since `f32_to_alsa` clamps them a
+        // few lines below and the information would be gone by then.
+        let mut peak = 0.0_f32;
+        let mut over = 0usize;
+        for &s in floats.iter() {
+            let a = s.abs();
+            if a > peak {
+                peak = a;
+            }
+            if a > 1.0 {
+                over += 1;
+            }
+        }
+        if over > 0 {
+            w.clipped.fetch_add(over, Ordering::Relaxed);
+        }
         let prev = f32::from_bits(w.level_bits.load(Ordering::Relaxed));
         let smoothed = if peak > prev { peak } else { prev * 0.7 + peak * 0.3 };
         w.level_bits.store(smoothed.to_bits(), Ordering::Relaxed);

@@ -53,6 +53,9 @@ pub struct RunningRoute {
     /// Capture-side xrun counter, only set when this engine holds the
     /// route's capture side.
     pub cap_xruns: Option<Arc<AtomicUsize>>,
+    /// Clamped-sample counter, only set when this engine holds the route's
+    /// playback side.
+    pub clipped: Option<Arc<AtomicUsize>>,
 }
 
 impl RunningRoute {
@@ -295,7 +298,7 @@ async fn try_start_inner(state: &Arc<EngineState>, route: &Route) -> Result<Opti
         send: None, recv: None,
         level_bits: None, xruns: None, e2e_ns: None, jitter_ns: None,
         cap_buffer_ns: None, pb_buffer_ns: None,
-        cap_format: None, pb_format: None, cap_xruns: None,
+        cap_format: None, pb_format: None, cap_xruns: None, clipped: None,
     };
 
     if is_local_src(state, route) {
@@ -355,6 +358,7 @@ async fn try_start_inner(state: &Arc<EngineState>, route: &Route) -> Result<Opti
         running.jitter_ns = Some(pipeline.jitter_ns.clone());
         running.pb_buffer_ns = Some(pipeline.buffer_ns.clone());
         running.pb_format = Some(pipeline.format.clone());
+        running.clipped = Some(pipeline.clipped.clone());
         running.recv = Some(pipeline);
     }
 
@@ -589,6 +593,10 @@ pub fn spawn_stats_pump(state: Arc<EngineState>) {
                 let roc_e2e_ms = running.e2e_ns.as_ref().and_then(|n| ns_to_ms(n));
                 let capture_buffer_ms = running.cap_buffer_ns.as_ref().and_then(|n| ns_to_ms(n));
                 let playback_buffer_ms = running.pb_buffer_ns.as_ref().and_then(|n| ns_to_ms(n));
+                let clipped_samples = running
+                    .clipped
+                    .as_ref()
+                    .map(|c| c.load(Ordering::Relaxed) as u32);
                 let capture_format = running.cap_format.as_ref().and_then(atomic_format);
                 let playback_format = running.pb_format.as_ref().and_then(atomic_format);
                 // A worker can have died since the last try_start check (that
@@ -616,6 +624,7 @@ pub fn spawn_stats_pump(state: Arc<EngineState>) {
                     playback_format,
                     capture_xruns,
                     playback_xruns,
+                    clipped_samples,
                 };
                 map.insert(route_id, stats);
             }
@@ -642,6 +651,7 @@ pub fn spawn_stats_pump(state: Arc<EngineState>) {
                         playback_format: None,
                         capture_xruns: None,
                         playback_xruns: None,
+                        clipped_samples: None,
                     },
                 );
             }

@@ -230,6 +230,18 @@ pub struct StreamStats {
     /// holds no playback side.
     #[serde(default)]
     pub playback_xruns: Option<u32>,
+    /// Samples that arrived at the playback device outside [-1.0, 1.0] and
+    /// had to be clamped.
+    ///
+    /// This distinguishes the two things that both sound like a click on a
+    /// loud sustained note. A timing glitch drops or repeats a period, so it
+    /// happens at a rate set by clock drift and is merely *inaudible* during
+    /// silence; clipping only happens when the signal is actually near full
+    /// scale — and a resampler can push a peak that was just under 1.0 to
+    /// just over it, which is a gain-staging problem, not a timing one.
+    /// Without this counter the two are indistinguishable by ear.
+    #[serde(default)]
+    pub clipped_samples: Option<u32>,
 }
 
 /// A host the user added manually (mDNS was blocked / offline). Rendered in

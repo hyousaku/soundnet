@@ -90,6 +90,12 @@ export interface StreamStats {
   // the input or the output side is late.
   capture_xruns: number | null;
   playback_xruns: number | null;
+  // Samples that had to be clamped at the rails on their way to the device.
+  // Separates the two things that both sound like a click on a loud
+  // sustained note: a timing glitch happens at a rate set by clock drift and
+  // is merely inaudible during silence, while clipping only happens when the
+  // signal is genuinely near full scale.
+  clipped_samples: number | null;
 }
 
 export interface ManualHost {

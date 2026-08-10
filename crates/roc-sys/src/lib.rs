@@ -191,6 +191,37 @@ pub struct roc_receiver_config {
     pub choppy_playback_timeout: i64,
 }
 
+/// log.h — a maximum, not a filter set: everything at or below the
+/// configured level is emitted.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum roc_log_level {
+    ROC_LOG_NONE = 0,
+    ROC_LOG_ERROR = 1,
+    ROC_LOG_INFO = 2,
+    ROC_LOG_NOTE = 3,
+    ROC_LOG_DEBUG = 4,
+    ROC_LOG_TRACE = 5,
+}
+
+/// Every `*const c_char` here is valid only for the duration of the handler
+/// call — libroc reuses the buffers afterwards, so anything to be kept must
+/// be copied out before returning.
+#[repr(C)]
+pub struct roc_log_message {
+    pub level: roc_log_level,
+    pub module: *const c_char,
+    pub file: *const c_char,
+    pub line: c_int,
+    pub time: u64,
+    pub pid: u64,
+    pub tid: u64,
+    pub text: *const c_char,
+}
+
+pub type roc_log_handler =
+    Option<unsafe extern "C" fn(message: *const roc_log_message, argument: *mut c_void)>;
+
 #[repr(C)]
 #[derive(Copy, Clone, Debug)]
 pub struct roc_interface_config {
@@ -268,6 +299,8 @@ extern "C" {
         endpoint: *const roc_endpoint,
     ) -> c_int;
     pub fn roc_sender_unlink(sender: *mut roc_sender, slot: roc_slot) -> c_int;
+    pub fn roc_log_set_level(level: roc_log_level);
+    pub fn roc_log_set_handler(handler: roc_log_handler, argument: *mut c_void);
     pub fn roc_sender_query(
         sender: *mut roc_sender,
         slot: roc_slot,

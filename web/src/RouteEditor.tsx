@@ -45,6 +45,7 @@ export default function RouteEditor() {
             </th>
             <th>jitter</th>
             <th>xr</th>
+            <th title="Samples clamped at full scale on the way to the device. Non-zero means the clicks are gain staging, not timing — turn the input down.">clip</th>
             <th>health</th>
             <th></th>
           </tr>
@@ -126,6 +127,9 @@ export default function RouteEditor() {
               </td>
               <td>{stats[r.id] ? `${stats[r.id].jitter_ms.toFixed(2)} ms` : "—"}</td>
               <td title={xrunBreakdown(stats[r.id])}>{stats[r.id]?.xruns ?? 0}</td>
+              <td style={(stats[r.id]?.clipped_samples ?? 0) > 0 ? { color: "#ef5350" } : undefined}>
+                {stats[r.id]?.clipped_samples ?? "—"}
+              </td>
               <td style={{ maxWidth: 220 }}>
                 {failing && health?.type === "retrying" ? (
                   <span title={health.reason} style={{ color: "#ef5350" }}>
