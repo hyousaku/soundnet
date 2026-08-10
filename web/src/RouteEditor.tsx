@@ -125,7 +125,7 @@ export default function RouteEditor() {
                 })()}
               </td>
               <td>{stats[r.id] ? `${stats[r.id].jitter_ms.toFixed(2)} ms` : "—"}</td>
-              <td>{stats[r.id]?.xruns ?? 0}</td>
+              <td title={xrunBreakdown(stats[r.id])}>{stats[r.id]?.xruns ?? 0}</td>
               <td style={{ maxWidth: 220 }}>
                 {failing && health?.type === "retrying" ? (
                   <span title={health.reason} style={{ color: "#ef5350" }}>
@@ -189,6 +189,18 @@ function ActualFormat({ spec, stats }: { spec: StreamSpec; stats?: StreamStats }
       {substituted.map(([side, actual]) => `→ ${actual} (${side})`).join(" ")}
     </div>
   );
+}
+
+/// The `xr` column sums both directions, so spell out which side is late —
+/// capture overruns and playback underruns sound the same but have opposite
+/// causes.
+function xrunBreakdown(stats?: StreamStats): string {
+  if (!stats) return "No data from this engine for this route.";
+  const parts: string[] = [];
+  if (stats.capture_xruns != null) parts.push(`${stats.capture_xruns} capture (overrun: input samples lost)`);
+  if (stats.playback_xruns != null) parts.push(`${stats.playback_xruns} playback (underrun: output starved)`);
+  if (parts.length === 0) return "This engine holds neither end of this route.";
+  return parts.join(", ");
 }
 
 function LevelMeter({ db }: { db: number }) {

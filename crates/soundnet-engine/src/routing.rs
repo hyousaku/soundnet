@@ -50,6 +50,9 @@ pub struct RunningRoute {
     pub cap_format: Option<Arc<AtomicU8>>,
     /// Format the playback device was actually opened with.
     pub pb_format: Option<Arc<AtomicU8>>,
+    /// Capture-side xrun counter, only set when this engine holds the
+    /// route's capture side.
+    pub cap_xruns: Option<Arc<AtomicUsize>>,
 }
 
 impl RunningRoute {
@@ -292,7 +295,7 @@ async fn try_start_inner(state: &Arc<EngineState>, route: &Route) -> Result<Opti
         send: None, recv: None,
         level_bits: None, xruns: None, e2e_ns: None, jitter_ns: None,
         cap_buffer_ns: None, pb_buffer_ns: None,
-        cap_format: None, pb_format: None,
+        cap_format: None, pb_format: None, cap_xruns: None,
     };
 
     if is_local_src(state, route) {
@@ -333,6 +336,7 @@ async fn try_start_inner(state: &Arc<EngineState>, route: &Route) -> Result<Opti
         )?;
         running.cap_buffer_ns = Some(pipeline.buffer_ns.clone());
         running.cap_format = Some(pipeline.format.clone());
+        running.cap_xruns = Some(pipeline.xruns.clone());
         running.send = Some(pipeline);
     }
 
@@ -558,11 +562,18 @@ pub fn spawn_stats_pump(state: Arc<EngineState>) {
                     .as_ref()
                     .map(|b| f32::from_bits(b.load(Ordering::Relaxed)))
                     .unwrap_or(0.0);
-                let xruns = running
+                // Both directions, because a route can glitch on either and
+                // for a long time only the playback side was counted — a
+                // route dropping capture periods reported a clean zero.
+                let capture_xruns = running
+                    .cap_xruns
+                    .as_ref()
+                    .map(|c| c.load(Ordering::Relaxed) as u32);
+                let playback_xruns = running
                     .xruns
                     .as_ref()
-                    .map(|c| c.load(Ordering::Relaxed) as u32)
-                    .unwrap_or(0);
+                    .map(|c| c.load(Ordering::Relaxed) as u32);
+                let xruns = capture_xruns.unwrap_or(0) + playback_xruns.unwrap_or(0);
                 let jitter_ms = running
                     .jitter_ns
                     .as_ref()
@@ -603,6 +614,8 @@ pub fn spawn_stats_pump(state: Arc<EngineState>) {
                     playback_buffer_ms,
                     capture_format,
                     playback_format,
+                    capture_xruns,
+                    playback_xruns,
                 };
                 map.insert(route_id, stats);
             }
@@ -627,6 +640,8 @@ pub fn spawn_stats_pump(state: Arc<EngineState>) {
                         playback_buffer_ms: None,
                         capture_format: None,
                         playback_format: None,
+                        capture_xruns: None,
+                        playback_xruns: None,
                     },
                 );
             }

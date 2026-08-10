@@ -83,6 +83,13 @@ export interface StreamStats {
   // has no device on that side (or hasn't opened it yet).
   capture_format: SampleFormat | null;
   playback_format: SampleFormat | null;
+  // Breakdown behind `xruns`. Capture xruns are overruns (the device had a
+  // period ready before we collected it, so those samples are gone);
+  // playback xruns are underruns (the device wanted samples we hadn't
+  // supplied). Both are audible clicks, and which one it is says whether
+  // the input or the output side is late.
+  capture_xruns: number | null;
+  playback_xruns: number | null;
 }
 
 export interface ManualHost {

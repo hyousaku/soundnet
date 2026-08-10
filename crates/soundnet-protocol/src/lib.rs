@@ -182,6 +182,12 @@ pub enum RouteHealth {
 /// / Patchbay.tsx).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StreamStats {
+    /// Every xrun this engine saw for this route, both directions summed.
+    /// The breakdown is in `capture_xruns` / `playback_xruns` — this stays a
+    /// single number because "did anything glitch?" is the question the
+    /// column answers, and for a long time it silently answered it with the
+    /// playback side only, which let a route drop capture periods while
+    /// reporting a clean zero.
     pub xruns: u32,
     pub jitter_ms: f32,
     pub level_db: f32,
@@ -214,6 +220,16 @@ pub struct StreamStats {
     /// negotiate independently and can genuinely differ.
     #[serde(default)]
     pub playback_format: Option<SampleFormat>,
+    /// Xruns on the capture device alone (overruns: the device had samples
+    /// ready and we were late collecting them). `None` when this engine
+    /// holds no capture side, including a tone source.
+    #[serde(default)]
+    pub capture_xruns: Option<u32>,
+    /// Xruns on the playback device alone (underruns: the device wanted
+    /// samples and we were late supplying them). `None` when this engine
+    /// holds no playback side.
+    #[serde(default)]
+    pub playback_xruns: Option<u32>,
 }
 
 /// A host the user added manually (mDNS was blocked / offline). Rendered in

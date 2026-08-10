@@ -22,7 +22,7 @@
 use anyhow::{bail, Result};
 use soundnet_protocol::{StreamSpec, UNKNOWN_FORMAT};
 use std::net::IpAddr;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 
@@ -48,6 +48,11 @@ pub struct SendHandle {
     /// open, and for the whole life of a tone source — there is no device to
     /// negotiate with, so there is no format to report.
     pub format: Arc<AtomicU8>,
+    /// Monotonic count of recovered capture xruns. An overrun means the
+    /// device had a period ready before we came back for it, so those
+    /// samples are simply gone — an audible click, and for a long time one
+    /// that no counter anywhere recorded.
+    pub xruns: Arc<AtomicUsize>,
 }
 
 impl SendHandle {
@@ -72,10 +77,12 @@ pub fn spawn(
     let stop = Arc::new(AtomicBool::new(false));
     let buffer_ns = Arc::new(AtomicU64::new(u64::MAX));
     let format = Arc::new(AtomicU8::new(UNKNOWN_FORMAT));
+    let xruns = Arc::new(AtomicUsize::new(0));
 
     let stop_worker = stop.clone();
     let buffer_worker = buffer_ns.clone();
     let format_worker = format.clone();
+    let xruns_worker = xruns.clone();
     let alsa_name = alsa_name.to_string();
     let dst_host = dst_host.to_string();
     let spec = spec.clone();
@@ -104,6 +111,7 @@ pub fn spawn(
                     &stop_worker,
                     &buffer_worker,
                     &format_worker,
+                    &xruns_worker,
                 ),
             };
             if let Err(err) = result {
@@ -111,7 +119,7 @@ pub fn spawn(
             }
         })?;
 
-    Ok(SendHandle { stop, thread, buffer_ns, format })
+    Ok(SendHandle { stop, thread, buffer_ns, format, xruns })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -125,6 +133,7 @@ fn alsa_loop(
     stop: &Arc<AtomicBool>,
     buffer_ns: &Arc<AtomicU64>,
     format_out: &Arc<AtomicU8>,
+    xruns: &Arc<AtomicUsize>,
 ) -> Result<()> {
     let (pcm, format) = pcm::open(alsa_name, alsa::Direction::Capture, spec)?;
     format_out.store(format.as_u8(), Ordering::Relaxed);
@@ -151,6 +160,7 @@ fn alsa_loop(
             Ok(frames) => frames,
             Err(err) => {
                 if pcm.try_recover(err, false).is_ok() {
+                    xruns.fetch_add(1, Ordering::Relaxed);
                     consecutive_errors += 1;
                     if consecutive_errors >= MAX_CONSECUTIVE_ERRORS {
                         bail!("capture {alsa_name}: {consecutive_errors} consecutive xruns, giving up");
