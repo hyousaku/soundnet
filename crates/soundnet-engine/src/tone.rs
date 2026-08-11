@@ -23,6 +23,7 @@ pub fn register_default_tones(state: &Arc<EngineState>) {
                 alsa_name: format!("{TONE_PREFIX}{freq}"),
                 label: format!("Test tone {freq} Hz"),
                 max_channels: 2,
+                probe_failed: false,
                 supported_formats: vec![SampleFormat::F32Le, SampleFormat::S16Le, SampleFormat::S24Le3],
                 supported_rates: vec![44_100, 48_000, 96_000],
             },

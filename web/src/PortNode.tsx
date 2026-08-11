@@ -69,6 +69,36 @@ export default function PortNode({ data }: NodeProps<PortRFNode>) {
   );
 }
 
+/// The channel count, which is the whole reason the engine probes devices at
+/// all — and which the UI used to fetch and then throw away, so a 8-channel
+/// interface was indistinguishable from a stereo one until you tried it.
+function PortCaps({ port }: { port: LocalPort }) {
+  if (port.kind === "tone") return null;
+  if (port.probe_failed) {
+    return (
+      <span
+        style={{ color: "#f59e0b", fontSize: 10, whiteSpace: "nowrap" }}
+        title={
+          "Could not open this device to ask what it supports, so its channel " +
+          "count, formats and rates are unknown. Usually something else holds " +
+          "the card — on a desktop that is PipeWire. Release it (pavucontrol " +
+          "\u2192 Configuration \u2192 Off) and rescan."
+        }
+      >
+        ?ch
+      </span>
+    );
+  }
+  return (
+    <span
+      style={{ color: "#8a94a5", fontSize: 10, whiteSpace: "nowrap" }}
+      title={`up to ${port.max_channels} channels; ${port.supported_rates.join("/")} Hz; ${port.supported_formats.join(" ")}`}
+    >
+      {port.max_channels}ch
+    </span>
+  );
+}
+
 function PortRow({ port, side }: { port: LocalPort; side: "source" | "target" }) {
   const isSource = side === "source";
   return (
@@ -97,6 +127,7 @@ function PortRow({ port, side }: { port: LocalPort; side: "source" | "target" })
       >
         {port.label}
       </span>
+      <PortCaps port={port} />
       <Handle
         type={side}
         position={isSource ? Position.Right : Position.Left}

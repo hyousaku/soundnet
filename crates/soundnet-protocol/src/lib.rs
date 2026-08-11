@@ -88,6 +88,17 @@ pub struct LocalPort {
     /// Human-readable label shown in the UI.
     pub label: String,
     pub max_channels: u8,
+    /// True when the device could not be opened to ask what it supports, so
+    /// `max_channels` / `supported_formats` / `supported_rates` are
+    /// placeholders rather than facts.
+    ///
+    /// The usual cause is that something else holds the card — on a desktop
+    /// that is PipeWire. The old fallback silently claimed "2 channels,
+    /// S16_LE, 48 kHz", which is indistinguishable from a real stereo
+    /// interface and sends you looking for the missing channels in the wrong
+    /// place entirely.
+    #[serde(default)]
+    pub probe_failed: bool,
     pub supported_formats: Vec<SampleFormat>,
     pub supported_rates: Vec<u32>,
 }

@@ -1,5 +1,5 @@
 import { useStore } from "./store";
-import type { SampleFormat, StreamSpec, StreamStats } from "./protocol";
+import type { LocalPort, Route, SampleFormat, StreamSpec, StreamStats } from "./protocol";
 import { summarizeLatency } from "./latency";
 
 const RATES = [44100, 48000, 88200, 96000];
@@ -12,6 +12,26 @@ export default function RouteEditor() {
   const nodes = useStore((s) => s.nodes);
   const stats = useStore((s) => s.stats);
   const send = useStore((s) => s.send);
+  const ports = useStore((s) => s.ports);
+
+  /// The most channels this route can carry: whichever of its two devices has
+  /// fewer. Routes default to 2 (see `defaultSpec`), so without this the
+  /// operator has no way to know a multichannel interface is being used two
+  /// channels at a time.
+  const channelLimit = (r: Route): { max: number; known: boolean } => {
+    const find = (nodeId: string, portId: string): LocalPort | undefined =>
+      (ports[nodeId] ?? []).find((p) => p.id === portId);
+    const src = find(r.src.node_id, r.src.port_id);
+    const dst = find(r.dst.node_id, r.dst.port_id);
+    // A tone source synthesizes as many channels as asked for, so it never
+    // constrains the route; an unprobed device's "2" is a placeholder, not a
+    // limit, and clamping to it would turn a display problem into a real one.
+    const limits = [src, dst]
+      .filter((p): p is LocalPort => !!p && p.kind !== "tone" && !p.probe_failed)
+      .map((p) => p.max_channels);
+    if (limits.length === 0) return { max: 32, known: false };
+    return { max: Math.min(...limits), known: true };
+  };
 
   const routeList = Object.values(routes);
   if (routeList.length === 0) {
@@ -70,15 +90,36 @@ export default function RouteEditor() {
                   ))}
                 </select>
               </td>
-              <td>
-                <input
-                  type="number"
-                  min={1}
-                  max={32}
-                  style={{ width: 50 }}
-                  value={r.spec.channels}
-                  onChange={(e) => update(send, r.id, r.spec, { channels: Number(e.target.value) })}
-                />
+              <td style={{ whiteSpace: "nowrap" }}>
+                {(() => {
+                  const limit = channelLimit(r);
+                  return (
+                    <>
+                      <input
+                        type="number"
+                        min={1}
+                        max={limit.max}
+                        style={{ width: 50 }}
+                        value={r.spec.channels}
+                        onChange={(e) =>
+                          update(send, r.id, r.spec, {
+                            channels: Math.max(1, Math.min(limit.max, Number(e.target.value))),
+                          })
+                        }
+                      />
+                      <span
+                        style={{ color: "#8a94a5", fontSize: 10, marginLeft: 4 }}
+                        title={
+                          limit.known
+                            ? `Both devices on this route support at least ${limit.max} channels.`
+                            : "Channel count unknown — one end could not be probed, or is a tone."
+                        }
+                      >
+                        /{limit.known ? limit.max : "?"}
+                      </span>
+                    </>
+                  );
+                })()}
               </td>
               <td>
                 <select

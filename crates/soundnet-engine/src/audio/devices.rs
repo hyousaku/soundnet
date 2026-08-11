@@ -102,7 +102,7 @@ fn add_port(
         PortKind::Tone => return,
     };
 
-    let (max_channels, formats, rates) = probe(alsa_name, dir);
+    let probed = probe(alsa_name, dir);
     let id = alsa_name.replace([':', ',', '/', ' '], "_")
         + match kind {
             PortKind::Capture => "_in",
@@ -125,24 +125,55 @@ fn add_port(
             kind,
             alsa_name: alsa_name.to_string(),
             label,
-            max_channels,
-            supported_formats: formats,
-            supported_rates: rates,
+            max_channels: probed.max_channels,
+            supported_formats: probed.formats,
+            supported_rates: probed.rates,
+            probe_failed: probed.failed,
         },
     );
 }
 
-fn probe(alsa_name: &str, dir: alsa::Direction) -> (u8, Vec<SampleFormat>, Vec<u32>) {
+struct Probe {
+    max_channels: u8,
+    formats: Vec<SampleFormat>,
+    rates: Vec<u32>,
+    failed: bool,
+}
+
+/// What we have to say when the device won't open. Marked `failed` so the UI
+/// can show it as unknown: a device that is merely busy would otherwise be
+/// reported as a plain stereo 48 kHz interface, which looks entirely normal
+/// and hides however many channels it really has.
+fn unprobed() -> Probe {
+    Probe {
+        max_channels: 2,
+        formats: vec![SampleFormat::S16Le],
+        rates: vec![48_000],
+        failed: true,
+    }
+}
+
+fn probe(alsa_name: &str, dir: alsa::Direction) -> Probe {
     let pcm = match alsa::PCM::new(alsa_name, dir, true) {
         Ok(pcm) => pcm,
         Err(err) => {
-            tracing::debug!("probe open {alsa_name}: {err}");
-            return (2, vec![SampleFormat::S16Le], vec![48_000]);
+            // Warn, not debug. This is the difference between "my 8-channel
+            // interface shows up as stereo" being a five-minute fix and an
+            // afternoon.
+            tracing::warn!(
+                "cannot probe {alsa_name} ({err}); reporting placeholder \
+                 capabilities. If something else holds the card (PipeWire on \
+                 a desktop), release it and rescan."
+            );
+            return unprobed();
         }
     };
     let hwp = match alsa::pcm::HwParams::any(&pcm) {
         Ok(h) => h,
-        Err(_) => return (2, vec![SampleFormat::S16Le], vec![48_000]),
+        Err(err) => {
+            tracing::warn!("cannot read hw params for {alsa_name}: {err}");
+            return unprobed();
+        }
     };
 
     let max_channels = hwp.get_channels_max().unwrap_or(2).min(32) as u8;
@@ -167,5 +198,5 @@ fn probe(alsa_name: &str, dir: alsa::Direction) -> (u8, Vec<SampleFormat>, Vec<u
         rates.push(48_000);
     }
 
-    (max_channels, formats, rates)
+    Probe { max_channels, formats, rates, failed: false }
 }

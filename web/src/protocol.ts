@@ -27,6 +27,10 @@ export interface LocalPort {
   alsa_name: string;
   label: string;
   max_channels: number;
+  // True when the device could not be opened to ask what it supports, so the
+  // three capability fields are placeholders. Almost always means something
+  // else holds the card — PipeWire, on a desktop.
+  probe_failed: boolean;
   supported_formats: SampleFormat[];
   supported_rates: number[];
 }
