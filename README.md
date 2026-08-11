@@ -4,7 +4,8 @@ Low-latency **LAN audio streaming** between Linux hosts (including
 Raspberry Pi 4). One small Rust daemon per host, a shared browser UI you can
 open from anywhere on the LAN, patch bay–style routing between USB / built-in
 sound cards on different machines, and a target end-to-end latency of ~10 ms
-on wired Gigabit.
+**over wired Gigabit** — Wi-Fi works but clicks under load, and is for
+verification rather than production (see [Network](#network-wired-only-in-practice)).
 
 The transport is [roc-toolkit](https://github.com/roc-streaming/roc-toolkit) —
 so you get clock-drift compensation, adaptive jitter buffer, and FEC out of the
@@ -193,6 +194,37 @@ Tests:
 cargo test --workspace
 ```
 
+## Network: wired only, in practice
+
+**Use a wire.** Measured on the two deployed machines, a wired link produces
+no audible artefacts at all; the same route over Wi-Fi clicks audibly on any
+sustained note. Wi-Fi is supported and useful — for checking that a machine
+works, for a temporary setup, for monitoring — but it is not the transport
+this project is for.
+
+The reason is not fixable from here. Wi-Fi is CSMA/CA: a station that wants to
+transmit must wait until the air is free, and retransmit when a frame is lost.
+The resulting delay varies by milliseconds to tens of milliseconds and cannot
+be predicted, while the whole design rests on a jitter buffer sized in single
+milliseconds. A packet that misses its slot is a gap in the waveform, and a
+gap in a waveform is a click. This is the same reason Dante is a wired
+technology and AES67 assumes a managed network.
+
+If you do run over Wi-Fi, three things make it tolerable:
+
+| | |
+|---|---|
+| `target_latency_ms` **40–80** | The jitter buffer is the only thing absorbing that variance. This is the setting that matters. |
+| `frames_per_period` **256** | Cuts the packet rate to a quarter. Wi-Fi pays a fixed airtime cost per frame regardless of size, so many small packets is its worst case — and a longer FEC block also survives the consecutive losses Wi-Fi tends to produce. |
+| `iw dev wlan0 set power_save off` | Client power saving casually adds tens of milliseconds. Persist it with a `wifi.powersave = 2` drop-in under `/etc/NetworkManager/conf.d/`. |
+
+Prefer 5 GHz. Expect ~50 ms end to end, and treat anything under 20 ms as
+wired-only territory.
+
+The engine has no opinion about which interface you use — pin one per node
+under **This node → Egress interface** in the UI — so the same node can be
+wired for a session and wireless for a soundcheck.
+
 ## Latency tuning
 
 Start with the defaults (48 kHz / S24 / 2 ch / period 128 / target 10 ms /
@@ -207,7 +239,8 @@ Push it lower:
 
 Back off:
 
-- Raise `target_latency_ms` to 40–80 if the network is jittery (Wi-Fi, VPN)
+- Raise `target_latency_ms` to 40–80 if the network is jittery (Wi-Fi, VPN —
+  see [Network](#network-wired-only-in-practice))
 - Keep FEC on
 
 All parameters are editable per-route in the UI while audio is running — the
