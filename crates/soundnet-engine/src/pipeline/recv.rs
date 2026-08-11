@@ -19,7 +19,7 @@
 use anyhow::{bail, Result};
 use soundnet_protocol::{StreamSpec, UNKNOWN_FORMAT};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 
 use crate::audio::format::f32_to_alsa;
@@ -54,6 +54,9 @@ pub struct RecvHandle {
     /// device. See `StreamStats::clipped_samples` for why this earns a
     /// counter of its own.
     pub clipped: Arc<AtomicUsize>,
+    /// Why this pipeline stopped, if it stopped on its own. See the same
+    /// field on `SendHandle`.
+    pub last_error: Arc<Mutex<Option<String>>>,
 }
 
 impl RecvHandle {
@@ -80,6 +83,7 @@ pub fn spawn(
     let jitter_ns = Arc::new(AtomicU64::new(0));
     let format = Arc::new(AtomicU8::new(UNKNOWN_FORMAT));
     let clipped = Arc::new(AtomicUsize::new(0));
+    let last_error: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
 
     let worker = Worker {
         stop: stop.clone(),
@@ -90,6 +94,7 @@ pub fn spawn(
         format: format.clone(),
         clipped: clipped.clone(),
     };
+    let error_worker = last_error.clone();
     let alsa_name = alsa_name.to_string();
     let bind_host = bind_host.to_string();
     let spec = spec.clone();
@@ -100,10 +105,11 @@ pub fn spawn(
             crate::rt::raise_thread_priority("recv pipeline", crate::rt::PRIO_RECV);
             if let Err(err) = run(&alsa_name, &spec, ctx, &bind_host, bind_port, &worker) {
                 tracing::error!("recv pipeline {bind_host}:{bind_port} -> {alsa_name} failed: {err:#}");
+                *error_worker.lock().unwrap() = Some(format!("{err:#}"));
             }
         })?;
 
-    Ok(RecvHandle { stop, thread, level_bits, xruns, buffer_ns, e2e_ns, jitter_ns, format, clipped })
+    Ok(RecvHandle { stop, thread, level_bits, xruns, buffer_ns, e2e_ns, jitter_ns, format, clipped, last_error })
 }
 
 /// The atomics the worker publishes into, grouped so the loop signature

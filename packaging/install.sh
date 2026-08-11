@@ -110,6 +110,16 @@ build_roc_from_source() {
         scons -Q --prefix=/usr/local --build-3rdparty=openfec
         $SUDO scons -Q --prefix=/usr/local --build-3rdparty=openfec install
     )
+    # Leaving the distro's 0.3 -dev package installed is not harmless: it owns
+    # /usr/lib/<triplet>/libroc.so, which the linker finds before
+    # /usr/local/lib, so the next build would link the very 0.3 we just spent
+    # ten minutes replacing. Only the -dev package goes; the 0.3 runtime can
+    # stay for anything else that needs it.
+    if dpkg-query -W -f='${Status}' libroc-dev 2>/dev/null | grep -q "install ok installed"; then
+        warn "removing the distro's libroc-dev (0.3) — its /usr/lib/libroc.so would
+         shadow the 0.4 just built into /usr/local at link time"
+        $SUDO apt-get remove -y libroc-dev
+    fi
     $SUDO ldconfig
 }
 

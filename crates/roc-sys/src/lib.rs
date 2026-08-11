@@ -219,6 +219,18 @@ pub struct roc_log_message {
     pub text: *const c_char,
 }
 
+/// version.h. The header is explicit that this "may be different from the
+/// compile-time version when using shared library" — which is the whole
+/// reason `check_runtime_version` exists.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default)]
+pub struct roc_version {
+    pub major: c_uint,
+    pub minor: c_uint,
+    pub patch: c_uint,
+    pub code: c_uint,
+}
+
 pub type roc_log_handler =
     Option<unsafe extern "C" fn(message: *const roc_log_message, argument: *mut c_void)>;
 
@@ -299,6 +311,7 @@ extern "C" {
         endpoint: *const roc_endpoint,
     ) -> c_int;
     pub fn roc_sender_unlink(sender: *mut roc_sender, slot: roc_slot) -> c_int;
+    pub fn roc_version_load(version: *mut roc_version);
     pub fn roc_log_set_level(level: roc_log_level);
     pub fn roc_log_set_handler(handler: roc_log_handler, argument: *mut c_void);
     pub fn roc_sender_query(
@@ -339,4 +352,37 @@ extern "C" {
     ) -> c_int;
     pub fn roc_receiver_read(receiver: *mut roc_receiver, frame: *mut roc_frame) -> c_int;
     pub fn roc_receiver_close(receiver: *mut roc_receiver) -> c_int;
+}
+
+/// The libroc ABI these bindings describe. 0.3 is not merely older — several
+/// `roc_sender_config` / `roc_receiver_config` fields were renamed and
+/// reordered between the two, so a 0.3 library reads our structs at the wrong
+/// offsets. It does not crash; it rejects the call with a message about a
+/// field name that does not exist in this crate
+/// ("invalid roc_receiver_config.clock_sync_profile"), which is a genuinely
+/// baffling thing to be told, and then every route fails to start with no
+/// hint that the library is the problem.
+pub const EXPECTED_MAJOR: c_uint = 0;
+pub const EXPECTED_MINOR: c_uint = 4;
+
+/// Ask the *loaded* library what it is, and complain if it is not what these
+/// bindings were written against.
+///
+/// Checking headers at install time is not the same check: the header in
+/// /usr/local can be 0.4 while the dynamic linker resolves `libroc.so.0.3`
+/// from /usr/lib, and nothing before this noticed the difference.
+pub fn check_runtime_version() -> Result<(u32, u32, u32), String> {
+    let mut v = roc_version::default();
+    unsafe { roc_version_load(&mut v) };
+    if v.major == EXPECTED_MAJOR && v.minor == EXPECTED_MINOR {
+        Ok((v.major, v.minor, v.patch))
+    } else {
+        Err(format!(
+            "libroc {}.{}.{} is loaded, but this build requires {}.{}.x — the two \
+             are not ABI compatible (config struct fields were renamed and \
+             reordered), so every route would fail to start with a confusing \
+             error about a field that does not exist in this version",
+            v.major, v.minor, v.patch, EXPECTED_MAJOR, EXPECTED_MINOR
+        ))
+    }
 }

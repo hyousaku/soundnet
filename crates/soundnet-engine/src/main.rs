@@ -59,6 +59,18 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
 
+    // Check the library we actually loaded, not the headers we compiled
+    // against — version.h itself notes the two "may be different when using
+    // shared library", and on a machine with both a distro 0.3 and a
+    // source-built 0.4 that is exactly what happens. Against 0.3 the config
+    // structs are read at the wrong offsets, so nothing works and the errors
+    // name fields that do not exist in this version. Failing here, once, with
+    // the real numbers beats that by a wide margin.
+    match roc_sys::check_runtime_version() {
+        Ok((major, minor, patch)) => tracing::info!("libroc {major}.{minor}.{patch}"),
+        Err(msg) => anyhow::bail!("{msg}\n\nSee the libroc section of packaging/README.md."),
+    }
+
     let hostname = hostname::get()
         .ok()
         .and_then(|s| s.into_string().ok())

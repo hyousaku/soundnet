@@ -23,7 +23,7 @@ use anyhow::{bail, Result};
 use soundnet_protocol::{StreamSpec, UNKNOWN_FORMAT};
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 
 use crate::audio::format::alsa_to_f32;
@@ -53,6 +53,11 @@ pub struct SendHandle {
     /// samples are simply gone — an audible click, and for a long time one
     /// that no counter anywhere recorded.
     pub xruns: Arc<AtomicUsize>,
+    /// Why this pipeline stopped, if it stopped on its own. Written once, as
+    /// the thread unwinds. Without it the UI can only say that a worker
+    /// exited — which names the symptom and withholds every fact that would
+    /// let an operator act on it.
+    pub last_error: Arc<Mutex<Option<String>>>,
 }
 
 impl SendHandle {
@@ -78,11 +83,13 @@ pub fn spawn(
     let buffer_ns = Arc::new(AtomicU64::new(u64::MAX));
     let format = Arc::new(AtomicU8::new(UNKNOWN_FORMAT));
     let xruns = Arc::new(AtomicUsize::new(0));
+    let last_error: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
 
     let stop_worker = stop.clone();
     let buffer_worker = buffer_ns.clone();
     let format_worker = format.clone();
     let xruns_worker = xruns.clone();
+    let error_worker = last_error.clone();
     let alsa_name = alsa_name.to_string();
     let dst_host = dst_host.to_string();
     let spec = spec.clone();
@@ -116,10 +123,11 @@ pub fn spawn(
             };
             if let Err(err) = result {
                 tracing::error!("send pipeline {alsa_name} -> {dst_host}:{dst_port} failed: {err:#}");
+                *error_worker.lock().unwrap() = Some(format!("{err:#}"));
             }
         })?;
 
-    Ok(SendHandle { stop, thread, buffer_ns, format, xruns })
+    Ok(SendHandle { stop, thread, buffer_ns, format, xruns, last_error })
 }
 
 #[allow(clippy::too_many_arguments)]

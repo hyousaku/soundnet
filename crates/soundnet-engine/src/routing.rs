@@ -68,6 +68,30 @@ impl RunningRoute {
         self.send.as_ref().map(|s| s.thread.is_finished()).unwrap_or(false)
             || self.recv.as_ref().map(|r| r.thread.is_finished()).unwrap_or(false)
     }
+
+    /// Why the pipeline stopped, as reported by the thread itself.
+    ///
+    /// "worker exited unexpectedly" was the only thing the UI used to say,
+    /// which names the symptom and withholds every fact needed to act: an
+    /// ALSA device held by PipeWire, a format no device would accept and a
+    /// UDP port already bound all looked identical, and the operator had to
+    /// go read the journal to find out which. The thread already knows.
+    fn failure_reason(&self) -> String {
+        let from = |slot: &Option<Arc<std::sync::Mutex<Option<String>>>>| -> Option<String> {
+            slot.as_ref()?.lock().ok()?.clone()
+        };
+        let send = from(&self.send.as_ref().map(|s| s.last_error.clone()));
+        let recv = from(&self.recv.as_ref().map(|r| r.last_error.clone()));
+        match (send, recv) {
+            (Some(s), Some(r)) => format!("send: {s}; recv: {r}"),
+            (Some(s), None) => s,
+            (None, Some(r)) => r,
+            // The thread finished without recording anything: it returned
+            // Ok, which for these loops only happens on a stop request. Say
+            // so rather than inventing a cause.
+            (None, None) => "pipeline stopped without reporting an error".to_string(),
+        }
+    }
 }
 
 /// Backoff bookkeeping for a route this engine has a local role in but
@@ -250,6 +274,7 @@ fn validate_route(state: &Arc<EngineState>, route: &Route) -> Result<()> {
 pub async fn try_start(state: &Arc<EngineState>, route: &Route) -> Result<()> {
     if let Some(entry) = state.running.get(&route.id) {
         let dead = entry.is_dead();
+        let dead_reason = if dead { Some(entry.failure_reason()) } else { None };
         drop(entry);
         if !dead {
             // Confirmed alive as of this check — any backoff from an earlier
@@ -260,11 +285,9 @@ pub async fn try_start(state: &Arc<EngineState>, route: &Route) -> Result<()> {
         if let Some((_, dead_route)) = state.running.remove(&route.id) {
             shutdown_running(dead_route);
         }
-        record_failure(state, &route.id, "worker exited unexpectedly");
-        tracing::warn!(
-            "route {} worker(s) exited unexpectedly; backing off before retry",
-            route.id
-        );
+        let reason = dead_reason.unwrap_or_else(|| "pipeline exited".to_string());
+        tracing::warn!("route {} pipeline died: {reason}; backing off before retry", route.id);
+        record_failure(state, &route.id, &reason);
     }
 
     if let Some(failure) = state.failures.get(&route.id) {
