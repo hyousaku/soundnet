@@ -69,16 +69,18 @@ change that:
 
 ## `@xyflow/react` attribution
 
-The patch bay sets `proOptions={{ hideAttribution: true }}`, which removes the
-"React Flow" badge from the canvas.
+The patch bay shows React Flow's attribution badge, and should keep doing so.
 
-The library's own license file is plain MIT and imposes no such condition — it
-requires only that the copyright notice travel with copies of the software.
-But the xyflow project **asks** that the attribution be kept unless you hold a
-Pro subscription, and that request is how they fund the library. It is a
-courtesy question rather than a license one. Worth a deliberate decision
-before making the repository public, since the flag is now visible to anyone
-reading `web/src/Patchbay.tsx`.
+The library's license is plain MIT and does not require it — MIT asks only
+that the copyright notice travel with copies of the software, not that
+anything appear on screen. Removing the badge would have been legally fine,
+and `proOptions={{ hideAttribution: true }}` did exactly that for a while.
+But the xyflow project asks that it stay unless you hold a Pro subscription,
+and that request is how the library is funded. Since we are not paying for it,
+leaving the badge up is the least we can do.
+
+If you ever do want it gone, buy the subscription rather than setting the
+flag.
 
 ---
 

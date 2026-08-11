@@ -127,7 +127,6 @@ export default function Patchbay() {
         fitViewOptions={{ maxZoom: 1 }}
         minZoom={0.2}
         colorMode="dark"
-        proOptions={{ hideAttribution: true }}
       >
         <Background color="#262d38" gap={20} />
         <Controls />
