@@ -9,6 +9,24 @@ to type.
 | **B. `install.sh`** | Fresh machine, nothing set up yet | `packaging/install.sh` |
 | **C. Manual** | You want to see every step | See [README.md](../README.md) |
 
+## Setting up a brand-new machine
+
+```bash
+sudo apt update && sudo apt install -y git
+git clone -b claude/low-latency-network-audio-54k08x \
+    git@github.com:hyousaku/soundnet.git ~/soundnet
+cd ~/soundnet && packaging/install.sh --yes
+```
+
+Swap the clone URL for `https://github.com/hyousaku/soundnet.git` if the
+machine has no SSH key registered. Then log out and back in — `install.sh`
+adds you to the `audio` group, and the real-time limits only apply to a fresh
+session.
+
+Verify with `soundnet-engine --version`: it prints the git commit it was
+built from, and `install.sh` has already checked that against the binary it
+just built, so a mismatch would have stopped the install.
+
 ## A. Install a prebuilt `.deb`
 
 ```bash

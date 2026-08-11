@@ -232,4 +232,12 @@ worker restarts transparently.
 
 ## Licence
 
-MIT.
+MIT — see [LICENSE](LICENSE).
+
+Dependencies and what they ask of you are inventoried in
+[THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md). The short version: nothing
+this repo produces contains third-party code except the Rust crates and web
+libraries compiled into the binary, all of which are permissive apart from one
+MPL-2.0 crate used unmodified. roc-toolkit (MPL-2.0), ALSA (LGPL-2.1+) and
+OpenFEC (CeCILL-C) are dynamically linked system libraries and are not
+redistributed here — which would change if the `.deb` ever bundled them.
