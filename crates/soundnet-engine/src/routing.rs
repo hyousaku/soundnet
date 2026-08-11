@@ -359,6 +359,7 @@ async fn try_start_inner(state: &Arc<EngineState>, route: &Route) -> Result<Opti
             &dst_node.addr,
             dst_port,
             outgoing,
+            route.src.channel_offset,
         )?;
         running.cap_buffer_ns = Some(pipeline.buffer_ns.clone());
         running.cap_format = Some(pipeline.format.clone());
@@ -374,7 +375,14 @@ async fn try_start_inner(state: &Arc<EngineState>, route: &Route) -> Result<Opti
             .ok_or_else(|| anyhow!("unknown local dst port {}", route.dst.port_id))?;
         let bind_port = route_port(state.identity.audio_port, &route.id);
         let ctx = roc_context().await?;
-        let pipeline = recv::spawn(&port.alsa_name, &route.spec, ctx, "0.0.0.0", bind_port)?;
+        let pipeline = recv::spawn(
+            &port.alsa_name,
+            &route.spec,
+            ctx,
+            "0.0.0.0",
+            bind_port,
+            route.dst.channel_offset,
+        )?;
         running.level_bits = Some(pipeline.level_bits.clone());
         running.xruns = Some(pipeline.xruns.clone());
         running.e2e_ns = Some(pipeline.e2e_ns.clone());

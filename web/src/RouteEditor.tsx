@@ -14,23 +14,27 @@ export default function RouteEditor() {
   const send = useStore((s) => s.send);
   const ports = useStore((s) => s.ports);
 
-  /// The most channels this route can carry: whichever of its two devices has
-  /// fewer. Routes default to 2 (see `defaultSpec`), so without this the
-  /// operator has no way to know a multichannel interface is being used two
-  /// channels at a time.
-  const channelLimit = (r: Route): { max: number; known: boolean } => {
+  /// How many channels each end's device has, or null when that is not a
+  /// real constraint: a tone synthesizes as many as asked for, and an
+  /// unprobed device's "2" is a placeholder rather than a limit — clamping to
+  /// it would turn a display problem into a real one.
+  const deviceWidths = (r: Route): { src: number | null; dst: number | null } => {
     const find = (nodeId: string, portId: string): LocalPort | undefined =>
       (ports[nodeId] ?? []).find((p) => p.id === portId);
-    const src = find(r.src.node_id, r.src.port_id);
-    const dst = find(r.dst.node_id, r.dst.port_id);
-    // A tone source synthesizes as many channels as asked for, so it never
-    // constrains the route; an unprobed device's "2" is a placeholder, not a
-    // limit, and clamping to it would turn a display problem into a real one.
-    const limits = [src, dst]
-      .filter((p): p is LocalPort => !!p && p.kind !== "tone" && !p.probe_failed)
-      .map((p) => p.max_channels);
-    if (limits.length === 0) return { max: 32, known: false };
-    return { max: Math.min(...limits), known: true };
+    const width = (p?: LocalPort) =>
+      p && p.kind !== "tone" && !p.probe_failed ? p.max_channels : null;
+    return { src: width(find(r.src.node_id, r.src.port_id)), dst: width(find(r.dst.node_id, r.dst.port_id)) };
+  };
+
+  /// Widest window that still fits inside both devices from their current
+  /// starting channels.
+  const maxWidth = (r: Route): number => {
+    const w = deviceWidths(r);
+    const room = [
+      w.src === null ? null : w.src - (r.src.channel_offset ?? 0),
+      w.dst === null ? null : w.dst - (r.dst.channel_offset ?? 0),
+    ].filter((n): n is number => n !== null);
+    return room.length === 0 ? 32 : Math.max(1, Math.min(...room));
   };
 
   const routeList = Object.values(routes);
@@ -54,7 +58,9 @@ export default function RouteEditor() {
           <tr>
             <th>Src → Dst</th>
             <th>Rate</th>
-            <th>Ch</th>
+            <th title="How many channels this route carries.">Ch</th>
+            <th title="First channel of the source device this route takes, counting from 1.">src ch</th>
+            <th title="First channel of the destination device this route lands on, counting from 1.">dst ch</th>
             <th>Format</th>
             <th>Period</th>
             <th>Latency</th>
@@ -91,36 +97,31 @@ export default function RouteEditor() {
                 </select>
               </td>
               <td style={{ whiteSpace: "nowrap" }}>
-                {(() => {
-                  const limit = channelLimit(r);
-                  return (
-                    <>
-                      <input
-                        type="number"
-                        min={1}
-                        max={limit.max}
-                        style={{ width: 50 }}
-                        value={r.spec.channels}
-                        onChange={(e) =>
-                          update(send, r.id, r.spec, {
-                            channels: Math.max(1, Math.min(limit.max, Number(e.target.value))),
-                          })
-                        }
-                      />
-                      <span
-                        style={{ color: "#8a94a5", fontSize: 10, marginLeft: 4 }}
-                        title={
-                          limit.known
-                            ? `Both devices on this route support at least ${limit.max} channels.`
-                            : "Channel count unknown — one end could not be probed, or is a tone."
-                        }
-                      >
-                        /{limit.known ? limit.max : "?"}
-                      </span>
-                    </>
-                  );
-                })()}
+                <input
+                  type="number"
+                  min={1}
+                  max={maxWidth(r)}
+                  style={{ width: 46 }}
+                  value={r.spec.channels}
+                  onChange={(e) =>
+                    update(send, r.id, r.spec, {
+                      channels: Math.max(1, Math.min(maxWidth(r), Number(e.target.value))),
+                    })
+                  }
+                />
               </td>
+              <ChannelStart
+                route={r}
+                side="src"
+                deviceWidth={deviceWidths(r).src}
+                send={send}
+              />
+              <ChannelStart
+                route={r}
+                side="dst"
+                deviceWidth={deviceWidths(r).dst}
+                send={send}
+              />
               <td>
                 <select
                   value={r.spec.alsa_format}
@@ -193,6 +194,57 @@ export default function RouteEditor() {
         </tbody>
       </table>
     </div>
+  );
+}
+
+/// Which channel of the device this route's window starts at.
+///
+/// Shown counting from 1, because that is how the numbers are silk-screened
+/// on the front of an interface; `channel_offset` on the wire is 0-based.
+/// Getting that translation wrong by one is the kind of mistake that sounds
+/// like a patching error rather than a UI bug, so it happens exactly here and
+/// nowhere else.
+function ChannelStart({
+  route,
+  side,
+  deviceWidth,
+  send,
+}: {
+  route: Route;
+  side: "src" | "dst";
+  deviceWidth: number | null;
+  send: (msg: any) => void;
+}) {
+  const ref = side === "src" ? route.src : route.dst;
+  const offset = ref.channel_offset ?? 0;
+  // The window has to fit: a 2-channel route on an 8-channel device can start
+  // at 7 at the latest.
+  const maxStart = deviceWidth === null ? 32 : Math.max(1, deviceWidth - route.spec.channels + 1);
+  return (
+    <td style={{ whiteSpace: "nowrap" }}>
+      <input
+        type="number"
+        min={1}
+        max={maxStart}
+        style={{ width: 46 }}
+        value={offset + 1}
+        onChange={(e) => {
+          const start = Math.max(1, Math.min(maxStart, Number(e.target.value)));
+          const patched = { ...ref, channel_offset: start - 1 };
+          // Offsets live on the PortRef, not the spec, so this goes back as a
+          // whole route. `apply_route` treats a known id as an update: it
+          // restarts the pipelines and gossips to the other engine, same as
+          // any other change.
+          send({
+            type: "add_route",
+            route: side === "src" ? { ...route, src: patched } : { ...route, dst: patched },
+          });
+        }}
+      />
+      <span style={{ color: "#8a94a5", fontSize: 10, marginLeft: 3 }}>
+        /{deviceWidth ?? "?"}
+      </span>
+    </td>
   );
 }
 

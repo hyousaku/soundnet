@@ -23,7 +23,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 
 use crate::audio::format::f32_to_alsa;
-use crate::audio::pcm;
+use crate::audio::{pcm, window};
 use crate::pipeline::MAX_CONSECUTIVE_ERRORS;
 use crate::transport::{receiver, RocContext};
 
@@ -74,6 +74,7 @@ pub fn spawn(
     ctx: Arc<RocContext>,
     bind_host: &str,
     bind_port: u16,
+    channel_offset: u8,
 ) -> Result<RecvHandle> {
     let stop = Arc::new(AtomicBool::new(false));
     let level_bits = Arc::new(AtomicU32::new(0));
@@ -103,7 +104,15 @@ pub fn spawn(
         .name(format!("recv-{alsa_name}"))
         .spawn(move || {
             crate::rt::raise_thread_priority("recv pipeline", crate::rt::PRIO_RECV);
-            if let Err(err) = run(&alsa_name, &spec, ctx, &bind_host, bind_port, &worker) {
+            if let Err(err) = run(
+                &alsa_name,
+                &spec,
+                ctx,
+                &bind_host,
+                bind_port,
+                &worker,
+                channel_offset as usize,
+            ) {
                 tracing::error!("recv pipeline {bind_host}:{bind_port} -> {alsa_name} failed: {err:#}");
                 *error_worker.lock().unwrap() = Some(format!("{err:#}"));
             }
@@ -131,17 +140,29 @@ fn run(
     bind_host: &str,
     bind_port: u16,
     w: &Worker,
+    channel_offset: usize,
 ) -> Result<()> {
-    let (pcm, format) = pcm::open(alsa_name, alsa::Direction::Playback, spec)?;
+    // As in send.rs: open exactly wide enough to reach the window's far edge.
+    let channels = spec.channels as usize;
+    let device_channels = channel_offset + channels;
+    let (pcm, format) = pcm::open(
+        alsa_name,
+        alsa::Direction::Playback,
+        spec,
+        device_channels as u32,
+    )?;
     w.format.store(format.as_u8(), Ordering::Relaxed);
     let io = pcm.io_bytes();
 
     let mut rx = receiver::open(ctx, bind_host, bind_port, spec)?;
 
     let period_frames = spec.frames_per_period as usize;
-    let period_samples = period_frames * spec.channels as usize;
+    let period_samples = period_frames * channels;
+    // What roc hands over (the window), and what the device is written
+    // (full width, with every channel this route doesn't drive left silent).
     let mut floats: Vec<f32> = vec![0.0; period_samples];
-    let frame_bytes = spec.channels as usize * format.bytes_per_sample();
+    let mut device_floats: Vec<f32> = Vec::with_capacity(period_frames * device_channels);
+    let frame_bytes = device_channels * format.bytes_per_sample();
     let mut raw: Vec<u8> = Vec::with_capacity(period_frames * frame_bytes);
 
     let metrics_every = pcm::metrics_every(spec.rate, period_frames);
@@ -190,7 +211,8 @@ fn run(
         let smoothed = if peak > prev { peak } else { prev * 0.7 + peak * 0.3 };
         w.level_bits.store(smoothed.to_bits(), Ordering::Relaxed);
 
-        f32_to_alsa(format, &floats, &mut raw);
+        window::scatter(&floats, channels, device_channels, channel_offset, &mut device_floats);
+        f32_to_alsa(format, &device_floats, &mut raw);
 
         // The one blocking point in this loop. The device is opened
         // blocking, so a short write means the syscall was interrupted

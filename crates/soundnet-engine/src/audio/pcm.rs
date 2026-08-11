@@ -16,6 +16,11 @@ use crate::audio::format::{pick_format, to_alsa_format};
 /// every caller must convert samples using the *returned* format, never the
 /// requested one, or the audio is garbled rather than erroring.
 ///
+/// `device_channels` is how wide to open the device, which is *not* the
+/// route's channel count: reaching a device's channel 5 means opening at
+/// least 5 channels and then taking a window out of the middle. See
+/// `audio::window`.
+///
 /// Rate and channel count get no such latitude. They are set with `_near`
 /// like everything else, so ALSA will quietly hand back the closest thing the
 /// device can do — and unlike format, there is no honest way to absorb that:
@@ -36,6 +41,7 @@ pub fn open(
     alsa_name: &str,
     dir: alsa::Direction,
     spec: &StreamSpec,
+    device_channels: u32,
 ) -> Result<(alsa::PCM, SampleFormat)> {
     let what = match dir {
         alsa::Direction::Capture => "capture",
@@ -64,7 +70,7 @@ pub fn open(
         hwp.set_format(to_alsa_format(format))?;
         // *_near variants let the driver pick the closest supported value —
         // USB DACs commonly reject exact rate/period requests.
-        hwp.set_channels_near(spec.channels as u32)?;
+        hwp.set_channels_near(device_channels)?;
         hwp.set_rate_near(spec.rate, alsa::ValueOr::Nearest)?;
         hwp.set_period_size_near(spec.frames_per_period as i64, alsa::ValueOr::Nearest)?;
         // Two periods (double buffering) is the standard low-latency choice —
@@ -75,13 +81,15 @@ pub fn open(
         hwp.set_periods(2, alsa::ValueOr::Nearest)?;
 
         let got_channels = hwp.get_channels()?;
-        if got_channels != spec.channels as u32 {
+        if got_channels != device_channels {
             bail!(
-                "{alsa_name}: asked for {} channels, device offers {got_channels}. \
-                 Lower the route's channel count to {got_channels} (or fewer) — \
-                 unlike sample format, channel count cannot be substituted \
-                 transparently, because it defines what a frame is on the wire.",
-                spec.channels
+                "{alsa_name}: needs {device_channels} channels open (the route's \
+                 {} channels starting at offset {}), device offers {got_channels}. \
+                 Move the window down, or narrow it — unlike sample format, \
+                 channel count cannot be substituted transparently, because it \
+                 defines what a frame is.",
+                spec.channels,
+                device_channels as i64 - spec.channels as i64
             );
         }
         let got_rate = hwp.get_rate()?;

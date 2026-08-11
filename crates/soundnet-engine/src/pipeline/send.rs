@@ -27,7 +27,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 
 use crate::audio::format::alsa_to_f32;
-use crate::audio::pcm;
+use crate::audio::{pcm, window};
 use crate::pipeline::MAX_CONSECUTIVE_ERRORS;
 use crate::tone;
 use crate::transport::{sender, RocContext};
@@ -78,6 +78,7 @@ pub fn spawn(
     dst_host: &str,
     dst_port: u16,
     outgoing: Option<IpAddr>,
+    channel_offset: u8,
 ) -> Result<SendHandle> {
     let stop = Arc::new(AtomicBool::new(false));
     let buffer_ns = Arc::new(AtomicU64::new(u64::MAX));
@@ -119,6 +120,7 @@ pub fn spawn(
                     &buffer_worker,
                     &format_worker,
                     &xruns_worker,
+                    channel_offset as usize,
                 ),
             };
             if let Err(err) = result {
@@ -142,18 +144,31 @@ fn alsa_loop(
     buffer_ns: &Arc<AtomicU64>,
     format_out: &Arc<AtomicU8>,
     xruns: &Arc<AtomicUsize>,
+    channel_offset: usize,
 ) -> Result<()> {
-    let (pcm, format) = pcm::open(alsa_name, alsa::Direction::Capture, spec)?;
+    // Open as many channels as it takes to reach the far edge of the window,
+    // and no more: to read a device's channel 5 you must open 5 channels, but
+    // opening all 16 of a 16-channel interface to carry one of them is wasted
+    // USB bandwidth on every period.
+    let channels = spec.channels as usize;
+    let device_channels = channel_offset + channels;
+    let (pcm, format) = pcm::open(
+        alsa_name,
+        alsa::Direction::Capture,
+        spec,
+        device_channels as u32,
+    )?;
     format_out.store(format.as_u8(), Ordering::Relaxed);
     let io = pcm.io_bytes();
     pcm.start().ok(); // Ignore EAGAIN — the first read will start it.
 
     let mut sender = sender::open(ctx, dst_host, dst_port, spec, outgoing)?;
 
-    let channels = spec.channels as usize;
-    let frame_bytes = channels * format.bytes_per_sample();
+    let frame_bytes = device_channels * format.bytes_per_sample();
     let period_frames = spec.frames_per_period as usize;
     let mut raw = vec![0u8; period_frames * frame_bytes];
+    // Everything the device gives us, then just the window that goes on the wire.
+    let mut device_floats: Vec<f32> = Vec::with_capacity(period_frames * device_channels);
     let mut floats: Vec<f32> = Vec::with_capacity(period_frames * channels);
 
     let metrics_every = pcm::metrics_every(spec.rate, period_frames);
@@ -181,7 +196,8 @@ fn alsa_loop(
         };
         // A short read (signal during the syscall) would otherwise send the
         // tail of the *previous* period again, so convert only what arrived.
-        alsa_to_f32(format, &raw[..frames * frame_bytes], &mut floats);
+        alsa_to_f32(format, &raw[..frames * frame_bytes], &mut device_floats);
+        window::extract(&device_floats, device_channels, channel_offset, channels, &mut floats);
 
         if let Err(err) = sender.write(&mut floats) {
             consecutive_errors += 1;
