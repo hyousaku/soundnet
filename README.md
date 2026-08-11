@@ -285,6 +285,34 @@ Back off:
 All parameters are editable per-route in the UI while audio is running — the
 worker restarts transparently.
 
+### Measuring it for real
+
+The `latency` column adds up what each engine can account for. It cannot see
+the converters, and it is an accounting rather than a measurement. To get a
+number that includes everything, put a cable in the loop and measure it:
+
+```bash
+sudo apt install python3-alsaaudio python3-numpy
+
+# 1. The hardware floor. Cable from the interface's output to its own input.
+tools/measure-latency.py --out plughw:1,0 --in plughw:1,0
+
+# 2. The same floor plus one trip through SoundNet: route this machine's
+#    input to the far end, and cable the far end's output back to this
+#    machine's input.
+tools/measure-latency.py --out plughw:1,0 --in plughw:2,0
+```
+
+Subtract the first from the second. The tool emits a chirp and
+cross-correlates the return, which finds the signal ~45 dB below full scale —
+so "nothing detected" means the loop is genuinely broken (a mute, an input
+gain at zero, an interface routing switch), and it says so rather than
+printing a number.
+
+Both streams run from one lock-step loop so they share a time base. Two
+separate processes — `aplay` and `arecord`, say — do not, and diffing their
+timestamps measures the scheduler rather than the audio path.
+
 ## Architecture
 
 - **`crates/roc-sys`** — minimal hand-written FFI to `libroc` (0.4.x).
