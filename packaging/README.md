@@ -13,8 +13,7 @@ to type.
 
 ```bash
 sudo apt update && sudo apt install -y git
-git clone -b claude/low-latency-network-audio-54k08x \
-    git@github.com:hyousaku/soundnet.git ~/soundnet
+git clone git@github.com:hyousaku/soundnet.git ~/soundnet
 cd ~/soundnet && packaging/install.sh --yes
 ```
 

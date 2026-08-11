@@ -302,6 +302,19 @@ worker restarts transparently.
   - `tone.rs` — synthetic sine capture ports for preview
 - **`web/`** — Vite + React + React Flow patch bay UI
 
+## How this was built
+
+SoundNet was written by ひょうさく together with
+[Claude](https://claude.com/claude-code), Anthropic's coding assistant, over a
+series of pair-programming sessions. Claude wrote most of the code and the
+documentation; every decision, every piece of hardware testing, and every
+"that isn't what I heard" that sent a theory back to the drawing board came
+from the human side — which is where most of the real findings in this
+project came from, since none of the interesting bugs were visible without a
+sound card and a pair of ears.
+
+Individual commits carry a `Co-Authored-By: Claude` trailer.
+
 ## Licence
 
 MIT — see [LICENSE](LICENSE).
