@@ -63,6 +63,15 @@ pub fn refresh(state: &Arc<EngineState>) -> Result<()> {
                     alsa::Direction::Playback => PortKind::Playback,
                 };
 
+                // Probe the raw device once and describe both entries with
+                // it. Asking `plughw:` what it supports is close to
+                // meaningless: the plug layer converts, so `channels_max`
+                // reports *its* ceiling rather than the hardware's, and a
+                // stereo interface would advertise 32 channels. The hardware
+                // is the truth for both, since plughw only ever converts
+                // down onto the same device.
+                let probed = probe(&format!("hw:{card_idx},{device_idx}"), dir);
+
                 // Preferred: plughw — libasound converts rate/format/channels
                 // on the fly, so almost any route spec will Just Work.
                 add_port(
@@ -71,6 +80,7 @@ pub fn refresh(state: &Arc<EngineState>) -> Result<()> {
                     &format!("{card_name} — {dev_name}"),
                     kind,
                     /* raw */ false,
+                    &probed,
                 );
 
                 // Also expose the raw device for advanced/low-latency use.
@@ -80,6 +90,7 @@ pub fn refresh(state: &Arc<EngineState>) -> Result<()> {
                     &format!("{card_name} — {dev_name}"),
                     kind,
                     /* raw */ true,
+                    &probed,
                 );
             }
         }
@@ -95,14 +106,11 @@ fn add_port(
     hardware_label: &str,
     kind: PortKind,
     raw: bool,
+    probed: &Probe,
 ) {
-    let dir = match kind {
-        PortKind::Capture => alsa::Direction::Capture,
-        PortKind::Playback => alsa::Direction::Playback,
-        PortKind::Tone => return,
-    };
-
-    let probed = probe(alsa_name, dir);
+    if matches!(kind, PortKind::Tone) {
+        return;
+    }
     let id = alsa_name.replace([':', ',', '/', ' '], "_")
         + match kind {
             PortKind::Capture => "_in",
@@ -126,8 +134,8 @@ fn add_port(
             alsa_name: alsa_name.to_string(),
             label,
             max_channels: probed.max_channels,
-            supported_formats: probed.formats,
-            supported_rates: probed.rates,
+            supported_formats: probed.formats.clone(),
+            supported_rates: probed.rates.clone(),
             probe_failed: probed.failed,
         },
     );

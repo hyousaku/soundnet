@@ -6,7 +6,7 @@
 //! stream that opened fine and then sounded subtly wrong in one direction
 //! only. Keeping it in one place makes that class of bug impossible.
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use soundnet_protocol::{SampleFormat, StreamSpec};
 
 use crate::audio::format::{pick_format, to_alsa_format};
@@ -15,6 +15,23 @@ use crate::audio::format::{pick_format, to_alsa_format};
 /// format actually negotiated, which may differ from `spec.alsa_format` —
 /// every caller must convert samples using the *returned* format, never the
 /// requested one, or the audio is garbled rather than erroring.
+///
+/// Rate and channel count get no such latitude. They are set with `_near`
+/// like everything else, so ALSA will quietly hand back the closest thing the
+/// device can do — and unlike format, there is no honest way to absorb that:
+///
+/// * Both engines register roc's packet encoding from the route's `(rate,
+///   channels)`. The two ends negotiate with their own devices independently,
+///   so a silent substitution means the sender and the receiver disagree
+///   about what a frame *is*. "Use whatever we got" cannot fix it; there is
+///   no shared value to use.
+/// * Everything downstream computes frame strides from `spec.channels` and
+///   timing from `spec.rate`. A device that answered differently produces
+///   scrambled interleaving, or samples labelled with a rate they were not
+///   captured at.
+///
+/// So a mismatch is an error here, named precisely, rather than a stream that
+/// opens successfully and sounds wrong.
 pub fn open(
     alsa_name: &str,
     dir: alsa::Direction,
@@ -56,6 +73,39 @@ pub fn open(
         // means a device that insists on more (some cheap USB DACs refuse 2)
         // gets bumped up instead of failing to open.
         hwp.set_periods(2, alsa::ValueOr::Nearest)?;
+
+        let got_channels = hwp.get_channels()?;
+        if got_channels != spec.channels as u32 {
+            bail!(
+                "{alsa_name}: asked for {} channels, device offers {got_channels}. \
+                 Lower the route's channel count to {got_channels} (or fewer) — \
+                 unlike sample format, channel count cannot be substituted \
+                 transparently, because it defines what a frame is on the wire.",
+                spec.channels
+            );
+        }
+        let got_rate = hwp.get_rate()?;
+        if got_rate != spec.rate {
+            bail!(
+                "{alsa_name}: asked for {} Hz, device offers {got_rate} Hz. \
+                 Set the route to {got_rate} Hz — sending samples labelled with \
+                 a rate they were not captured at shifts the pitch and leaves \
+                 roc's clock tuner chasing an offset it cannot close.",
+                spec.rate
+            );
+        }
+        // The period is a different matter: it only sets how much audio moves
+        // per syscall, so a device that rounds it changes the latency and
+        // nothing else. Worth saying, not worth refusing.
+        if let Ok(got_period) = hwp.get_period_size() {
+            if got_period != spec.frames_per_period as i64 {
+                tracing::info!(
+                    "{what} {alsa_name}: period {} not available, using {got_period}",
+                    spec.frames_per_period
+                );
+            }
+        }
+
         pcm.hw_params(&hwp)?;
         format
     };
