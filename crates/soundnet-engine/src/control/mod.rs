@@ -30,6 +30,44 @@ fn default_true() -> bool { true }
 use crate::routing;
 use crate::state::EngineState;
 
+/// Cross-origin policy for the control plane.
+///
+/// The API has no authentication — anything that can reach port 7788 can
+/// enumerate this machine's sound devices and re-patch its audio. That is a
+/// deliberate LAN-trust design (see the security note in README.md), and on a
+/// trusted network it is the same exposure as the mDNS advertisement itself.
+///
+/// `allow_origin(Any)` made it considerably worse than that, though, and for
+/// no benefit in production: the UI is served from this very origin, so it
+/// never needs CORS. What the wildcard did add was a path in from *outside*
+/// the LAN — any web page the operator happens to visit could script this API
+/// and read the responses, turning "trusted network" into "trusted network
+/// plus every site anyone here browses".
+///
+/// So: no CORS headers by default. `SOUNDNET_DEV_ORIGIN` re-enables them for
+/// the Vite dev server (`npm run dev` on :5173), which is the only thing that
+/// ever needed them.
+fn cors_layer() -> Option<CorsLayer> {
+    let origin = std::env::var("SOUNDNET_DEV_ORIGIN").ok()?;
+    let value = match origin.parse::<axum::http::HeaderValue>() {
+        Ok(v) => v,
+        Err(_) => {
+            tracing::warn!("SOUNDNET_DEV_ORIGIN {origin:?} is not a valid origin, ignoring");
+            return None;
+        }
+    };
+    tracing::warn!(
+        "CORS enabled for {origin} — development only; it lets that origin drive \
+         this engine's control plane from any browser tab"
+    );
+    Some(
+        CorsLayer::new()
+            .allow_origin(value)
+            .allow_methods(Any)
+            .allow_headers(Any),
+    )
+}
+
 pub async fn serve(state: Arc<EngineState>, addr: SocketAddr) -> Result<()> {
     let app = Router::new()
         .route("/api/state", get(state_handler))
@@ -40,9 +78,16 @@ pub async fn serve(state: Arc<EngineState>, addr: SocketAddr) -> Result<()> {
         .route("/api/peer-ports", post(peer_ports_handler))
         .route("/ws", get(ws::ws_handler))
         .fallback(web::static_handler)
-        .layer(CorsLayer::new().allow_origin(Any).allow_methods(Any).allow_headers(Any))
         .layer(TraceLayer::new_for_http())
         .with_state(state);
+
+    // No layer at all in the default case, rather than a permissive one that
+    // happens to allow nothing: the production posture is that the UI is
+    // same-origin and needs no CORS headers whatsoever.
+    let app = match cors_layer() {
+        Some(layer) => app.layer(layer),
+        None => app,
+    };
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, app.into_make_service()).await?;

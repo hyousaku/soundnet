@@ -180,19 +180,58 @@ you clear the failure counter with
 ## Development
 
 ```bash
-# Run the engine on your dev machine
-cargo run -p soundnet-engine
+# Run the engine on your dev machine. SOUNDNET_DEV_ORIGIN lets the Vite dev
+# server talk to it cross-origin; without it the engine sends no CORS headers
+# at all (see Security above), which is what you want in production and not
+# what you want at :5173.
+SOUNDNET_DEV_ORIGIN=http://localhost:5173 cargo run -p soundnet-engine
 
 # Separately, run the Vite dev server (proxies /api and /ws to the engine)
 cd web && npm run dev
 # then open http://localhost:5173
 ```
 
+Other environment variables:
+
+- `RUST_LOG` — standard `tracing` filter, e.g. `info,soundnet_engine=debug`.
+- `SOUNDNET_ROC_LOG` — libroc's own log level (`error` by default; `debug`
+  shows jitter-buffer and latency-tuner activity, at a cost to the audio
+  threads it is reporting on).
+
 Tests:
 
 ```bash
 cargo test --workspace
 ```
+
+## Security: this trusts your LAN
+
+**Anything that can reach port 7788 has full control of the engine.** There is
+no authentication, and none is planned — the design assumes a network you
+already trust with an open microphone.
+
+Concretely, a peer on the same network can list the machine's sound devices,
+create and delete routes, re-patch audio, and stream a capture port anywhere
+the engine can reach. On a home or studio LAN that is the same trust you
+already extend by advertising over mDNS. On a conference Wi-Fi, a shared
+office network, or anything with guests on it, it is not.
+
+So:
+
+- **Do not port-forward 7788**, and do not put the engine on a public IP.
+- On a network you don't control, bind it to one interface —
+  `--bind 192.168.1.20:7788` — or to loopback and reach it over an SSH tunnel:
+  `ssh -L 7788:localhost:7788 host`.
+- If you want it reachable more widely, put a reverse proxy with real
+  authentication in front. The engine will not grow a login of its own.
+
+The UI is served from the engine's own origin and needs no CORS, so the
+control plane sends no cross-origin headers at all. This matters more than it
+sounds: with a permissive policy, any web page anyone on that machine happened
+to visit could script this API from their browser, which would extend the
+trust boundary from "our LAN" to "every site we browse". `SOUNDNET_DEV_ORIGIN`
+re-enables CORS for one named origin, for the Vite dev server, and warns
+loudly when it does.
 
 ## Network: wired only, in practice
 
