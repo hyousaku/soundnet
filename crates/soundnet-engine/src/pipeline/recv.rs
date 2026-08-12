@@ -60,8 +60,17 @@ pub struct RecvHandle {
 }
 
 impl RecvHandle {
-    pub fn stop_and_join(self) {
+    /// Ask the pipeline to stop, without waiting for it. See the same method
+    /// on `SendHandle`.
+    pub fn request_stop(&self) {
         self.stop.store(true, Ordering::Relaxed);
+    }
+
+    /// Stop the pipeline and wait for its thread to be gone. Blocks for
+    /// however long the thread takes to return from `snd_pcm_writei`, so
+    /// `routing` only calls it from a blocking-pool thread.
+    pub fn stop_and_join(self) {
+        self.request_stop();
         let _ = self.thread.join();
     }
 }

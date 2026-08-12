@@ -97,6 +97,18 @@ impl RunningRoute {
             (None, None) => "pipeline stopped without reporting an error".to_string(),
         }
     }
+
+    /// Raise the stop flag on both halves without waiting for either. Cheap
+    /// and non-blocking — the threads only act on it when they next come
+    /// around their loops.
+    fn request_stop(&self) {
+        if let Some(h) = self.send.as_ref() {
+            h.request_stop();
+        }
+        if let Some(h) = self.recv.as_ref() {
+            h.request_stop();
+        }
+    }
 }
 
 /// Backoff bookkeeping for a route this engine has a local role in but
@@ -224,7 +236,7 @@ pub async fn apply_route(state: &Arc<EngineState>, route: Route, gossip: bool) -
     // waiting out whatever window the last failure scheduled.
     if is_new_or_changed {
         if let Some((_, existing)) = state.running.remove(&route.id) {
-            shutdown_running(existing);
+            shutdown_running(existing).await;
         }
         state.failures.remove(&route.id);
         if let Err(err) = try_start(state, &route).await {
@@ -299,7 +311,7 @@ pub async fn try_start(state: &Arc<EngineState>, route: &Route) -> Result<()> {
             return Ok(());
         }
         if let Some((_, dead_route)) = state.running.remove(&route.id) {
-            shutdown_running(dead_route);
+            shutdown_running(dead_route).await;
         }
         let reason = dead_reason.unwrap_or_else(|| "pipeline exited".to_string());
         tracing::warn!(
@@ -477,7 +489,7 @@ pub fn spawn_route_supervisor(state: Arc<EngineState>) {
 pub async fn remove_route(state: &Arc<EngineState>, id: &str, gossip: bool) {
     let route = state.routes.remove(id).map(|(_, r)| r);
     if let Some((_, running)) = state.running.remove(id) {
-        shutdown_running(running);
+        shutdown_running(running).await;
     }
     state.failures.remove(id);
     state.stats.remove(id);
@@ -728,15 +740,79 @@ pub fn spawn_stats_pump(state: Arc<EngineState>) {
 }
 
 pub async fn shutdown_all(state: &Arc<EngineState>) {
+    // Two passes, deliberately: raise every stop flag first, then wait.
+    //
+    // Joining route by route serializes the teardown. A pipeline only
+    // notices the request when it next comes around its loop, so asking one
+    // route at a time costs one period-wait *per route*, in sequence —
+    // and `iface::set_selected` tears everything down on an interface
+    // change, so that would get slower in proportion to how much is patched.
+    // Flagging everything up front lets the threads wind down concurrently,
+    // which makes the total wait roughly the slowest single device instead
+    // of the sum of all of them.
+    //
+    // This is only safe because each pipeline owns its own device and its
+    // own roc endpoint: there is no ordering to preserve between them, which
+    // is exactly the property the merged send/recv pipelines were built for.
     let ids: Vec<_> = state.running.iter().map(|e| e.key().clone()).collect();
+    let mut draining = Vec::with_capacity(ids.len());
     for id in ids {
         if let Some((_, running)) = state.running.remove(&id) {
-            shutdown_running(running);
+            running.request_stop();
+            draining.push(running);
         }
     }
+    if draining.is_empty() {
+        return;
+    }
+    // One blocking-pool thread joins them all: they are already winding down
+    // in parallel, so a task each would buy nothing.
+    let _ = tokio::task::spawn_blocking(move || {
+        for running in draining {
+            join_running(running);
+        }
+    })
+    .await;
 }
 
-fn shutdown_running(running: RunningRoute) {
+/// Stop both halves of a route and wait for their threads to be gone.
+///
+/// The wait is real. `stop_and_join` ends in `std::thread::join`, and the
+/// thread it waits on is sitting inside a blocking ALSA call
+/// (`snd_pcm_readi` / `snd_pcm_writei`), so this returns no sooner than the
+/// device's next period — and if the device has stopped answering (a USB
+/// interface unplugged mid-stream, a driver wedged in D state), not at all.
+///
+/// That wait must not happen on the async executor. Every caller of this is
+/// an axum handler or a tokio task, and blocking one of those parks a
+/// runtime worker for the duration: at best a few milliseconds stolen from
+/// the request path, at worst one of the runtime's handful of workers is
+/// gone permanently and deleting a single route from the UI takes the
+/// engine's whole control plane with it. `gossip_add`/`gossip_remove`
+/// already push their blocking `ureq` calls onto the blocking pool for
+/// exactly this reason; this is the same move.
+///
+/// What this does **not** fix: the audio thread's own stop latency is still
+/// unbounded. A wedged device now wedges a blocking-pool thread instead of a
+/// runtime worker — a much softer failure, since that pool exists to absorb
+/// open-ended waits and grows on demand while the async side keeps serving —
+/// but bounding how long a pipeline can take to notice `stop` is a change to
+/// the loops themselves, not to their callers.
+///
+/// Awaited rather than detached, on purpose: `apply_route` re-opens the same
+/// ALSA device immediately afterwards, and `hw:` devices are handed out
+/// exclusively. Letting the teardown race the new `snd_pcm_open` would turn
+/// every format or period change into an intermittent "device or resource
+/// busy" that only shows up under timing luck.
+async fn shutdown_running(running: RunningRoute) {
+    running.request_stop();
+    let _ = tokio::task::spawn_blocking(move || join_running(running)).await;
+}
+
+/// The blocking half of `shutdown_running`, kept separate so `shutdown_all`
+/// can drain many routes on a single blocking-pool thread. Never call this
+/// from an async context.
+fn join_running(running: RunningRoute) {
     // Each pipeline owns its device and its roc endpoint, so stopping the
     // thread is the whole teardown — no ordering to get right between a
     // transport worker and the audio worker feeding it any more.

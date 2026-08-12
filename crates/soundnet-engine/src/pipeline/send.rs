@@ -61,8 +61,23 @@ pub struct SendHandle {
 }
 
 impl SendHandle {
-    pub fn stop_and_join(self) {
+    /// Ask the pipeline to stop, without waiting for it.
+    ///
+    /// Split out from the join so a caller tearing down several routes at
+    /// once can raise every flag first and then wait once — see
+    /// `routing::shutdown_all`. On its own this returns immediately; the
+    /// thread doesn't notice until it next comes around the top of its loop.
+    pub fn request_stop(&self) {
         self.stop.store(true, Ordering::Relaxed);
+    }
+
+    /// Stop the pipeline and wait for its thread to be gone.
+    ///
+    /// This blocks for however long the thread takes to return from whatever
+    /// ALSA call it is currently inside, which is why `routing` only ever
+    /// calls it from a blocking-pool thread.
+    pub fn stop_and_join(self) {
+        self.request_stop();
         let _ = self.thread.join();
     }
 }
