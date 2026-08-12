@@ -177,33 +177,6 @@ If a service has been failing repeatedly, systemd may refuse to start it until
 you clear the failure counter with
 `sudo systemctl reset-failed soundnet-engine@$USER.service`.
 
-## Development
-
-```bash
-# Run the engine on your dev machine. SOUNDNET_DEV_ORIGIN lets the Vite dev
-# server talk to it cross-origin; without it the engine sends no CORS headers
-# at all (see Security above), which is what you want in production and not
-# what you want at :5173.
-SOUNDNET_DEV_ORIGIN=http://localhost:5173 cargo run -p soundnet-engine
-
-# Separately, run the Vite dev server (proxies /api and /ws to the engine)
-cd web && npm run dev
-# then open http://localhost:5173
-```
-
-Other environment variables:
-
-- `RUST_LOG` — standard `tracing` filter, e.g. `info,soundnet_engine=debug`.
-- `SOUNDNET_ROC_LOG` — libroc's own log level (`error` by default; `debug`
-  shows jitter-buffer and latency-tuner activity, at a cost to the audio
-  threads it is reporting on).
-
-Tests:
-
-```bash
-cargo test --workspace
-```
-
 ## Security: this trusts your LAN
 
 **Anything that can reach port 7788 has full control of the engine.** There is
@@ -312,6 +285,33 @@ printing a number.
 Both streams run from one lock-step loop so they share a time base. Two
 separate processes — `aplay` and `arecord`, say — do not, and diffing their
 timestamps measures the scheduler rather than the audio path.
+
+## Development
+
+```bash
+# Run the engine on your dev machine. SOUNDNET_DEV_ORIGIN lets the Vite dev
+# server talk to it cross-origin; without it the engine sends no CORS headers
+# at all (see Security above), which is what you want in production and not
+# what you want at :5173.
+SOUNDNET_DEV_ORIGIN=http://localhost:5173 cargo run -p soundnet-engine
+
+# Separately, run the Vite dev server (proxies /api and /ws to the engine)
+cd web && npm run dev
+# then open http://localhost:5173
+```
+
+Other environment variables:
+
+- `RUST_LOG` — standard `tracing` filter, e.g. `info,soundnet_engine=debug`.
+- `SOUNDNET_ROC_LOG` — libroc's own log level (`error` by default; `debug`
+  shows jitter-buffer and latency-tuner activity, at a cost to the audio
+  threads it is reporting on).
+
+Tests:
+
+```bash
+cargo test --workspace
+```
 
 ## Architecture
 
