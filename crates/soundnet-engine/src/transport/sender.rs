@@ -116,7 +116,15 @@ pub fn open(
             channels: roc::roc_channel_layout::ROC_CHANNEL_LAYOUT_MULTITRACK,
             tracks: spec.channels as u32,
         },
-        packet_encoding,
+        // The cast is roc's own asymmetry, not ours:
+        // `roc_context_register_encoding` takes the identifier as a signed
+        // `int`, while the config field that consumes it is declared as the
+        // `roc_packet_encoding` enum, whose underlying type is unsigned. Both
+        // are 32 bits, and registered ids are small and positive, so this
+        // only satisfies the type system. (The field is generated as a plain
+        // integer rather than a Rust enum precisely because the value we put
+        // in it is never one of that enum's variants — see build.rs.)
+        packet_encoding: packet_encoding as roc::roc_packet_encoding::Type,
         // Match packetisation to the ALSA period instead of leaving it at
         // roc's own (larger) default quantum — otherwise the network hop
         // adds a chunking delay independent of, and typically bigger than,

@@ -91,11 +91,14 @@ this section describes the same thing done by hand.
 - Rust stable (`rustup default stable`)
 - Node.js 20+ and npm (for the web UI)
 - `libasound2-dev`, `libroc-dev`, `pkg-config`
+- `libclang-dev` — `crates/roc-sys` generates its FFI from roc's headers with
+  bindgen, which parses them with libclang. Build-time only; it is not a
+  dependency of the resulting binary or of the `.deb`.
 
 Debian/Ubuntu/Raspberry Pi OS:
 
 ```bash
-sudo apt install libasound2-dev libroc-dev pkg-config build-essential
+sudo apt install libasound2-dev libroc-dev pkg-config build-essential libclang-dev
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 # Node via nvm or your distro's package
 ```
@@ -337,7 +340,8 @@ What CI does **not** cover, and cannot:
 
 ## Architecture
 
-- **`crates/roc-sys`** — minimal hand-written FFI to `libroc` (0.4.x).
+- **`crates/roc-sys`** — FFI to `libroc` (0.4.x), generated from the
+  installed headers by bindgen at build time.
 - **`crates/soundnet-protocol`** — JSON types shared with the web UI.
 - **`crates/soundnet-engine`** — the daemon:
   - `audio/` — ALSA device enumeration, hardware-parameter negotiation, format conversion

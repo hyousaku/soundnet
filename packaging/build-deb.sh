@@ -17,6 +17,12 @@
 #
 #   sudo apt install ./soundnet-engine_<version>-<rev>_<arch>.deb
 #
+# Build-time prerequisites are whatever packaging/install.sh installs; note in
+# particular libclang-dev, which crates/roc-sys needs to generate its FFI from
+# roc's headers. It does not appear in the package's Depends because nothing in
+# the shipped binary links against it — Depends is derived from the sonames the
+# binary actually pulls in, further down.
+#
 # Environment overrides: DEB_REVISION (default: derived from git so every
 # build gets a distinct, increasing version), DEB_MAINTAINER.
 set -euo pipefail

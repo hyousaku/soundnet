@@ -71,8 +71,11 @@ apt_install() {
 
 # --- 1. base toolchain ----------------------------------------------------
 say "installing build dependencies"
+# libclang is not optional despite looking like a compiler extra: crates/roc-sys
+# generates its FFI from roc's headers with bindgen at build time, and bindgen
+# parses those headers with libclang.
 apt_install build-essential pkg-config curl git ca-certificates \
-            libasound2-dev
+            libasound2-dev libclang-dev
 
 # --- 2. libroc 0.4 --------------------------------------------------------
 # The engine's FFI targets the 0.4 ABI. 0.3 (Ubuntu 24.04, Debian bookworm)

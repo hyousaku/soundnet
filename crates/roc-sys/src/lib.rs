@@ -1,358 +1,63 @@
-//! Hand-written FFI bindings for libroc **0.4.x** (Debian trixie / Raspberry
-//! Pi OS trixie).
+//! FFI bindings for libroc **0.4.x**, generated at build time by bindgen from
+//! the headers actually installed on the machine doing the building.
 //!
-//! Only the surface we actually need in `soundnet-engine` is exposed: context
-//! lifecycle, sender/receiver open/close, endpoint URI setup, bind/connect,
-//! frame read/write, and query. Keep in sync with `/usr/include/roc/*.h`.
+//! They used to be written out by hand. That worked, and the layout happened
+//! to be right — but "happened to be" was the whole problem: a struct
+//! transcribed by eye compiles just as cleanly when it is wrong, and a single
+//! field added upstream would have shifted every field after it while the
+//! build stayed green and the reads went to the wrong offsets at runtime.
+//! Generating from the headers moves that from a thing to be careful about to
+//! a thing that cannot happen. bindgen also emits `const _` layout assertions
+//! for every struct, so a disagreement about size, alignment or field offset
+//! is a compile error rather than a bug report about audio.
+//!
+//! See `build.rs` for which libroc gets bound, how the same decision drives
+//! the linker, and why three enums are deliberately generated as plain
+//! constants rather than Rust enums.
+//!
+//! ### What this does not check
+//!
+//! bindgen guarantees agreement with the headers *at build time*. It says
+//! nothing about the shared library that gets loaded at run time, which on
+//! these machines is a real distinction and not a theoretical one — see
+//! [`check_runtime_version`].
 //!
 //! ### Notes on the 0.3 → 0.4 jump
+//!
+//! Kept because they are the record of what actually went wrong, and because
+//! anyone who meets a 0.3 in the wild will need them again:
 //!
 //! * `roc_clock_source` enum values shifted (0.4 added `DEFAULT = 0`).
 //! * `roc_clock_sync_backend` / `roc_clock_sync_profile` were renamed to
 //!   `roc_latency_tuner_backend` / `roc_latency_tuner_profile`.
-//! * `roc_sender_config` gained `latency_tuner_backend`, `latency_tuner_profile`,
-//!   `target_latency`, `latency_tolerance` at the end.
+//! * `roc_sender_config` gained `latency_tuner_backend`,
+//!   `latency_tuner_profile`, `target_latency`, `latency_tolerance` at the end.
 //! * `roc_receiver_config` fields renamed (same layout).
 //! * `metrics.h` was rewritten: no more `roc_session_metrics {niq_latency,
-//!   e2e_latency}` / receiver-metrics-with-sessions-pointer. Now:
-//!   `roc_connection_metrics {e2e_latency}` (only) is an out-array,
-//!   `roc_receiver_metrics {connection_count}` and
-//!   `roc_sender_metrics {connection_count}` are the slot-level structs.
-//! * `roc_receiver_query` / `roc_sender_query` grew a fourth+fifth argument
-//!   (slot metrics, connection metrics array, count).
+//!   e2e_latency}` / receiver-metrics-with-sessions-pointer. Now
+//!   `roc_connection_metrics {e2e_latency}` (only) is an out-array, and
+//!   `roc_receiver_metrics {connection_count}` /
+//!   `roc_sender_metrics {connection_count}` are the slot-level structs. The
+//!   dropped `niq_latency` is why `StreamStats::jitter_ms` reports nothing.
+//! * `roc_receiver_query` / `roc_sender_query` grew a fourth and fifth
+//!   argument (slot metrics, connection metrics array, count).
+//!
+//! ### Lifetimes the C API does not express
+//!
+//! Every `*const c_char` in `roc_log_message` is valid only for the duration
+//! of the log handler call — libroc reuses the buffers afterwards, so anything
+//! to be kept must be copied out before returning.
 
 #![allow(non_camel_case_types)]
+#![allow(non_snake_case)]
 #![allow(non_upper_case_globals)]
 #![allow(clippy::missing_safety_doc)]
+#![allow(clippy::useless_transmute)]
+#![allow(dead_code)]
 
-use core::ffi::{c_char, c_int, c_uint, c_void};
+use core::ffi::c_uint;
 
-pub type roc_slot = u64;
-pub const ROC_SLOT_DEFAULT: roc_slot = 0;
-
-#[repr(C)]
-pub struct roc_context {
-    _private: [u8; 0],
-}
-#[repr(C)]
-pub struct roc_sender {
-    _private: [u8; 0],
-}
-#[repr(C)]
-pub struct roc_receiver {
-    _private: [u8; 0],
-}
-#[repr(C)]
-pub struct roc_endpoint {
-    _private: [u8; 0],
-}
-
-#[repr(C)]
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum roc_interface {
-    ROC_INTERFACE_CONSOLIDATED = 1,
-    ROC_INTERFACE_AUDIO_SOURCE = 11,
-    ROC_INTERFACE_AUDIO_REPAIR = 12,
-    ROC_INTERFACE_AUDIO_CONTROL = 13,
-}
-
-#[repr(C)]
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum roc_protocol {
-    ROC_PROTO_RTSP = 10,
-    ROC_PROTO_RTP = 20,
-    ROC_PROTO_RTP_RS8M_SOURCE = 30,
-    ROC_PROTO_RS8M_REPAIR = 31,
-    ROC_PROTO_RTP_LDPC_SOURCE = 32,
-    ROC_PROTO_LDPC_REPAIR = 33,
-    ROC_PROTO_RTCP = 70,
-}
-
-#[repr(C)]
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum roc_packet_encoding {
-    ROC_PACKET_ENCODING_AVP_L16_MONO = 11,
-    ROC_PACKET_ENCODING_AVP_L16_STEREO = 10,
-}
-
-#[repr(C)]
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum roc_fec_encoding {
-    ROC_FEC_ENCODING_DISABLE = -1,
-    ROC_FEC_ENCODING_DEFAULT = 0,
-    ROC_FEC_ENCODING_RS8M = 1,
-    ROC_FEC_ENCODING_LDPC_STAIRCASE = 2,
-}
-
-#[repr(C)]
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum roc_format {
-    ROC_FORMAT_PCM_FLOAT32 = 1,
-}
-
-#[repr(C)]
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum roc_channel_layout {
-    ROC_CHANNEL_LAYOUT_MULTITRACK = 1,
-    ROC_CHANNEL_LAYOUT_MONO = 2,
-    ROC_CHANNEL_LAYOUT_STEREO = 3,
-}
-
-#[repr(C)]
-#[derive(Copy, Clone, Debug)]
-pub struct roc_media_encoding {
-    pub rate: c_uint,
-    pub format: roc_format,
-    pub channels: roc_channel_layout,
-    pub tracks: c_uint,
-}
-
-#[repr(C)]
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum roc_clock_source {
-    ROC_CLOCK_SOURCE_DEFAULT = 0,
-    ROC_CLOCK_SOURCE_EXTERNAL = 1,
-    ROC_CLOCK_SOURCE_INTERNAL = 2,
-}
-
-#[repr(C)]
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum roc_latency_tuner_backend {
-    ROC_LATENCY_TUNER_BACKEND_DEFAULT = 0,
-    ROC_LATENCY_TUNER_BACKEND_NIQ = 2,
-}
-
-#[repr(C)]
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum roc_latency_tuner_profile {
-    ROC_LATENCY_TUNER_PROFILE_DEFAULT = 0,
-    ROC_LATENCY_TUNER_PROFILE_INTACT = 1,
-    ROC_LATENCY_TUNER_PROFILE_RESPONSIVE = 2,
-    ROC_LATENCY_TUNER_PROFILE_GRADUAL = 3,
-}
-
-#[repr(C)]
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum roc_resampler_backend {
-    ROC_RESAMPLER_BACKEND_DEFAULT = 0,
-    ROC_RESAMPLER_BACKEND_BUILTIN = 1,
-    ROC_RESAMPLER_BACKEND_SPEEX = 2,
-    ROC_RESAMPLER_BACKEND_SPEEXDEC = 3,
-}
-
-#[repr(C)]
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum roc_resampler_profile {
-    ROC_RESAMPLER_PROFILE_DEFAULT = 0,
-    ROC_RESAMPLER_PROFILE_HIGH = 1,
-    ROC_RESAMPLER_PROFILE_MEDIUM = 2,
-    ROC_RESAMPLER_PROFILE_LOW = 3,
-}
-
-#[repr(C)]
-#[derive(Copy, Clone, Debug)]
-pub struct roc_context_config {
-    pub max_packet_size: c_uint,
-    pub max_frame_size: c_uint,
-}
-
-#[repr(C)]
-#[derive(Copy, Clone, Debug)]
-pub struct roc_sender_config {
-    pub frame_encoding: roc_media_encoding,
-    pub packet_encoding: c_int, // roc_packet_encoding OR custom registered id (0 = auto)
-    pub packet_length: u64,
-    pub packet_interleaving: c_uint,
-    pub fec_encoding: roc_fec_encoding,
-    pub fec_block_source_packets: c_uint,
-    pub fec_block_repair_packets: c_uint,
-    pub clock_source: roc_clock_source,
-    // Fields below were added in libroc 0.4.
-    pub latency_tuner_backend: roc_latency_tuner_backend,
-    pub latency_tuner_profile: roc_latency_tuner_profile,
-    pub resampler_backend: roc_resampler_backend,
-    pub resampler_profile: roc_resampler_profile,
-    pub target_latency: u64,
-    pub latency_tolerance: u64,
-}
-
-#[repr(C)]
-#[derive(Copy, Clone, Debug)]
-pub struct roc_receiver_config {
-    pub frame_encoding: roc_media_encoding,
-    pub clock_source: roc_clock_source,
-    pub latency_tuner_backend: roc_latency_tuner_backend,
-    pub latency_tuner_profile: roc_latency_tuner_profile,
-    pub resampler_backend: roc_resampler_backend,
-    pub resampler_profile: roc_resampler_profile,
-    pub target_latency: u64,
-    pub latency_tolerance: u64,
-    pub no_playback_timeout: i64,
-    pub choppy_playback_timeout: i64,
-}
-
-/// log.h — a maximum, not a filter set: everything at or below the
-/// configured level is emitted.
-#[repr(C)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum roc_log_level {
-    ROC_LOG_NONE = 0,
-    ROC_LOG_ERROR = 1,
-    ROC_LOG_INFO = 2,
-    ROC_LOG_NOTE = 3,
-    ROC_LOG_DEBUG = 4,
-    ROC_LOG_TRACE = 5,
-}
-
-/// Every `*const c_char` here is valid only for the duration of the handler
-/// call — libroc reuses the buffers afterwards, so anything to be kept must
-/// be copied out before returning.
-#[repr(C)]
-pub struct roc_log_message {
-    pub level: roc_log_level,
-    pub module: *const c_char,
-    pub file: *const c_char,
-    pub line: c_int,
-    pub time: u64,
-    pub pid: u64,
-    pub tid: u64,
-    pub text: *const c_char,
-}
-
-/// version.h. The header is explicit that this "may be different from the
-/// compile-time version when using shared library" — which is the whole
-/// reason `check_runtime_version` exists.
-#[repr(C)]
-#[derive(Copy, Clone, Debug, Default)]
-pub struct roc_version {
-    pub major: c_uint,
-    pub minor: c_uint,
-    pub patch: c_uint,
-    pub code: c_uint,
-}
-
-pub type roc_log_handler =
-    Option<unsafe extern "C" fn(message: *const roc_log_message, argument: *mut c_void)>;
-
-#[repr(C)]
-#[derive(Copy, Clone, Debug)]
-pub struct roc_interface_config {
-    pub outgoing_address: [c_char; 48],
-    pub multicast_group: [c_char; 48],
-    pub reuse_address: c_int,
-}
-
-/// Per-connection metrics — one entry per active sender→receiver pairing.
-/// Only `e2e_latency` is exposed by libroc 0.4 (`niq_latency` was dropped).
-#[repr(C)]
-#[derive(Copy, Clone, Debug, Default)]
-pub struct roc_connection_metrics {
-    pub e2e_latency: u64,
-}
-
-/// Receiver slot-level metrics.
-#[repr(C)]
-#[derive(Copy, Clone, Debug, Default)]
-pub struct roc_receiver_metrics {
-    pub connection_count: c_uint,
-}
-
-/// Sender slot-level metrics.
-#[repr(C)]
-#[derive(Copy, Clone, Debug, Default)]
-pub struct roc_sender_metrics {
-    pub connection_count: c_uint,
-}
-
-#[repr(C)]
-pub struct roc_frame {
-    pub samples: *mut c_void,
-    pub samples_size: usize,
-}
-
-extern "C" {
-    // ---- context ----
-    pub fn roc_context_open(
-        config: *const roc_context_config,
-        result: *mut *mut roc_context,
-    ) -> c_int;
-    pub fn roc_context_register_encoding(
-        context: *mut roc_context,
-        encoding_id: c_int,
-        encoding: *const roc_media_encoding,
-    ) -> c_int;
-    pub fn roc_context_close(context: *mut roc_context) -> c_int;
-
-    // ---- endpoint ----
-    pub fn roc_endpoint_allocate(result: *mut *mut roc_endpoint) -> c_int;
-    pub fn roc_endpoint_set_uri(endpoint: *mut roc_endpoint, uri: *const c_char) -> c_int;
-    pub fn roc_endpoint_set_protocol(endpoint: *mut roc_endpoint, proto: roc_protocol) -> c_int;
-    pub fn roc_endpoint_set_host(endpoint: *mut roc_endpoint, host: *const c_char) -> c_int;
-    pub fn roc_endpoint_set_port(endpoint: *mut roc_endpoint, port: c_int) -> c_int;
-    pub fn roc_endpoint_get_port(endpoint: *const roc_endpoint, port: *mut c_int) -> c_int;
-    pub fn roc_endpoint_deallocate(endpoint: *mut roc_endpoint) -> c_int;
-
-    // ---- sender ----
-    pub fn roc_sender_open(
-        context: *mut roc_context,
-        config: *const roc_sender_config,
-        result: *mut *mut roc_sender,
-    ) -> c_int;
-    pub fn roc_sender_configure(
-        sender: *mut roc_sender,
-        slot: roc_slot,
-        iface: roc_interface,
-        config: *const roc_interface_config,
-    ) -> c_int;
-    pub fn roc_sender_connect(
-        sender: *mut roc_sender,
-        slot: roc_slot,
-        iface: roc_interface,
-        endpoint: *const roc_endpoint,
-    ) -> c_int;
-    pub fn roc_sender_unlink(sender: *mut roc_sender, slot: roc_slot) -> c_int;
-    pub fn roc_version_load(version: *mut roc_version);
-    pub fn roc_log_set_level(level: roc_log_level);
-    pub fn roc_log_set_handler(handler: roc_log_handler, argument: *mut c_void);
-    pub fn roc_sender_query(
-        sender: *mut roc_sender,
-        slot: roc_slot,
-        slot_metrics: *mut roc_sender_metrics,
-        conn_metrics: *mut roc_connection_metrics,
-        conn_metrics_count: *mut usize,
-    ) -> c_int;
-    pub fn roc_sender_write(sender: *mut roc_sender, frame: *const roc_frame) -> c_int;
-    pub fn roc_sender_close(sender: *mut roc_sender) -> c_int;
-
-    // ---- receiver ----
-    pub fn roc_receiver_open(
-        context: *mut roc_context,
-        config: *const roc_receiver_config,
-        result: *mut *mut roc_receiver,
-    ) -> c_int;
-    pub fn roc_receiver_configure(
-        receiver: *mut roc_receiver,
-        slot: roc_slot,
-        iface: roc_interface,
-        config: *const roc_interface_config,
-    ) -> c_int;
-    pub fn roc_receiver_bind(
-        receiver: *mut roc_receiver,
-        slot: roc_slot,
-        iface: roc_interface,
-        endpoint: *mut roc_endpoint,
-    ) -> c_int;
-    pub fn roc_receiver_unlink(receiver: *mut roc_receiver, slot: roc_slot) -> c_int;
-    pub fn roc_receiver_query(
-        receiver: *mut roc_receiver,
-        slot: roc_slot,
-        slot_metrics: *mut roc_receiver_metrics,
-        conn_metrics: *mut roc_connection_metrics,
-        conn_metrics_count: *mut usize,
-    ) -> c_int;
-    pub fn roc_receiver_read(receiver: *mut roc_receiver, frame: *mut roc_frame) -> c_int;
-    pub fn roc_receiver_close(receiver: *mut roc_receiver) -> c_int;
-}
+include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
 
 /// The libroc ABI these bindings describe. 0.3 is not merely older — several
 /// `roc_sender_config` / `roc_receiver_config` fields were renamed and
@@ -366,11 +71,14 @@ pub const EXPECTED_MAJOR: c_uint = 0;
 pub const EXPECTED_MINOR: c_uint = 4;
 
 /// Ask the *loaded* library what it is, and complain if it is not what these
-/// bindings were written against.
+/// bindings were built against.
 ///
-/// Checking headers at install time is not the same check: the header in
-/// /usr/local can be 0.4 while the dynamic linker resolves `libroc.so.0.3`
-/// from /usr/lib, and nothing before this noticed the difference.
+/// Generating the bindings from headers does not make this redundant, and the
+/// distinction is the one this project actually got caught by: the header in
+/// /usr/local can say 0.4 — so bindgen faithfully describes 0.4 — while the
+/// dynamic linker resolves `libroc.so.0.3` from /usr/lib. Everything about
+/// that build is internally consistent. It is consistent with the wrong
+/// library.
 pub fn check_runtime_version() -> Result<(u32, u32, u32), String> {
     let mut v = roc_version::default();
     unsafe { roc_version_load(&mut v) };

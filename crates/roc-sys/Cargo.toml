@@ -3,7 +3,7 @@ name = "roc-sys"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Minimal hand-written FFI bindings for the roc-toolkit C library (libroc)."
+description = "FFI bindings for the roc-toolkit C library (libroc), generated from its headers."
 links = "roc"
 
 [lib]
@@ -11,4 +11,5 @@ name = "roc_sys"
 path = "src/lib.rs"
 
 [build-dependencies]
+bindgen = "0.72.1"
 pkg-config = "0.3"

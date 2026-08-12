@@ -17,9 +17,10 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  # The ABI crates/roc-sys is hand-written against — see its
-  # check_runtime_version(). Pinned rather than tracking a branch, because
-  # this string is also part of the cache key below.
+  # The ABI crates/roc-sys binds against — its bindings are generated from
+  # these headers, and check_runtime_version() asserts the loaded library
+  # agrees. Pinned rather than tracking a branch, because this string is also
+  # part of the cache key below.
   ROC_VERSION: v0.4.0
   CARGO_TERM_COLOR: always
 
@@ -100,7 +101,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            build-essential pkg-config libasound2-dev \
+            build-essential pkg-config libasound2-dev libclang-dev \
             scons ragel gengetopt libuv1-dev libunwind-dev libspeexdsp-dev \
             libsox-dev libsndfile1-dev libssl-dev libpulse-dev \
             libtool intltool autoconf automake make cmake
