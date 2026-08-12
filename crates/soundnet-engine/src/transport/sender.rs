@@ -191,8 +191,7 @@ pub fn open(
 
     let connect = |uri: String, iface: roc::roc_interface, what: &str| -> Result<()> {
         let ep = endpoint_from_uri(&uri)?;
-        let rc =
-            unsafe { roc::roc_sender_connect(sender.raw, roc::ROC_SLOT_DEFAULT, iface, ep) };
+        let rc = unsafe { roc::roc_sender_connect(sender.raw, roc::ROC_SLOT_DEFAULT, iface, ep) };
         endpoint_free(ep);
         if rc != 0 {
             bail!("sender connect {what} failed ({rc})");
@@ -206,7 +205,11 @@ pub fn open(
     } else {
         format!("rtp://{host}:{audio_port}")
     };
-    connect(source_uri, roc::roc_interface::ROC_INTERFACE_AUDIO_SOURCE, "source")?;
+    connect(
+        source_uri,
+        roc::roc_interface::ROC_INTERFACE_AUDIO_SOURCE,
+        "source",
+    )?;
 
     if spec.fec {
         connect(

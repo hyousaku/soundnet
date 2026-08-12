@@ -24,7 +24,10 @@ pub fn list_interfaces() -> Vec<NetInterface> {
         .unwrap_or_default()
         .into_iter()
         .filter_map(|iface| {
-            usable_ipv4(&iface).map(|ip| NetInterface { name: iface.name, addr: ip.to_string() })
+            usable_ipv4(&iface).map(|ip| NetInterface {
+                name: iface.name,
+                addr: ip.to_string(),
+            })
         })
         .collect()
 }
@@ -38,14 +41,22 @@ pub fn resolve(name: &str) -> Option<IpAddr> {
 }
 
 fn resolve_in(name: &str, ifaces: &[if_addrs::Interface]) -> Option<IpAddr> {
-    ifaces.iter().find(|i| i.name == name).and_then(usable_ipv4).map(IpAddr::V4)
+    ifaces
+        .iter()
+        .find(|i| i.name == name)
+        .and_then(usable_ipv4)
+        .map(IpAddr::V4)
 }
 
 /// First non-loopback, non-link-local IPv4 interface in OS enumeration
 /// order. Used when nothing is pinned — same fallback behaviour as before
 /// this feature existed, just moved out of `main.rs`.
 pub fn first_non_loopback_ipv4() -> Option<IpAddr> {
-    if_addrs::get_if_addrs().unwrap_or_default().iter().find_map(usable_ipv4).map(IpAddr::V4)
+    if_addrs::get_if_addrs()
+        .unwrap_or_default()
+        .iter()
+        .find_map(usable_ipv4)
+        .map(IpAddr::V4)
 }
 
 fn usable_ipv4(iface: &if_addrs::Interface) -> Option<Ipv4Addr> {

@@ -25,7 +25,9 @@ pub struct GossipQuery {
     gossip: bool,
 }
 
-fn default_true() -> bool { true }
+fn default_true() -> bool {
+    true
+}
 
 use crate::routing;
 use crate::state::EngineState;
@@ -98,7 +100,11 @@ pub async fn serve(state: Arc<EngineState>, addr: SocketAddr) -> Result<()> {
 pub async fn snapshot(state: &Arc<EngineState>) -> StateSnapshot {
     let self_node = state.self_node();
 
-    let mut local_ports: Vec<_> = state.local_ports.iter().map(|e| e.value().clone()).collect();
+    let mut local_ports: Vec<_> = state
+        .local_ports
+        .iter()
+        .map(|e| e.value().clone())
+        .collect();
     crate::audio::devices::sort_ports(&mut local_ports);
 
     let mut remote_ports = Vec::new();
@@ -142,11 +148,7 @@ async fn add_route_handler(
     }
     match routing::apply_route(&state, route.clone(), q.gossip).await {
         Ok(()) => (StatusCode::CREATED, Json(route)).into_response(),
-        Err(err) => (
-            StatusCode::BAD_REQUEST,
-            format!("{err:#}"),
-        )
-            .into_response(),
+        Err(err) => (StatusCode::BAD_REQUEST, format!("{err:#}")).into_response(),
     }
 }
 
@@ -192,7 +194,9 @@ pub async fn set_interface_and_broadcast(
 ) -> anyhow::Result<()> {
     iface::set_selected(state, name).await?;
     let snap = snapshot(state).await;
-    let _ = state.events.send(soundnet_protocol::ServerMsg::State { snapshot: snap });
+    let _ = state
+        .events
+        .send(soundnet_protocol::ServerMsg::State { snapshot: snap });
     Ok(())
 }
 
@@ -226,7 +230,10 @@ async fn peer_ports_handler(
     }
     state.peers.insert(
         push.node.id.clone(),
-        PeerRecord { node: push.node.clone(), ports: push.ports.clone() },
+        PeerRecord {
+            node: push.node.clone(),
+            ports: push.ports.clone(),
+        },
     );
     let _ = state.events.send(ServerMsg::NodeAppeared {
         node: push.node,

@@ -124,12 +124,21 @@ pub fn spawn(
                 ),
             };
             if let Err(err) = result {
-                tracing::error!("send pipeline {alsa_name} -> {dst_host}:{dst_port} failed: {err:#}");
+                tracing::error!(
+                    "send pipeline {alsa_name} -> {dst_host}:{dst_port} failed: {err:#}"
+                );
                 *error_worker.lock().unwrap() = Some(format!("{err:#}"));
             }
         })?;
 
-    Ok(SendHandle { stop, thread, buffer_ns, format, xruns, last_error })
+    Ok(SendHandle {
+        stop,
+        thread,
+        buffer_ns,
+        format,
+        xruns,
+        last_error,
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -197,7 +206,13 @@ fn alsa_loop(
         // A short read (signal during the syscall) would otherwise send the
         // tail of the *previous* period again, so convert only what arrived.
         alsa_to_f32(format, &raw[..frames * frame_bytes], &mut device_floats);
-        window::extract(&device_floats, device_channels, channel_offset, channels, &mut floats);
+        window::extract(
+            &device_floats,
+            device_channels,
+            channel_offset,
+            channels,
+            &mut floats,
+        );
 
         if let Err(err) = sender.write(&mut floats) {
             consecutive_errors += 1;
@@ -247,7 +262,14 @@ fn tone_loop(
     let mut consecutive_errors = 0_u32;
 
     while !stop.load(Ordering::Relaxed) {
-        tone::generate(freq, spec.rate, spec.channels, period_frames, &mut phase, &mut buf);
+        tone::generate(
+            freq,
+            spec.rate,
+            spec.channels,
+            period_frames,
+            &mut phase,
+            &mut buf,
+        );
         if let Err(err) = sender.write(&mut buf) {
             consecutive_errors += 1;
             if consecutive_errors >= MAX_CONSECUTIVE_ERRORS {

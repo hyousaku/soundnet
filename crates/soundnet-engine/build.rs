@@ -31,7 +31,9 @@ fn main() {
 /// simply nothing to watch, and asking cargo to watch a path that does not
 /// exist would force a rebuild on every single invocation.
 fn watch_git() {
-    let Some(git_dir) = find_git_dir() else { return };
+    let Some(git_dir) = find_git_dir() else {
+        return;
+    };
 
     let head = git_dir.join("HEAD");
     if !head.exists() {
@@ -42,8 +44,12 @@ fn watch_git() {
     // "ref: refs/heads/main" → also watch .git/refs/heads/main. A detached
     // HEAD holds a bare hash instead, and then HEAD itself is the whole
     // story.
-    let Ok(contents) = std::fs::read_to_string(&head) else { return };
-    let Some(refname) = contents.trim().strip_prefix("ref: ") else { return };
+    let Ok(contents) = std::fs::read_to_string(&head) else {
+        return;
+    };
+    let Some(refname) = contents.trim().strip_prefix("ref: ") else {
+        return;
+    };
     let ref_path = git_dir.join(refname);
     if ref_path.exists() {
         println!("cargo:rerun-if-changed={}", ref_path.display());

@@ -16,9 +16,7 @@
 
 use anyhow::{anyhow, bail, Context, Result};
 use once_cell::sync::Lazy;
-use soundnet_protocol::{
-    PortKind, Route, RouteHealth, SampleFormat, ServerMsg, StreamStats,
-};
+use soundnet_protocol::{PortKind, Route, RouteHealth, SampleFormat, ServerMsg, StreamStats};
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -65,8 +63,15 @@ impl RunningRoute {
     /// `JoinHandle::is_finished` is the only way to notice after the fact
     /// that a "running" route's pipeline actually died.
     fn is_dead(&self) -> bool {
-        self.send.as_ref().map(|s| s.thread.is_finished()).unwrap_or(false)
-            || self.recv.as_ref().map(|r| r.thread.is_finished()).unwrap_or(false)
+        self.send
+            .as_ref()
+            .map(|s| s.thread.is_finished())
+            .unwrap_or(false)
+            || self
+                .recv
+                .as_ref()
+                .map(|r| r.thread.is_finished())
+                .unwrap_or(false)
     }
 
     /// Why the pipeline stopped, as reported by the thread itself.
@@ -131,11 +136,14 @@ fn backoff_for_attempts(attempts: u32) -> Duration {
 /// Record (or extend) a failure for `id`, bumping its attempt count and
 /// pushing `next_retry_at` out by the backoff for that attempt count.
 fn record_failure(state: &Arc<EngineState>, id: &str, reason: &str) {
-    let mut entry = state.failures.entry(id.to_string()).or_insert_with(|| RouteFailure {
-        attempts: 0,
-        reason: String::new(),
-        next_retry_at: Instant::now(),
-    });
+    let mut entry = state
+        .failures
+        .entry(id.to_string())
+        .or_insert_with(|| RouteFailure {
+            attempts: 0,
+            reason: String::new(),
+            next_retry_at: Instant::now(),
+        });
     entry.attempts += 1;
     entry.reason = reason.to_string();
     entry.next_retry_at = Instant::now() + backoff_for_attempts(entry.attempts);
@@ -239,7 +247,10 @@ fn validate_route(state: &Arc<EngineState>, route: &Route) -> Result<()> {
     if is_local_src(state, route) {
         if let Some(p) = state.local_ports.get(&route.src.port_id) {
             if matches!(p.kind, PortKind::Playback) {
-                bail!("src port {} is a Playback port; sources must be Capture or Tone", route.src.port_id);
+                bail!(
+                    "src port {} is a Playback port; sources must be Capture or Tone",
+                    route.src.port_id
+                );
             }
         }
     }
@@ -248,7 +259,8 @@ fn validate_route(state: &Arc<EngineState>, route: &Route) -> Result<()> {
             if !matches!(p.kind, PortKind::Playback) {
                 bail!(
                     "dst port {} is a {:?} port; destinations must be Playback",
-                    route.dst.port_id, p.kind
+                    route.dst.port_id,
+                    p.kind
                 );
             }
         }
@@ -274,7 +286,11 @@ fn validate_route(state: &Arc<EngineState>, route: &Route) -> Result<()> {
 pub async fn try_start(state: &Arc<EngineState>, route: &Route) -> Result<()> {
     if let Some(entry) = state.running.get(&route.id) {
         let dead = entry.is_dead();
-        let dead_reason = if dead { Some(entry.failure_reason()) } else { None };
+        let dead_reason = if dead {
+            Some(entry.failure_reason())
+        } else {
+            None
+        };
         drop(entry);
         if !dead {
             // Confirmed alive as of this check — any backoff from an earlier
@@ -286,7 +302,10 @@ pub async fn try_start(state: &Arc<EngineState>, route: &Route) -> Result<()> {
             shutdown_running(dead_route);
         }
         let reason = dead_reason.unwrap_or_else(|| "pipeline exited".to_string());
-        tracing::warn!("route {} pipeline died: {reason}; backing off before retry", route.id);
+        tracing::warn!(
+            "route {} pipeline died: {reason}; backing off before retry",
+            route.id
+        );
         record_failure(state, &route.id, &reason);
     }
 
@@ -318,10 +337,18 @@ pub async fn try_start(state: &Arc<EngineState>, route: &Route) -> Result<()> {
 /// peers) — not a failure, nothing to retry.
 async fn try_start_inner(state: &Arc<EngineState>, route: &Route) -> Result<Option<RunningRoute>> {
     let mut running = RunningRoute {
-        send: None, recv: None,
-        level_bits: None, xruns: None, e2e_ns: None, jitter_ns: None,
-        cap_buffer_ns: None, pb_buffer_ns: None,
-        cap_format: None, pb_format: None, cap_xruns: None, clipped: None,
+        send: None,
+        recv: None,
+        level_bits: None,
+        xruns: None,
+        e2e_ns: None,
+        jitter_ns: None,
+        cap_buffer_ns: None,
+        pb_buffer_ns: None,
+        cap_format: None,
+        pb_format: None,
+        cap_xruns: None,
+        clipped: None,
     };
 
     if is_local_src(state, route) {
@@ -437,7 +464,10 @@ pub fn spawn_route_supervisor(state: Arc<EngineState>) {
             let routes: Vec<Route> = state.routes.iter().map(|e| e.value().clone()).collect();
             for route in routes {
                 if let Err(err) = try_start(&state, &route).await {
-                    tracing::debug!("route supervisor: route {} still failing: {err:#}", route.id);
+                    tracing::debug!(
+                        "route supervisor: route {} still failing: {err:#}",
+                        route.id
+                    );
                 }
             }
         }
@@ -457,7 +487,9 @@ pub async fn remove_route(state: &Arc<EngineState>, id: &str, gossip: bool) {
             gossip_remove(state, &route).await;
         }
     }
-    let _ = state.events.send(ServerMsg::RouteRemoved { id: id.to_string() });
+    let _ = state
+        .events
+        .send(ServerMsg::RouteRemoved { id: id.to_string() });
 }
 
 /// Snapshot in-memory state to the configured TOML file. Best-effort — a
@@ -522,9 +554,7 @@ async fn gossip_remove(state: &Arc<EngineState>, route: &Route) {
         let id = id.clone();
         tokio::task::spawn_blocking(move || {
             let url = format!("http://{addr}:{port}/api/routes/{id}?gossip=false");
-            let _ = ureq::delete(&url)
-                .timeout(Duration::from_secs(3))
-                .call();
+            let _ = ureq::delete(&url).timeout(Duration::from_secs(3)).call();
         });
     }
 }
@@ -646,7 +676,11 @@ pub fn spawn_stats_pump(state: Arc<EngineState>) {
                 let stats = StreamStats {
                     xruns,
                     jitter_ms,
-                    level_db: if level > 0.0 { 20.0 * level.log10() } else { -120.0 },
+                    level_db: if level > 0.0 {
+                        20.0 * level.log10()
+                    } else {
+                        -120.0
+                    },
                     health,
                     roc_e2e_ms,
                     capture_buffer_ms,
@@ -747,7 +781,10 @@ mod tests {
         let a = route_port(10_001, id);
         let b = route_port(10_001, id);
         assert_eq!(a, b, "same id must produce same port on both engines");
-        assert!(a >= 10_001 + 3 && a <= 10_001 + 3 + 999 * 3, "port {a} out of range");
+        assert!(
+            a >= 10_001 + 3 && a <= 10_001 + 3 + 999 * 3,
+            "port {a} out of range"
+        );
     }
 
     #[test]
@@ -758,7 +795,11 @@ mod tests {
         // a neighboring route's source port.
         for id in ["r1", "r2", "12345", "550e8400-e29b-41d4-a716-446655440000"] {
             let p = route_port(10_001, id);
-            assert_eq!((p - 10_001) % 3, 0, "port for {id} = {p} is not a 3-aligned offset");
+            assert_eq!(
+                (p - 10_001) % 3,
+                0,
+                "port for {id} = {p} is not a 3-aligned offset"
+            );
         }
     }
 
@@ -778,7 +819,10 @@ mod tests {
         let ids: Vec<String> = (0..300).map(|i| format!("route-{i}")).collect();
         for a in &ids {
             let pa = route_port(base, a);
-            assert!(pa >= base + 3, "{a}: port {pa} must land at or after base+3");
+            assert!(
+                pa >= base + 3,
+                "{a}: port {pa} must land at or after base+3"
+            );
             for b in &ids {
                 if a == b {
                     continue;

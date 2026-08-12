@@ -58,7 +58,10 @@ fn install_roc_logger() {
 /// Must not unwind into C — hence the `catch_unwind`, which is cheap next to
 /// the formatting we are already doing and turns a panic in a logging path
 /// into a lost log line rather than an aborted process.
-unsafe extern "C" fn roc_log_handler(msg: *const roc::roc_log_message, _arg: *mut std::ffi::c_void) {
+unsafe extern "C" fn roc_log_handler(
+    msg: *const roc::roc_log_message,
+    _arg: *mut std::ffi::c_void,
+) {
     let _ = std::panic::catch_unwind(|| {
         let Some(msg) = msg.as_ref() else { return };
         let cstr = |p: *const std::ffi::c_char| -> String {
@@ -119,9 +122,7 @@ impl RocContext {
         };
         let rc = unsafe { roc::roc_context_register_encoding(self.ctx, id, &enc) };
         if rc != 0 {
-            tracing::warn!(
-                "register_encoding({id}, rate={rate}, ch={channels}) rc={rc}"
-            );
+            tracing::warn!("register_encoding({id}, rate={rate}, ch={channels}) rc={rc}");
         }
         seen.insert((rate, channels));
         id

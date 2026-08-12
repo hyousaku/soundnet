@@ -314,11 +314,24 @@ pub struct StateSnapshot {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ClientMsg {
     Hello,
-    AddRoute { route: Route },
-    RemoveRoute { id: RouteId },
-    UpdateSpec { id: RouteId, spec: StreamSpec },
-    AddManualHost { addr: String, port: u16 },
-    RemoveManualHost { addr: String, port: u16 },
+    AddRoute {
+        route: Route,
+    },
+    RemoveRoute {
+        id: RouteId,
+    },
+    UpdateSpec {
+        id: RouteId,
+        spec: StreamSpec,
+    },
+    AddManualHost {
+        addr: String,
+        port: u16,
+    },
+    RemoveManualHost {
+        addr: String,
+        port: u16,
+    },
     /// Re-enumerate local ALSA devices (e.g. after plugging in a new USB
     /// interface). The engine responds by broadcasting a fresh State snapshot.
     RescanDevices,
@@ -326,7 +339,9 @@ pub enum ClientMsg {
     /// interface this engine advertises over mDNS and sends audio out of.
     /// Only ever meaningful sent to the engine that owns the interface — an
     /// engine can only reconfigure itself, not a peer.
-    SetInterface { name: Option<String> },
+    SetInterface {
+        name: Option<String>,
+    },
 }
 
 // ---------- WS server -> client ----------
@@ -334,14 +349,29 @@ pub enum ClientMsg {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerMsg {
-    State { snapshot: StateSnapshot },
-    NodeAppeared { node: Node, ports: Vec<LocalPort> },
-    NodeDisappeared { node_id: NodeId },
-    RouteAdded { route: Route },
-    RouteRemoved { id: RouteId },
-    RouteUpdated { route: Route },
+    State {
+        snapshot: StateSnapshot,
+    },
+    NodeAppeared {
+        node: Node,
+        ports: Vec<LocalPort>,
+    },
+    NodeDisappeared {
+        node_id: NodeId,
+    },
+    RouteAdded {
+        route: Route,
+    },
+    RouteRemoved {
+        id: RouteId,
+    },
+    RouteUpdated {
+        route: Route,
+    },
     Stats {
         stats: std::collections::HashMap<RouteId, StreamStats>,
     },
-    Error { message: String },
+    Error {
+        message: String,
+    },
 }

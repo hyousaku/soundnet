@@ -24,7 +24,11 @@ pub fn register_default_tones(state: &Arc<EngineState>) {
                 label: format!("Test tone {freq} Hz"),
                 max_channels: 2,
                 probe_failed: false,
-                supported_formats: vec![SampleFormat::F32Le, SampleFormat::S16Le, SampleFormat::S24Le3],
+                supported_formats: vec![
+                    SampleFormat::F32Le,
+                    SampleFormat::S16Le,
+                    SampleFormat::S24Le3,
+                ],
                 supported_rates: vec![44_100, 48_000, 96_000],
             },
         );
@@ -33,7 +37,14 @@ pub fn register_default_tones(state: &Arc<EngineState>) {
 
 /// Fill `out` with `frames` frames of interleaved sine at `freq`, advancing
 /// `phase` (radians, 0..2π) in-place. Amplitude is fixed at -12 dBFS.
-pub fn generate(freq: f32, rate: u32, channels: u8, frames: usize, phase: &mut f32, out: &mut Vec<f32>) {
+pub fn generate(
+    freq: f32,
+    rate: u32,
+    channels: u8,
+    frames: usize,
+    phase: &mut f32,
+    out: &mut Vec<f32>,
+) {
     out.clear();
     out.reserve(frames * channels as usize);
     let two_pi = std::f32::consts::TAU;

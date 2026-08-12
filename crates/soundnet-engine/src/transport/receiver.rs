@@ -78,12 +78,7 @@ impl Receiver {
 
 /// Open a receiver bound to `host`'s audio port trio (source, +1 repair,
 /// +2 RTCP control).
-pub fn open(
-    ctx: Arc<RocContext>,
-    host: &str,
-    port: u16,
-    spec: &StreamSpec,
-) -> Result<Receiver> {
+pub fn open(ctx: Arc<RocContext>, host: &str, port: u16, spec: &StreamSpec) -> Result<Receiver> {
     // Both sides register the same custom encoding for this (rate, channels)
     // tuple so packets round-trip without libroc having to guess a match.
     ctx.ensure_encoding(spec.rate, spec.channels);
@@ -130,8 +125,7 @@ pub fn open(
 
     let bind = |uri: String, iface: roc::roc_interface, what: &str| -> Result<()> {
         let ep = endpoint_from_uri(&uri)?;
-        let rc =
-            unsafe { roc::roc_receiver_bind(receiver.raw, roc::ROC_SLOT_DEFAULT, iface, ep) };
+        let rc = unsafe { roc::roc_receiver_bind(receiver.raw, roc::ROC_SLOT_DEFAULT, iface, ep) };
         endpoint_free(ep);
         if rc != 0 {
             bail!("receiver bind {what} failed ({rc})");
@@ -144,7 +138,11 @@ pub fn open(
     } else {
         format!("rtp://{host}:{port}")
     };
-    bind(source_uri, roc::roc_interface::ROC_INTERFACE_AUDIO_SOURCE, "source")?;
+    bind(
+        source_uri,
+        roc::roc_interface::ROC_INTERFACE_AUDIO_SOURCE,
+        "source",
+    )?;
 
     if spec.fec {
         bind(

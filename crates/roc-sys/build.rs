@@ -24,7 +24,9 @@ fn main() {
 /// correct distro package is left alone.
 fn prefer_local_roc_04() {
     let header = std::path::Path::new("/usr/local/include/roc/version.h");
-    let Ok(text) = std::fs::read_to_string(header) else { return };
+    let Ok(text) = std::fs::read_to_string(header) else {
+        return;
+    };
     let field = |name: &str| -> Option<u32> {
         text.lines()
             .find_map(|l| l.strip_prefix(&format!("#define {name}")))

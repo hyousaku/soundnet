@@ -65,9 +65,7 @@ pub fn alsa_to_f32(fmt: SampleFormat, bytes: &[u8], out: &mut Vec<f32>) {
             out.reserve(bytes.len() / 3);
             for chunk in bytes.chunks_exact(3) {
                 // sign-extend 24 → 32
-                let raw = (chunk[0] as u32)
-                    | ((chunk[1] as u32) << 8)
-                    | ((chunk[2] as u32) << 16);
+                let raw = (chunk[0] as u32) | ((chunk[1] as u32) << 8) | ((chunk[2] as u32) << 16);
                 let signed = if raw & 0x00_80_00_00 != 0 {
                     (raw | 0xFF_00_00_00) as i32
                 } else {

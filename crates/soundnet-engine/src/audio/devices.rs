@@ -233,7 +233,12 @@ fn probe(alsa_name: &str, dir: alsa::Direction) -> Probe {
         rates.push(48_000);
     }
 
-    Probe { max_channels, formats, rates, failed: false }
+    Probe {
+        max_channels,
+        formats,
+        rates,
+        failed: false,
+    }
 }
 
 #[cfg(test)]
@@ -271,7 +276,11 @@ mod tests {
         sort_ports(&mut reversed);
 
         let ids = |v: &[LocalPort]| v.iter().map(|p| p.id.clone()).collect::<Vec<_>>();
-        assert_eq!(ids(&forward), ids(&reversed), "order must not depend on input order");
+        assert_eq!(
+            ids(&forward),
+            ids(&reversed),
+            "order must not depend on input order"
+        );
         // Sources first, tones after them, outputs last — the order the node
         // card draws, so a row's position (and therefore its patch point)
         // stays put across snapshots.

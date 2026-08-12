@@ -47,8 +47,9 @@ struct Cli {
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,soundnet_engine=debug")),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+                tracing_subscriber::EnvFilter::new("info,soundnet_engine=debug")
+            }),
         )
         .init();
 
@@ -80,10 +81,7 @@ async fn main() -> Result<()> {
 
     let bind_addr = cli.bind;
 
-    let cfg_path = cli
-        .config
-        .clone()
-        .unwrap_or_else(config::default_path);
+    let cfg_path = cli.config.clone().unwrap_or_else(config::default_path);
     let mut cfg = config::Config::load_or_default(Some(&cfg_path))?;
 
     let advertise_ip = pick_advertise_ip(bind_addr.ip(), cfg.interface.as_deref());
@@ -145,7 +143,12 @@ async fn main() -> Result<()> {
     }
 
     // Kick off discovery + stats pump in the background.
-    discovery::spawn(state.clone(), advertise_ip, bind_addr.port(), cli.audio_port);
+    discovery::spawn(
+        state.clone(),
+        advertise_ip,
+        bind_addr.port(),
+        cli.audio_port,
+    );
     routing::spawn_stats_pump(state.clone());
     // mDNS ServiceRemoved only fires on a graceful goodbye; a crash, SIGKILL,
     // or re-IP via DHCP just leaves the old peer record in state.peers
@@ -163,7 +166,10 @@ async fn main() -> Result<()> {
 
     tracing::info!(
         "soundnet-engine {} listening on http://{}  (advertise ip {}, audio {})",
-        BUILD_ID, bind_addr, advertise_ip, cli.audio_port
+        BUILD_ID,
+        bind_addr,
+        advertise_ip,
+        cli.audio_port
     );
 
     // systemd sends SIGTERM on `stop`/`restart`, not SIGINT — without a

@@ -58,8 +58,10 @@ pub fn open(
         // when the route asked for S16LE) would otherwise kill the worker
         // outright. Substituting is safe because the wire format is always
         // f32; we just need to convert using whatever we actually opened.
-        let format = pick_format(spec.alsa_format, |f| hwp.test_format(to_alsa_format(f)).is_ok())
-            .ok_or_else(|| anyhow!("{alsa_name}: no supported {what} format"))?;
+        let format = pick_format(spec.alsa_format, |f| {
+            hwp.test_format(to_alsa_format(f)).is_ok()
+        })
+        .ok_or_else(|| anyhow!("{alsa_name}: no supported {what} format"))?;
         if format != spec.alsa_format {
             tracing::warn!(
                 "{what} {alsa_name}: requested format {:?} unsupported, using {:?} instead",

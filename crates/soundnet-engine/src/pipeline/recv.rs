@@ -113,12 +113,25 @@ pub fn spawn(
                 &worker,
                 channel_offset as usize,
             ) {
-                tracing::error!("recv pipeline {bind_host}:{bind_port} -> {alsa_name} failed: {err:#}");
+                tracing::error!(
+                    "recv pipeline {bind_host}:{bind_port} -> {alsa_name} failed: {err:#}"
+                );
                 *error_worker.lock().unwrap() = Some(format!("{err:#}"));
             }
         })?;
 
-    Ok(RecvHandle { stop, thread, level_bits, xruns, buffer_ns, e2e_ns, jitter_ns, format, clipped, last_error })
+    Ok(RecvHandle {
+        stop,
+        thread,
+        level_bits,
+        xruns,
+        buffer_ns,
+        e2e_ns,
+        jitter_ns,
+        format,
+        clipped,
+        last_error,
+    })
 }
 
 /// The atomics the worker publishes into, grouped so the loop signature
@@ -208,10 +221,20 @@ fn run(
             w.clipped.fetch_add(over, Ordering::Relaxed);
         }
         let prev = f32::from_bits(w.level_bits.load(Ordering::Relaxed));
-        let smoothed = if peak > prev { peak } else { prev * 0.7 + peak * 0.3 };
+        let smoothed = if peak > prev {
+            peak
+        } else {
+            prev * 0.7 + peak * 0.3
+        };
         w.level_bits.store(smoothed.to_bits(), Ordering::Relaxed);
 
-        window::scatter(&floats, channels, device_channels, channel_offset, &mut device_floats);
+        window::scatter(
+            &floats,
+            channels,
+            device_channels,
+            channel_offset,
+            &mut device_floats,
+        );
         f32_to_alsa(format, &device_floats, &mut raw);
 
         // The one blocking point in this loop. The device is opened

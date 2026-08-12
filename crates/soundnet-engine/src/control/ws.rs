@@ -9,8 +9,8 @@ use futures_util::{SinkExt, StreamExt};
 use soundnet_protocol::{ClientMsg, ServerMsg};
 use std::sync::Arc;
 
-use crate::{discovery, routing};
 use crate::state::EngineState;
+use crate::{discovery, routing};
 
 pub async fn ws_handler(
     ws: WebSocketUpgrade,
@@ -52,9 +52,9 @@ async fn serve_socket(socket: WebSocket, state: Arc<EngineState>) {
                 }
                 if let Err(err) = routing::apply_route(&state, route, true).await {
                     tracing::warn!("ws add_route failed: {err:#}");
-                    let _ = state
-                        .events
-                        .send(ServerMsg::Error { message: format!("{err:#}") });
+                    let _ = state.events.send(ServerMsg::Error {
+                        message: format!("{err:#}"),
+                    });
                 }
             }
             Ok(ClientMsg::RemoveRoute { id }) => {
@@ -84,9 +84,9 @@ async fn serve_socket(socket: WebSocket, state: Arc<EngineState>) {
             Ok(ClientMsg::SetInterface { name }) => {
                 if let Err(err) = super::set_interface_and_broadcast(&state, name).await {
                     tracing::warn!("ws set_interface failed: {err:#}");
-                    let _ = state
-                        .events
-                        .send(ServerMsg::Error { message: format!("{err:#}") });
+                    let _ = state.events.send(ServerMsg::Error {
+                        message: format!("{err:#}"),
+                    });
                 }
             }
             Err(err) => {

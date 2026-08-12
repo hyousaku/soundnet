@@ -42,8 +42,16 @@ pub fn spawn(state: Arc<EngineState>, ip: IpAddr, control_port: u16, audio_port:
 /// addresses, forever. We always advertise exactly one address — either the
 /// pinned interface's or the automatically-chosen one — and it's the caller's
 /// job to have already picked which.
-fn build_service_info(state: &EngineState, ip: IpAddr, audio_port: u16) -> anyhow::Result<ServiceInfo> {
-    let host_label = format!("{}-{}", state.identity.hostname, &state.identity.node_id[..8]);
+fn build_service_info(
+    state: &EngineState,
+    ip: IpAddr,
+    audio_port: u16,
+) -> anyhow::Result<ServiceInfo> {
+    let host_label = format!(
+        "{}-{}",
+        state.identity.hostname,
+        &state.identity.node_id[..8]
+    );
     let instance = &state.identity.node_id;
     let mut props = std::collections::HashMap::new();
     props.insert("node_id".to_string(), state.identity.node_id.clone());
@@ -78,7 +86,10 @@ async fn run(
     // Stash the daemon + fullname so main.rs can send a graceful goodbye on
     // shutdown (SIGTERM from systemd, or Ctrl-C) instead of leaving a ghost
     // record for peers to time out on.
-    *state.mdns.write().await = Some(MdnsHandle { daemon: daemon.clone(), fullname });
+    *state.mdns.write().await = Some(MdnsHandle {
+        daemon: daemon.clone(),
+        fullname,
+    });
 
     // Start browsing for peers.
     let receiver = daemon.browse(SERVICE_TYPE)?;
@@ -94,14 +105,13 @@ async fn run(
                 {
                     continue;
                 }
-                let addr = info
-                    .get_addresses()
-                    .iter()
-                    .find(|a| a.is_ipv4())
-                    .copied();
+                let addr = info.get_addresses().iter().find(|a| a.is_ipv4()).copied();
                 let Some(addr) = addr else { continue };
                 let node = Node {
-                    id: info.get_property_val_str("node_id").unwrap_or("").to_string(),
+                    id: info
+                        .get_property_val_str("node_id")
+                        .unwrap_or("")
+                        .to_string(),
                     hostname: info
                         .get_property_val_str("hostname")
                         .unwrap_or(info.get_hostname())
@@ -126,19 +136,18 @@ async fn run(
             ServiceEvent::ServiceRemoved(_ty, fullname) => {
                 // Find and drop peer by fullname match (best-effort — fullname
                 // includes the node id we registered).
-                let removed: Option<String> = state
-                    .peers
-                    .iter()
-                    .find_map(|entry| {
-                        if fullname.contains(&entry.key()[..8]) {
-                            Some(entry.key().clone())
-                        } else {
-                            None
-                        }
-                    });
+                let removed: Option<String> = state.peers.iter().find_map(|entry| {
+                    if fullname.contains(&entry.key()[..8]) {
+                        Some(entry.key().clone())
+                    } else {
+                        None
+                    }
+                });
                 if let Some(id) = removed {
                     state.peers.remove(&id);
-                    let _ = state.events.send(ServerMsg::NodeDisappeared { node_id: id });
+                    let _ = state
+                        .events
+                        .send(ServerMsg::NodeDisappeared { node_id: id });
                 }
             }
             _ => {}
@@ -179,7 +188,10 @@ pub async fn reregister(state: &Arc<EngineState>, ip: IpAddr) -> anyhow::Result<
     daemon.register(info)?;
     tracing::info!("mDNS: re-advertising {SERVICE_TYPE} on {ip}");
 
-    *guard = Some(MdnsHandle { daemon, fullname: new_fullname });
+    *guard = Some(MdnsHandle {
+        daemon,
+        fullname: new_fullname,
+    });
     Ok(())
 }
 
@@ -204,8 +216,11 @@ pub fn spawn_liveness_checker(state: Arc<EngineState>) {
 }
 
 async fn check_peers_once(state: &Arc<EngineState>, failures: &mut HashMap<String, u32>) {
-    let snapshot: Vec<(String, Node)> =
-        state.peers.iter().map(|e| (e.key().clone(), e.value().node.clone())).collect();
+    let snapshot: Vec<(String, Node)> = state
+        .peers
+        .iter()
+        .map(|e| (e.key().clone(), e.value().node.clone()))
+        .collect();
     // Drop stale bookkeeping for ids that already left state.peers by some
     // other path (e.g. remove_manual) so the map doesn't grow forever.
     failures.retain(|id, _| snapshot.iter().any(|(pid, _)| pid == id));
@@ -216,7 +231,10 @@ async fn check_peers_once(state: &Arc<EngineState>, failures: &mut HashMap<Strin
             ureq::get(&url)
                 .timeout(LIVENESS_TIMEOUT)
                 .call()
-                .and_then(|resp| resp.into_json::<soundnet_protocol::StateSnapshot>().map_err(Into::into))
+                .and_then(|resp| {
+                    resp.into_json::<soundnet_protocol::StateSnapshot>()
+                        .map_err(Into::into)
+                })
         })
         .await;
 
@@ -237,13 +255,18 @@ async fn check_peers_once(state: &Arc<EngineState>, failures: &mut HashMap<Strin
                         node.addr, node.port, real_id, id
                     );
                     state.peers.remove(&id);
-                    let _ = state.events.send(ServerMsg::NodeDisappeared { node_id: id });
+                    let _ = state
+                        .events
+                        .send(ServerMsg::NodeDisappeared { node_id: id });
                 }
                 // Refresh the cached record either way — ports may have
                 // changed since we first saw this peer, and this is cheap.
                 state.peers.insert(
                     real_id,
-                    PeerRecord { node: snap.self_node.clone(), ports: snap.local_ports },
+                    PeerRecord {
+                        node: snap.self_node.clone(),
+                        ports: snap.local_ports,
+                    },
                 );
             }
             _ => {
@@ -254,7 +277,9 @@ async fn check_peers_once(state: &Arc<EngineState>, failures: &mut HashMap<Strin
                         tracing::info!(
                             "liveness: peer {id} unreachable after {count} checks, dropping"
                         );
-                        let _ = state.events.send(ServerMsg::NodeDisappeared { node_id: id.clone() });
+                        let _ = state.events.send(ServerMsg::NodeDisappeared {
+                            node_id: id.clone(),
+                        });
                     }
                     failures.remove(&id);
                 }
@@ -287,7 +312,10 @@ pub async fn add_manual(state: &Arc<EngineState>, addr: String, port: u16) {
         let mut hosts = state.manual_hosts.write().await;
         let already = hosts.iter().any(|h| h.addr == addr && h.port == port);
         if !already {
-            hosts.push(soundnet_protocol::ManualHost { addr: addr.clone(), port });
+            hosts.push(soundnet_protocol::ManualHost {
+                addr: addr.clone(),
+                port,
+            });
         }
     }
     routing::persist(state).await;
@@ -313,7 +341,9 @@ pub async fn remove_manual(state: &Arc<EngineState>, addr: &str, port: u16) {
         .collect();
     for id in removed {
         state.peers.remove(&id);
-        let _ = state.events.send(ServerMsg::NodeDisappeared { node_id: id });
+        let _ = state
+            .events
+            .send(ServerMsg::NodeDisappeared { node_id: id });
     }
     routing::persist(state).await;
 }
@@ -324,7 +354,11 @@ pub async fn remove_manual(state: &Arc<EngineState>, addr: &str, port: u16) {
 /// the next time mDNS resolves us fresh on its end).
 pub fn push_ports_to_peers(state: &Arc<EngineState>) {
     let self_node = state.self_node();
-    let mut ports: Vec<LocalPort> = state.local_ports.iter().map(|e| e.value().clone()).collect();
+    let mut ports: Vec<LocalPort> = state
+        .local_ports
+        .iter()
+        .map(|e| e.value().clone())
+        .collect();
     crate::audio::devices::sort_ports(&mut ports);
     let targets: Vec<(String, u16)> = state
         .peers
@@ -333,7 +367,10 @@ pub fn push_ports_to_peers(state: &Arc<EngineState>) {
         .collect();
 
     for (addr, port) in targets {
-        let push = PeerPortsPush { node: self_node.clone(), ports: ports.clone() };
+        let push = PeerPortsPush {
+            node: self_node.clone(),
+            ports: ports.clone(),
+        };
         let body = match serde_json::to_string(&push) {
             Ok(s) => s,
             Err(err) => {
@@ -360,7 +397,10 @@ async fn fetch_peer_state(state: &Arc<EngineState>, node: Node) {
         ureq::get(&url)
             .timeout(Duration::from_secs(2))
             .call()
-            .and_then(|resp| resp.into_json::<soundnet_protocol::StateSnapshot>().map_err(Into::into))
+            .and_then(|resp| {
+                resp.into_json::<soundnet_protocol::StateSnapshot>()
+                    .map_err(Into::into)
+            })
     })
     .await;
     match fetched {
@@ -368,15 +408,23 @@ async fn fetch_peer_state(state: &Arc<EngineState>, node: Node) {
             // Prefer the ids/ports the peer reports over whatever we had.
             let node = snap.self_node.clone();
             let ports: Vec<LocalPort> = snap.local_ports;
-            let record = PeerRecord { node: node.clone(), ports: ports.clone() };
+            let record = PeerRecord {
+                node: node.clone(),
+                ports: ports.clone(),
+            };
             state.peers.insert(node.id.clone(), record);
-            let _ = state
-                .events
-                .send(ServerMsg::NodeAppeared { node: node.clone(), ports });
+            let _ = state.events.send(ServerMsg::NodeAppeared {
+                node: node.clone(),
+                ports,
+            });
             // Retry any routes that were waiting for this peer.
             routing::retry_pending_for_peer(state, &node.id).await;
         }
-        Ok(Err(err)) => tracing::warn!("failed to fetch peer state from {}:{}: {err:#}", node.addr, node.port),
+        Ok(Err(err)) => tracing::warn!(
+            "failed to fetch peer state from {}:{}: {err:#}",
+            node.addr,
+            node.port
+        ),
         Err(err) => tracing::warn!("peer state task panicked: {err}"),
     }
 }
