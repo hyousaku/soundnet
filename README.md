@@ -313,6 +313,28 @@ Tests:
 cargo test --workspace
 ```
 
+### Continuous integration
+
+`.github/workflows/ci.yml` runs on pushes to `main` and on every pull
+request. It builds the web UI (`tsc --noEmit && vite build`), hands the
+result to a second job — the engine embeds `web/dist` at compile time, so it
+does not build without it — and there runs `cargo fmt --all --check`,
+`cargo clippy --workspace --all-targets -- -D warnings` and
+`cargo test --workspace`.
+
+No Ubuntu or Debian release packages libroc 0.4 (noble ships 0.3.0, which is
+a different ABI), so CI builds it from source the same way
+`packaging/install.sh` does and caches the result. The first run on a fresh
+cache takes a few minutes longer.
+
+What CI does **not** cover, and cannot:
+
+- **Anything involving a sound card.** No audio device, no network peer, no
+  xruns, no drift. Every interesting bug in this project so far has needed
+  hardware and a pair of ears; CI catches the ones that are cheaper to catch.
+- **arm64.** The Raspberry Pi build is verified by building on the Pi.
+- **The `.deb`.** `packaging/build-deb.sh` is not run by CI.
+
 ## Architecture
 
 - **`crates/roc-sys`** — minimal hand-written FFI to `libroc` (0.4.x).

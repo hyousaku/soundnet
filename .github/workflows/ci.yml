@@ -1,0 +1,155 @@
+name: CI
+
+# Push is limited to main because that is where work actually lands here;
+# every other branch is covered through its pull request, and running both
+# triggers on the same commit would just double the queue.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+# A newer push to the same branch makes the older run's answer irrelevant.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # The ABI crates/roc-sys is hand-written against — see its
+  # check_runtime_version(). Pinned rather than tracking a branch, because
+  # this string is also part of the cache key below.
+  ROC_VERSION: v0.4.0
+  CARGO_TERM_COLOR: always
+
+# Both jobs pin ubuntu-24.04 rather than ubuntu-latest. The roc job caches
+# compiled binaries, so the distro must not shift underneath a cache key that
+# names it; and "latest" silently moving to a new LTS is the kind of change
+# that should be a deliberate commit, not a surprise on a Tuesday.
+
+jobs:
+  web:
+    name: web
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Install
+        working-directory: web
+        run: npm ci
+
+      # `npm run build` is `tsc --noEmit && vite build`, so the type check is
+      # already inside this step — a separate tsc invocation would only run
+      # the same thing twice.
+      - name: Type-check and build
+        working-directory: web
+        run: npm run build
+
+      # web/dist is gitignored but the engine embeds it at *compile* time
+      # (rust_embed, see control/web.rs), so `cargo check` on a fresh
+      # checkout fails outright until it exists. Hand the built directory to
+      # the rust job rather than having that job repeat the npm work.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: web-dist
+          path: web/dist
+          retention-days: 1
+
+  rust:
+    name: rust
+    runs-on: ubuntu-24.04
+    # Not an arbitrary ordering: without web/dist the engine does not
+    # compile. See the upload step above.
+    needs: web
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: web-dist
+          path: web/dist
+
+      - name: Resolve toolchain (rust-toolchain.toml)
+        run: rustup show
+
+      # No Ubuntu or Debian release packages libroc 0.4 — noble ships 0.3.0,
+      # and 0.3 is not merely older, it is a different ABI that links cleanly
+      # and then misbehaves at runtime. So CI builds 0.4 from source, exactly
+      # as packaging/install.sh does on a real machine, and caches the result.
+      # First run costs a few minutes; every run after it costs seconds.
+      - name: Cache libroc ${{ env.ROC_VERSION }}
+        id: roc-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/roc-prefix
+          key: roc-ubuntu-24.04-x86_64-${{ env.ROC_VERSION }}
+
+      # Installed unconditionally, cache hit or miss. The libroc.so we build
+      # links against libuv, libunwind, libspeexdsp and friends, so they have
+      # to be present to link and load it — skipping them on a cache hit
+      # would give us a job that passes on the run that builds roc and fails
+      # on every run afterwards.
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config libasound2-dev \
+            scons ragel gengetopt libuv1-dev libunwind-dev libspeexdsp-dev \
+            libsox-dev libsndfile1-dev libssl-dev libpulse-dev \
+            libtool intltool autoconf automake make cmake
+
+      - name: Build roc-toolkit ${{ env.ROC_VERSION }}
+        if: steps.roc-cache.outputs.cache-hit != 'true'
+        run: |
+          git clone --depth 1 --branch "$ROC_VERSION" \
+            https://github.com/roc-streaming/roc-toolkit.git /tmp/roc-toolkit
+          cd /tmp/roc-toolkit
+          # --build-3rdparty=openfec matches install.sh: no distro packages
+          # OpenFEC, and without it every `fec: true` route fails to start.
+          scons -Q --prefix="$HOME/roc-prefix" --build-3rdparty=openfec
+          scons -Q --prefix="$HOME/roc-prefix" --build-3rdparty=openfec install
+
+      - name: Install roc into /usr/local
+        run: |
+          sudo cp -a "$HOME/roc-prefix/." /usr/local/
+          sudo ldconfig
+          # /usr/local is where crates/roc-sys/build.rs looks to decide
+          # whether to put /usr/local/lib ahead of the multiarch directories
+          # at link time, so this path is not incidental.
+          #
+          # The version assertion is the same guard install.sh applies on a
+          # real machine, and it earns its place here specifically because of
+          # the cache: a stale or wrong entry restored into /usr/local is
+          # precisely how the wrong ABI would get linked without anyone
+          # noticing until audio misbehaved at runtime.
+          header=/usr/local/include/roc/version.h
+          major=$(sed -n 's/^#define ROC_VERSION_MAJOR *\([0-9]*\).*/\1/p' "$header")
+          minor=$(sed -n 's/^#define ROC_VERSION_MINOR *\([0-9]*\).*/\1/p' "$header")
+          echo "libroc headers report ${major}.${minor}"
+          test "${major}.${minor}" = "0.4"
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-ubuntu-24.04-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-ubuntu-24.04-
+
+      - name: Format
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test --workspace
