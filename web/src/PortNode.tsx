@@ -28,7 +28,10 @@ export default function PortNode({ data }: NodeProps<PortRFNode>) {
       color: "#e6e9ef",
       border: "1px solid #262d38",
       borderRadius: 8,
-      width: 320,
+      // Wide enough that a typical ALSA label — "HDA Intel PCH — HDMI 0
+      // (out · low-latency)" — fits on one line beside the channel count.
+      // Longer names wrap rather than being cut; see PortRow.
+      width: 420,
       overflow: "hidden",
       fontSize: 12,
     }}>
@@ -115,18 +118,36 @@ function PortRow({ port, side }: { port: LocalPort; side: "source" | "target" })
       alignItems: "center",
       gap: 6,
     }}>
-      <span style={{
-        color: port.kind === "tone" ? "#f59e0b" : (isSource ? "#6cf" : "#4ade80"),
-        fontSize: 10,
-        textTransform: "uppercase",
-      }}>{port.kind}</span>
+      {/*
+        Only on the output side, where it separates CAPTURE from TONE. Under
+        INPUTS every row is a playback port by construction, so the badge said
+        "PLAYBACK" eight times beneath a heading that already said INPUTS —
+        about sixty pixels per row spent repeating the heading, on exactly the
+        rows whose names are longest.
+      */}
+      {isSource && (
+        <span style={{
+          color: port.kind === "tone" ? "#f59e0b" : "#6cf",
+          fontSize: 10,
+          textTransform: "uppercase",
+        }}>{port.kind}</span>
+      )}
+      {/*
+        Wraps rather than truncating, and that is not a cosmetic preference.
+        The label is "<hardware> (<direction>[ · low-latency])", and the
+        low-latency suffix is the *only* thing distinguishing the raw `hw:`
+        port from the `plughw:` one for the same device. Ellipsis fell exactly
+        there, so the two rows rendered as the same name — leaving the operator
+        to pick between two identical-looking ports, one of which resamples.
+        Same family of problem as the port order that used to shuffle: the UI
+        was hiding which device a row actually meant.
+      */}
       <span
-        title={port.alsa_name}
+        title={`${port.label}\n${port.alsa_name}`}
         style={{
-          overflow: "hidden",
-          textOverflow: "ellipsis",
-          whiteSpace: "nowrap",
           flex: 1,
+          minWidth: 0,
+          overflowWrap: "anywhere",
           textAlign: isSource ? "right" : "left",
         }}
       >

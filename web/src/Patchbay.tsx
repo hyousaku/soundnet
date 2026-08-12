@@ -19,11 +19,12 @@ import { summarizeLatency } from "./latency";
 
 const nodeTypes = { port: PortNode };
 
-// Horizontal spacing between node cards. Cards are 320px wide (see
+// Horizontal spacing between node cards. Cards are 420px wide (see
 // PortNode.tsx) — the gap needs to be wide enough for a route's edge label
 // ("48k · 2ch · 256f · roc 3.1+pb 2.0ms partial") to render without
-// overlapping the cards on either side.
-const NODE_SPACING_X = 560;
+// overlapping the cards on either side. This tracks the card width: widening
+// the card without widening this would quietly eat the edge label's room.
+const NODE_SPACING_X = 660;
 
 export default function Patchbay() {
   const nodes = useStore((s) => s.nodes);
