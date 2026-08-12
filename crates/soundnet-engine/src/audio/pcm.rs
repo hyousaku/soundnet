@@ -50,7 +50,7 @@ pub fn open(
     let pcm = alsa::PCM::new(alsa_name, dir, false)
         .with_context(|| format!("open {what} {alsa_name}"))?;
 
-    let format = {
+    let (format, buffer_frames) = {
         let hwp = alsa::pcm::HwParams::any(&pcm)?;
         hwp.set_access(alsa::pcm::Access::RWInterleaved)?;
         // Unlike channels/rate/period below, ALSA has no "_near" for format —
@@ -117,8 +117,47 @@ pub fn open(
         }
 
         pcm.hw_params(&hwp)?;
-        format
+        // Read back after applying: this is the size the driver settled on,
+        // not the one we asked for.
+        let buffer_frames = hwp.get_buffer_size()?;
+        (format, buffer_frames)
     };
+
+    // Applying hw params resets the software params to alsa-lib's defaults,
+    // so this has to come after, and it has to be said out loud.
+    //
+    // The default `start_threshold` is 1 — measured, not assumed. A playback
+    // stream therefore begins the instant the first frame is written, which
+    // means our very first period of 256 frames starts a device whose buffer
+    // holds 512. The hardware drains those 256 frames in 5.3 ms while the
+    // thread goes back around to fetch and write the next period, so the
+    // steady state runs the buffer half empty with *no* margin at all: any
+    // late wakeup underruns. Worse, `snd_pcm_recover` leaves the buffer empty
+    // again, so the restart reproduces the same shallow start and the next
+    // period underruns too. That is why the journal showed xruns in bursts of
+    // ten, spaced exactly one period apart, starting the moment a route
+    // opened — one hiccup was being amplified into a run of them.
+    //
+    // Starting only once the buffer is full gives the depth `set_periods(2)`
+    // was chosen for in the first place: one period playing while the other
+    // fills. It costs one period of playback latency compared to the
+    // accidental behaviour above — and that is the honest framing, because
+    // the lower figure was never a working configuration, just a permanently
+    // starving one. To get the number back, halve the period: 2 x 128 frames
+    // queues the same 5.3 ms as the old 1 x 256, with a real 2.7 ms of slack
+    // instead of none.
+    //
+    // Capture is deliberately untouched. `start_threshold` governs when a
+    // stream starts on its own, and the capture path starts explicitly via
+    // `ensure_capture_running`; there is no equivalent shallow-start problem
+    // when the device is the one producing.
+    if matches!(dir, alsa::Direction::Playback) {
+        let swp = pcm.sw_params_current()?;
+        swp.set_start_threshold(buffer_frames)
+            .with_context(|| format!("{alsa_name}: set start threshold"))?;
+        pcm.sw_params(&swp)
+            .with_context(|| format!("{alsa_name}: apply software params"))?;
+    }
 
     Ok((pcm, format))
 }

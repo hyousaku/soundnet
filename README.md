@@ -261,6 +261,23 @@ Back off:
 All parameters are editable per-route in the UI while audio is running — the
 worker restarts transparently.
 
+### Why the period size sets the playback floor
+
+The playback device is opened with two periods and does not start until both
+are full, so the ALSA side of a route holds `2 x frames_per_period` of audio:
+5.3 ms at period 128, 10.7 ms at period 256, and so on at 48 kHz. That is the
+floor beneath everything `target_latency_ms` controls, and halving the period
+is the only way to lower it.
+
+It also sets how late the audio thread may be before the device runs dry —
+one period, so 2.7 ms at period 128. Dropping to 64 or 32 buys latency by
+spending that margin, which is why those settings xrun first on a loaded Pi.
+
+(Until the buffer was made to start full, playback ran a period shallower
+than this and reported correspondingly lower figures. It was not a working
+configuration: with no margin at all, a single late wakeup produced a run of
+xruns rather than one.)
+
 ### Measuring it for real
 
 The `latency` column adds up what each engine can account for. It cannot see
