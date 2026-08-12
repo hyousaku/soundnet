@@ -98,7 +98,8 @@ pub async fn serve(state: Arc<EngineState>, addr: SocketAddr) -> Result<()> {
 pub async fn snapshot(state: &Arc<EngineState>) -> StateSnapshot {
     let self_node = state.self_node();
 
-    let local_ports: Vec<_> = state.local_ports.iter().map(|e| e.value().clone()).collect();
+    let mut local_ports: Vec<_> = state.local_ports.iter().map(|e| e.value().clone()).collect();
+    crate::audio::devices::sort_ports(&mut local_ports);
 
     let mut remote_ports = Vec::new();
     let mut nodes = vec![self_node.clone()];
@@ -106,6 +107,10 @@ pub async fn snapshot(state: &Arc<EngineState>) -> StateSnapshot {
         nodes.push(entry.node.clone());
         remote_ports.extend(entry.ports.iter().cloned());
     }
+    crate::audio::devices::sort_ports(&mut remote_ports);
+    // Nodes come out of a DashMap too, so the graph would otherwise lay new
+    // cards out in a different order each time it is opened.
+    nodes[1..].sort_by(|a, b| a.hostname.cmp(&b.hostname).then_with(|| a.id.cmp(&b.id)));
     let routes: Vec<_> = state.routes.iter().map(|e| e.value().clone()).collect();
     let manual_hosts = state.manual_hosts.read().await.clone();
     let interfaces = iface::list_interfaces();

@@ -100,6 +100,33 @@ pub fn refresh(state: &Arc<EngineState>) -> Result<()> {
     Ok(())
 }
 
+/// Put a port list in a stable, meaningful order.
+///
+/// `local_ports` is a `DashMap`, and a sharded hash map hands its entries back
+/// in whatever order the shards happen to be walked — a different one on every
+/// snapshot. That is not cosmetic. The browser draws one row per port and
+/// React Flow anchors each connection point to where its row landed, so an
+/// unordered list makes the patch points move on every state update: the
+/// operator reads the list, aims at a row, and by the time the drag ends the
+/// list has reshuffled underneath and the wire lands on a different device.
+///
+/// Sorted by kind (sources above outputs, matching how the card is drawn),
+/// then by device name, which keeps a card's `hw:` and `plughw:` entries
+/// adjacent.
+pub fn sort_ports(ports: &mut [LocalPort]) {
+    ports.sort_by(|a, b| {
+        let rank = |k: &PortKind| match k {
+            PortKind::Capture => 0,
+            PortKind::Tone => 1,
+            PortKind::Playback => 2,
+        };
+        rank(&a.kind)
+            .cmp(&rank(&b.kind))
+            .then_with(|| a.alsa_name.cmp(&b.alsa_name))
+            .then_with(|| a.id.cmp(&b.id))
+    });
+}
+
 fn add_port(
     state: &Arc<EngineState>,
     alsa_name: &str,
@@ -207,4 +234,47 @@ fn probe(alsa_name: &str, dir: alsa::Direction) -> Probe {
     }
 
     Probe { max_channels, formats, rates, failed: false }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn port(id: &str, alsa_name: &str, kind: PortKind) -> LocalPort {
+        LocalPort {
+            node_id: "n".into(),
+            id: id.into(),
+            kind,
+            alsa_name: alsa_name.into(),
+            label: String::new(),
+            max_channels: 2,
+            probe_failed: false,
+            supported_formats: vec![],
+            supported_rates: vec![],
+        }
+    }
+
+    #[test]
+    fn sort_is_stable_regardless_of_input_order() {
+        let make = || {
+            vec![
+                port("c", "plughw:1,0", PortKind::Playback),
+                port("a", "hw:0,0", PortKind::Capture),
+                port("t", "tone:440", PortKind::Tone),
+                port("b", "hw:1,0", PortKind::Capture),
+            ]
+        };
+        let mut forward = make();
+        sort_ports(&mut forward);
+        let mut reversed = make();
+        reversed.reverse();
+        sort_ports(&mut reversed);
+
+        let ids = |v: &[LocalPort]| v.iter().map(|p| p.id.clone()).collect::<Vec<_>>();
+        assert_eq!(ids(&forward), ids(&reversed), "order must not depend on input order");
+        // Sources first, tones after them, outputs last — the order the node
+        // card draws, so a row's position (and therefore its patch point)
+        // stays put across snapshots.
+        assert_eq!(ids(&forward), vec!["a", "b", "t", "c"]);
+    }
 }

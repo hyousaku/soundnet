@@ -14,8 +14,13 @@ export type PortRFNode = RFNode<PortNodeData, "port">;
 /// Playback rows expose a target handle on the left.
 export default function PortNode({ data }: NodeProps<PortRFNode>) {
   const { node, ports } = data;
-  const capturePorts = ports.filter((p) => p.kind !== "playback");
-  const playbackPorts = ports.filter((p) => p.kind === "playback");
+  // Sorted here as well as in the engine, because a port list can also arrive
+  // via node_appeared without passing through snapshot(). A row's position is
+  // where React Flow anchors its connection point, so an order that varies
+  // between updates moves the patch points out from under the pointer.
+  const sorted = [...ports].sort((a, b) => a.alsa_name.localeCompare(b.alsa_name));
+  const capturePorts = sorted.filter((p) => p.kind !== "playback");
+  const playbackPorts = sorted.filter((p) => p.kind === "playback");
 
   return (
     <div style={{

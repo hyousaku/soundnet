@@ -324,7 +324,8 @@ pub async fn remove_manual(state: &Arc<EngineState>, addr: &str, port: u16) {
 /// the next time mDNS resolves us fresh on its end).
 pub fn push_ports_to_peers(state: &Arc<EngineState>) {
     let self_node = state.self_node();
-    let ports: Vec<LocalPort> = state.local_ports.iter().map(|e| e.value().clone()).collect();
+    let mut ports: Vec<LocalPort> = state.local_ports.iter().map(|e| e.value().clone()).collect();
+    crate::audio::devices::sort_ports(&mut ports);
     let targets: Vec<(String, u16)> = state
         .peers
         .iter()
