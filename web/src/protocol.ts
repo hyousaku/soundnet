@@ -74,7 +74,12 @@ export type RouteHealth =
 export interface StreamStats {
   xruns: number;
   jitter_ms: number;
-  level_db: number;
+  /** Peak dBFS of what this engine captured; null when it holds no capture
+   *  side of the route. null and -120 are different: -120 is silence. */
+  capture_level_db: number | null;
+  /** Peak dBFS of what this engine played out; null when it holds no
+   *  playback side. */
+  playback_level_db: number | null;
   health: RouteHealth;
   roc_e2e_ms: number | null;
   capture_buffer_ms: number | null;

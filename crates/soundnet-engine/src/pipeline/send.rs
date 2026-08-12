@@ -50,13 +50,15 @@
 use anyhow::{bail, Result};
 use soundnet_protocol::{StreamSpec, UNKNOWN_FORMAT};
 use std::net::IpAddr;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 
 use crate::audio::format::alsa_to_f32;
 use crate::audio::{pcm, window};
-use crate::pipeline::{DEVICE_WAIT_TIMEOUT_MS, MAX_CONSECUTIVE_ERRORS, STALL_WARN_AFTER};
+use crate::pipeline::{
+    publish_level, DEVICE_WAIT_TIMEOUT_MS, MAX_CONSECUTIVE_ERRORS, STALL_WARN_AFTER,
+};
 use crate::tone;
 use crate::transport::{sender, RocContext};
 
@@ -76,6 +78,14 @@ pub struct SendHandle {
     /// open, and for the whole life of a tone source — there is no device to
     /// negotiate with, so there is no format to report.
     pub format: Arc<AtomicU8>,
+    /// Bits of an f32 holding the rolling peak of what this pipeline put on
+    /// the wire. Read via `f32::from_bits(atomic.load(...))`.
+    ///
+    /// Measured after the channel window is extracted, so it reflects the
+    /// channels this route actually carries rather than everything the device
+    /// handed over — a 16-channel interface streaming channels 5-6 should not
+    /// show a meter driven by channel 1.
+    pub level_bits: Arc<AtomicU32>,
     /// Monotonic count of recovered capture xruns. An overrun means the
     /// device had a period ready before we came back for it, so those
     /// samples are simply gone — an audible click, and for a long time one
@@ -139,12 +149,14 @@ pub fn spawn(
     channel_offset: u8,
 ) -> Result<SendHandle> {
     let stop = Arc::new(AtomicBool::new(false));
+    let level_bits = Arc::new(AtomicU32::new(0));
     let buffer_ns = Arc::new(AtomicU64::new(u64::MAX));
     let format = Arc::new(AtomicU8::new(UNKNOWN_FORMAT));
     let xruns = Arc::new(AtomicUsize::new(0));
     let last_error: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
 
     let stop_worker = stop.clone();
+    let level_worker = level_bits.clone();
     let buffer_worker = buffer_ns.clone();
     let format_worker = format.clone();
     let xruns_worker = xruns.clone();
@@ -166,6 +178,7 @@ pub fn spawn(
                     dst_port,
                     outgoing,
                     &stop_worker,
+                    &level_worker,
                 ),
                 None => alsa_loop(
                     &alsa_name,
@@ -175,6 +188,7 @@ pub fn spawn(
                     dst_port,
                     outgoing,
                     &stop_worker,
+                    &level_worker,
                     &buffer_worker,
                     &format_worker,
                     &xruns_worker,
@@ -194,11 +208,24 @@ pub fn spawn(
     Ok(SendHandle {
         stop,
         thread,
+        level_bits,
         buffer_ns,
         format,
         xruns,
         last_error,
     })
+}
+
+/// Largest absolute sample in a period.
+///
+/// Deliberately not also counting samples past full scale the way the playback
+/// side does: what arrives here has already been through the interface's
+/// converter, so anything clipped was clipped in hardware before this engine
+/// saw it, and a counter here would name SoundNet as the culprit for something
+/// it cannot see and did not do. How close the signal runs to the rails is the
+/// part we can report honestly, and that is what the meter shows.
+fn peak_of(samples: &[f32]) -> f32 {
+    samples.iter().fold(0.0_f32, |acc, s| acc.max(s.abs()))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -210,6 +237,7 @@ fn alsa_loop(
     dst_port: u16,
     outgoing: Option<IpAddr>,
     stop: &Arc<AtomicBool>,
+    level_bits: &Arc<AtomicU32>,
     buffer_ns: &Arc<AtomicU64>,
     format_out: &Arc<AtomicU8>,
     xruns: &Arc<AtomicUsize>,
@@ -331,6 +359,7 @@ fn alsa_loop(
             channels,
             &mut floats,
         );
+        publish_level(level_bits, peak_of(&floats));
 
         if let Err(err) = sender.write(&mut floats) {
             consecutive_errors += 1;
@@ -368,6 +397,7 @@ fn tone_loop(
     dst_port: u16,
     outgoing: Option<IpAddr>,
     stop: &Arc<AtomicBool>,
+    level_bits: &Arc<AtomicU32>,
 ) -> Result<()> {
     let mut sender = sender::open(ctx, dst_host, dst_port, spec, outgoing)?;
 
@@ -388,6 +418,7 @@ fn tone_loop(
             &mut phase,
             &mut buf,
         );
+        publish_level(level_bits, peak_of(&buf));
         if let Err(err) = sender.write(&mut buf) {
             consecutive_errors += 1;
             if consecutive_errors >= MAX_CONSECUTIVE_ERRORS {

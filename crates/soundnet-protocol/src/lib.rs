@@ -201,7 +201,26 @@ pub struct StreamStats {
     /// reporting a clean zero.
     pub xruns: u32,
     pub jitter_ms: f32,
-    pub level_db: f32,
+    /// Peak level, in dBFS, of what this engine captured and put on the wire.
+    ///
+    /// Split from the playback level rather than sharing one field, for the
+    /// same reason `capture_format` and `capture_xruns` are split: a browser
+    /// is connected to exactly one engine, and that engine only holds one end
+    /// of most routes. A single `level_db` meant the meter was alive only when
+    /// the engine you happened to have open owned the *playback* side — so
+    /// standing at the machine with the microphone plugged into it, the one
+    /// place you most want to see whether signal is arriving, the meter read
+    /// silent.
+    ///
+    /// `None` means this engine has no capture side for this route, and must
+    /// be drawn as "no data" rather than as a meter at the bottom of its
+    /// range. -120 dB is a real reading — it means silence — and the two are
+    /// not the same thing.
+    pub capture_level_db: Option<f32>,
+    /// Peak level, in dBFS, of what this engine received and played out.
+    /// `None` when this engine holds no playback side — see
+    /// `capture_level_db`.
+    pub playback_level_db: Option<f32>,
     pub health: RouteHealth,
     /// Roc's own end-to-end latency (frame written by the sender's
     /// `roc_sender_write` → frame read by the receiver's `roc_receiver_read`),

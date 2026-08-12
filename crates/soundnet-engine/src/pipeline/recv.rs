@@ -46,7 +46,9 @@ use std::thread::{self, JoinHandle};
 
 use crate::audio::format::f32_to_alsa;
 use crate::audio::{pcm, window};
-use crate::pipeline::{DEVICE_WAIT_TIMEOUT_MS, MAX_CONSECUTIVE_ERRORS, STALL_WARN_AFTER};
+use crate::pipeline::{
+    publish_level, DEVICE_WAIT_TIMEOUT_MS, MAX_CONSECUTIVE_ERRORS, STALL_WARN_AFTER,
+};
 use crate::transport::{receiver, RocContext};
 
 pub struct RecvHandle {
@@ -254,13 +256,7 @@ fn run(
         if over > 0 {
             w.clipped.fetch_add(over, Ordering::Relaxed);
         }
-        let prev = f32::from_bits(w.level_bits.load(Ordering::Relaxed));
-        let smoothed = if peak > prev {
-            peak
-        } else {
-            prev * 0.7 + peak * 0.3
-        };
-        w.level_bits.store(smoothed.to_bits(), Ordering::Relaxed);
+        publish_level(&w.level_bits, peak);
 
         window::scatter(
             &floats,

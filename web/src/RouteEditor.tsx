@@ -65,7 +65,7 @@ export default function RouteEditor() {
             <th>Period</th>
             <th>Latency</th>
             <th>FEC</th>
-            <th>Level</th>
+            <th title="Peak level in and out, as measured by THIS engine. A route's two ends usually live on two machines, and each engine can only meter the half it holds — so a dash means &quot;not mine to measure&quot;, not silence. Open the other machine's UI to see its half.">Level</th>
             <th title="Latency this engine can actually account for — see the cell tooltips for what's missing on a partial figure.">
               latency
             </th>
@@ -154,8 +154,9 @@ export default function RouteEditor() {
                   onChange={(e) => update(send, r.id, r.spec, { fec: e.target.checked })}
                 />
               </td>
-              <td style={{ width: 100 }}>
-                <LevelMeter db={stats[r.id]?.level_db ?? -120} />
+              <td style={{ width: 110 }}>
+                <LevelMeter label="in" db={stats[r.id]?.capture_level_db ?? null} />
+                <LevelMeter label="out" db={stats[r.id]?.playback_level_db ?? null} />
               </td>
               <td>
                 {(() => {
@@ -300,21 +301,61 @@ function xrunBreakdown(stats?: StreamStats): string {
   return parts.join(", ");
 }
 
-function LevelMeter({ db }: { db: number }) {
+/// One direction's meter. `db === null` means this engine does not hold that
+/// end of the route, which is drawn as a dash rather than as a bar at the
+/// bottom of its travel — a meter reading empty is a claim about the audio,
+/// and we would be making it about a signal we never saw. For most routes one
+/// of the two is null, because the two ends are on different machines and a
+/// browser is connected to one engine.
+function LevelMeter({ label, db }: { label: string; db: number | null }) {
+  const track: React.CSSProperties = {
+    background: "#0b0d10",
+    height: 8,
+    borderRadius: 2,
+    overflow: "hidden",
+    flex: 1,
+  };
+  const tag = (
+    <span style={{ color: "#8a94a5", fontSize: 9, width: 20, flexShrink: 0 }}>{label}</span>
+  );
+  if (db === null) {
+    // A dashed outline rather than a dimmed empty bar: an empty bar is what a
+    // real meter looks like when the audio is silent, and these two states
+    // must not be able to be confused. The outline keeps the row aligned with
+    // the direction that does have a reading.
+    return (
+      <div style={{ display: "flex", alignItems: "center", gap: 4, marginBottom: 2 }}>
+        {tag}
+        <div
+          title={`This engine holds no ${label === "in" ? "capture" : "playback"} side of this route, so it has nothing to meter. Open the other machine's UI for that half.`}
+          style={{
+            height: 8,
+            flex: 1,
+            border: "1px dashed #333b47",
+            borderRadius: 2,
+            boxSizing: "border-box",
+          }}
+        />
+      </div>
+    );
+  }
   // Map [-60, 0] dB → [0, 1].
   const clamped = Math.max(-60, Math.min(0, db));
   const norm = (clamped + 60) / 60;
   const color = db > -3 ? "#ef5350" : db > -12 ? "#f59e0b" : "#4ade80";
   return (
-    <div style={{ background: "#0b0d10", height: 10, borderRadius: 2, overflow: "hidden" }}>
-      <div
-        style={{
-          width: `${norm * 100}%`,
-          height: "100%",
-          background: color,
-          transition: "width 100ms linear",
-        }}
-      />
+    <div style={{ display: "flex", alignItems: "center", gap: 4, marginBottom: 2 }}>
+      {tag}
+      <div style={track} title={`${db.toFixed(1)} dBFS`}>
+        <div
+          style={{
+            width: `${norm * 100}%`,
+            height: "100%",
+            background: color,
+            transition: "width 100ms linear",
+          }}
+        />
+      </div>
     </div>
   );
 }

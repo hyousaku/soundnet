@@ -33,7 +33,14 @@ pub struct RunningRoute {
     pub send: Option<send::SendHandle>,
     /// Set when this engine is the route's destination (network -> playback).
     pub recv: Option<recv::RecvHandle>,
-    pub level_bits: Option<Arc<AtomicU32>>,
+    /// Peak level of what this engine put on the wire, set only when it
+    /// holds the route's capture (or tone) side.
+    pub cap_level_bits: Option<Arc<AtomicU32>>,
+    /// Peak level of what this engine played out, set only when it holds the
+    /// route's playback side. Kept separate from the capture level for the
+    /// reason spelled out on `StreamStats::capture_level_db`: a browser sees
+    /// one engine, and one engine usually holds one end.
+    pub pb_level_bits: Option<Arc<AtomicU32>>,
     pub xruns: Option<Arc<AtomicUsize>>,
     pub e2e_ns: Option<Arc<AtomicU64>>,
     pub jitter_ns: Option<Arc<AtomicU64>>,
@@ -358,7 +365,8 @@ async fn try_start_inner(state: &Arc<EngineState>, route: &Route) -> Result<Opti
     let mut running = RunningRoute {
         send: None,
         recv: None,
-        level_bits: None,
+        cap_level_bits: None,
+        pb_level_bits: None,
         xruns: None,
         e2e_ns: None,
         jitter_ns: None,
@@ -407,6 +415,7 @@ async fn try_start_inner(state: &Arc<EngineState>, route: &Route) -> Result<Opti
             outgoing,
             route.src.channel_offset,
         )?;
+        running.cap_level_bits = Some(pipeline.level_bits.clone());
         running.cap_buffer_ns = Some(pipeline.buffer_ns.clone());
         running.cap_format = Some(pipeline.format.clone());
         running.cap_xruns = Some(pipeline.xruns.clone());
@@ -429,7 +438,7 @@ async fn try_start_inner(state: &Arc<EngineState>, route: &Route) -> Result<Opti
             bind_port,
             route.dst.channel_offset,
         )?;
-        running.level_bits = Some(pipeline.level_bits.clone());
+        running.pb_level_bits = Some(pipeline.level_bits.clone());
         running.xruns = Some(pipeline.xruns.clone());
         running.e2e_ns = Some(pipeline.e2e_ns.clone());
         running.jitter_ns = Some(pipeline.jitter_ns.clone());
@@ -641,11 +650,19 @@ pub fn spawn_stats_pump(state: Arc<EngineState>) {
             for entry in state.running.iter() {
                 let route_id = entry.key().clone();
                 let running = entry.value();
-                let level = running
-                    .level_bits
-                    .as_ref()
-                    .map(|b| f32::from_bits(b.load(Ordering::Relaxed)))
-                    .unwrap_or(0.0);
+                // `None` means "this engine holds no such side", which the UI
+                // must not draw as a meter pinned at the bottom — see the doc
+                // on `StreamStats::capture_level_db`.
+                let level_db = |slot: &Option<Arc<AtomicU32>>| -> Option<f32> {
+                    let peak = f32::from_bits(slot.as_ref()?.load(Ordering::Relaxed));
+                    Some(if peak > 0.0 {
+                        20.0 * peak.log10()
+                    } else {
+                        -120.0
+                    })
+                };
+                let capture_level_db = level_db(&running.cap_level_bits);
+                let playback_level_db = level_db(&running.pb_level_bits);
                 // Both directions, because a route can glitch on either and
                 // for a long time only the playback side was counted — a
                 // route dropping capture periods reported a clean zero.
@@ -695,11 +712,8 @@ pub fn spawn_stats_pump(state: Arc<EngineState>) {
                 let stats = StreamStats {
                     xruns,
                     jitter_ms,
-                    level_db: if level > 0.0 {
-                        20.0 * level.log10()
-                    } else {
-                        -120.0
-                    },
+                    capture_level_db,
+                    playback_level_db,
                     health,
                     roc_e2e_ms,
                     capture_buffer_ms,
@@ -726,7 +740,8 @@ pub fn spawn_stats_pump(state: Arc<EngineState>) {
                     StreamStats {
                         xruns: 0,
                         jitter_ms: 0.0,
-                        level_db: -120.0,
+                        capture_level_db: None,
+                        playback_level_db: None,
                         health: entry.value().to_health(),
                         roc_e2e_ms: None,
                         capture_buffer_ms: None,
@@ -939,7 +954,8 @@ mod tests {
         RunningRoute {
             send: None,
             recv: None,
-            level_bits: None,
+            cap_level_bits: None,
+            pb_level_bits: None,
             xruns: None,
             e2e_ns: None,
             jitter_ns: None,
@@ -956,7 +972,8 @@ mod tests {
         StreamStats {
             xruns: 7,
             jitter_ms: 0.0,
-            level_db: -120.0,
+            capture_level_db: None,
+            playback_level_db: None,
             health: RouteHealth::Ok,
             roc_e2e_ms: None,
             capture_buffer_ms: None,

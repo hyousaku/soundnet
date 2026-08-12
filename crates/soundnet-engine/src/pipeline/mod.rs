@@ -9,6 +9,29 @@
 pub mod recv;
 pub mod send;
 
+use std::sync::atomic::{AtomicU32, Ordering};
+
+/// Fold this period's peak into the rolling level the UI draws.
+///
+/// Rises instantly and falls slowly: a meter that tracked the raw per-period
+/// peak would flicker to the floor between syllables and be unreadable, while
+/// one that only rose would never come back down. Both pipelines publish
+/// through here so the two ends of a route decay at the same rate — a meter
+/// that behaved differently depending on which engine's UI you had open would
+/// be worse than no meter.
+///
+/// Stored as the bits of an f32 in an `AtomicU32`: the audio thread must not
+/// take a lock, and there is no atomic float.
+pub fn publish_level(level_bits: &AtomicU32, peak: f32) {
+    let prev = f32::from_bits(level_bits.load(Ordering::Relaxed));
+    let smoothed = if peak > prev {
+        peak
+    } else {
+        prev * 0.7 + peak * 0.3
+    };
+    level_bits.store(smoothed.to_bits(), Ordering::Relaxed);
+}
+
 /// How many consecutive failing iterations a pipeline tolerates before it
 /// gives up and lets the route supervisor restart it with backoff.
 ///
