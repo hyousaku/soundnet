@@ -14,15 +14,47 @@ pub fn to_alsa_format(fmt: SampleFormat) -> alsa::pcm::Format {
     }
 }
 
-/// Fallback order to try when a device rejects the format a route asked
-/// for. Mirrors `devices::CANDIDATE_FORMATS` — the same four formats we
-/// already probe for when enumerating ports — so runtime substitution never
-/// picks a format the UI wouldn't also have listed as supported.
+/// Fallback order to try when a device rejects the format a route asked for.
+///
+/// Ordered by how much of the signal survives, because a substitution the
+/// operator did not ask for should not also be a downgrade they cannot see.
+/// The wire is always f32, so every entry here is a lossless carrier of what
+/// we have except the last one.
+///
+/// **S16 is last, and that is the whole point of this ordering.** It used to
+/// sit second, which meant a route asking for 24-bit on a device that offers
+/// S16_LE and S32_LE — an extremely ordinary pair — was quietly opened at 16
+/// bits, throwing away eight bits while a container that would have held all
+/// 24 was sitting right there in the list. The log said
+/// "requested format S24Le3 unsupported, using S16Le instead", which is true
+/// and completely fails to convey that a better answer was available.
+///
+/// Note what a 24-bit interface usually offers. ALSA has three separate
+/// formats for 24-bit audio and hardware rarely offers all of them:
+/// `S24_3LE` packs 24 bits into 3 bytes (common on USB with 3-byte
+/// subslots), `S32_LE` carries them left-justified in a 32-bit word with the
+/// low 8 ignored (common everywhere else, and *not* a sign that the device is
+/// only doing 16 or 32 bit work), and `S24_LE` right-justifies them in 4
+/// bytes — that third one is not in this list or in
+/// `devices::CANDIDATE_FORMATS`, so a device offering only `S24_LE` still
+/// looks 24-bit-incapable to this engine.
+///
+/// This is the same *set* as `devices::CANDIDATE_FORMATS`, which is what the
+/// UI lists as a port's supported formats — so substitution can never land on
+/// something the UI said the port could not do. Only the order differs:
+/// probing wants the likeliest native format first, substituting wants the
+/// least destructive one.
 const FALLBACK_FORMATS: &[SampleFormat] = &[
+    // The likeliest exact match for a 24-bit device, and no loss for anything
+    // else in the list.
     SampleFormat::S24Le3,
-    SampleFormat::S16Le,
+    // 32-bit container: holds everything f32 can represent.
     SampleFormat::S32Le,
+    // Exactly what the wire carries, so no conversion at all — but rarely
+    // offered by raw `hw:` devices, hence not first.
     SampleFormat::F32Le,
+    // Genuinely lossy. Only when the device will take nothing else.
+    SampleFormat::S16Le,
 ];
 
 /// Pick the ALSA format to actually open a device with. `requested` is what
@@ -165,6 +197,94 @@ mod tests {
     fn pick_format_fails_when_nothing_matches() {
         let chosen = pick_format(SampleFormat::S16Le, |_| false);
         assert_eq!(chosen, None);
+    }
+
+    /// The case this ordering exists for. A 24-bit interface that exposes
+    /// S16_LE and S32_LE but not S24_3LE is completely ordinary, and the old
+    /// order handed it 16 bits.
+    #[test]
+    fn a_24_bit_request_prefers_a_wider_container_over_16_bit() {
+        let chosen = pick_format(SampleFormat::S24Le3, |f| {
+            matches!(f, SampleFormat::S16Le | SampleFormat::S32Le)
+        });
+        assert_eq!(
+            chosen,
+            Some(SampleFormat::S32Le),
+            "asked for 24 bits and a 32-bit container was on offer; dropping to \
+             16 discards resolution the device was willing to carry"
+        );
+    }
+
+    /// The invariant behind the ordering, checked over every combination
+    /// rather than the one case above: substituting *down* to 16 bits is only
+    /// ever allowed when the device will accept nothing else.
+    #[test]
+    fn s16_is_only_substituted_when_nothing_else_works() {
+        let all = all_formats();
+        for &requested in &all {
+            for mask in 0..(1u8 << all.len()) {
+                let offered: Vec<SampleFormat> = all
+                    .iter()
+                    .copied()
+                    .enumerate()
+                    .filter(|(i, _)| mask & (1 << i) != 0)
+                    .map(|(_, f)| f)
+                    .collect();
+                let chosen = pick_format(requested, |f| offered.contains(&f));
+                if chosen == Some(SampleFormat::S16Le) && requested != SampleFormat::S16Le {
+                    assert_eq!(
+                        offered,
+                        vec![SampleFormat::S16Le],
+                        "requested {requested:?}, device offered {offered:?}, and S16 was \
+                         chosen anyway"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A format the engine can convert but never substitutes in is a format
+    /// that silently does not exist for anyone whose device only offers that
+    /// one. `all_formats` fails to compile when a variant is added, so this
+    /// catches the omission at the moment it is introduced rather than on the
+    /// first machine that needs it.
+    #[test]
+    fn every_sample_format_is_available_as_a_substitute() {
+        let all = all_formats();
+        assert_eq!(
+            FALLBACK_FORMATS.len(),
+            all.len(),
+            "FALLBACK_FORMATS has drifted from the set of formats that exist"
+        );
+        for f in all {
+            assert!(
+                FALLBACK_FORMATS.contains(&f),
+                "{f:?} can be converted but would never be substituted in"
+            );
+        }
+    }
+
+    /// Every `SampleFormat`. The `match` is not decoration: it has no `_` arm,
+    /// so adding a variant to the enum stops this compiling until the new one
+    /// is listed here too — and then `every_sample_format_is_available_as_a_
+    /// substitute` immediately fails until it is wired into the fallback list
+    /// as well.
+    fn all_formats() -> Vec<SampleFormat> {
+        let all = vec![
+            SampleFormat::S16Le,
+            SampleFormat::S24Le3,
+            SampleFormat::S32Le,
+            SampleFormat::F32Le,
+        ];
+        for f in &all {
+            match f {
+                SampleFormat::S16Le
+                | SampleFormat::S24Le3
+                | SampleFormat::S32Le
+                | SampleFormat::F32Le => {}
+            }
+        }
+        all
     }
 
     #[test]
