@@ -85,6 +85,21 @@ pub struct SendHandle {
     /// the thread unwinds. Without it the UI can only say that a worker
     /// exited — which names the symptom and withholds every fact that would
     /// let an operator act on it.
+    ///
+    /// Every access to this mutex ignores poisoning (`unwrap_or_else(|e|
+    /// e.into_inner())`), reader and writer alike. Poisoning means some
+    /// thread panicked while holding the lock, and the usual reason to
+    /// respect that — the data behind it may be half-updated — cannot apply
+    /// here: the guard is only ever held across a single move of a `String`
+    /// that is either stored whole or not at all. There is no torn state to
+    /// protect anyone from.
+    ///
+    /// Panicking on it would be actively harmful. This field exists to
+    /// explain a failure, and it is written from the error path of a thread
+    /// that is already on its way out; `unwrap()` there would replace a
+    /// precise message like "device busy" with a second panic about a mutex,
+    /// which is the one moment an operator can least afford to lose the
+    /// first one.
     pub last_error: Arc<Mutex<Option<String>>>,
 }
 
@@ -170,7 +185,9 @@ pub fn spawn(
                 tracing::error!(
                     "send pipeline {alsa_name} -> {dst_host}:{dst_port} failed: {err:#}"
                 );
-                *error_worker.lock().unwrap() = Some(format!("{err:#}"));
+                // Poisoning ignored on purpose — see the doc on
+                // `SendHandle::last_error`.
+                *error_worker.lock().unwrap_or_else(|e| e.into_inner()) = Some(format!("{err:#}"));
             }
         })?;
 

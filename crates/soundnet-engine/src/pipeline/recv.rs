@@ -147,7 +147,9 @@ pub fn spawn(
                 tracing::error!(
                     "recv pipeline {bind_host}:{bind_port} -> {alsa_name} failed: {err:#}"
                 );
-                *error_worker.lock().unwrap() = Some(format!("{err:#}"));
+                // Poisoning ignored on purpose — see the doc on
+                // `SendHandle::last_error`.
+                *error_worker.lock().unwrap_or_else(|e| e.into_inner()) = Some(format!("{err:#}"));
             }
         })?;
 

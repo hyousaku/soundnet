@@ -83,7 +83,14 @@ impl RunningRoute {
     /// go read the journal to find out which. The thread already knows.
     fn failure_reason(&self) -> String {
         let from = |slot: &Option<Arc<std::sync::Mutex<Option<String>>>>| -> Option<String> {
-            slot.as_ref()?.lock().ok()?.clone()
+            // `ok()?` here would have thrown the reason away exactly when a
+            // thread had panicked — turning the most interesting failure into
+            // "stopped without reporting an error". Same reasoning as the
+            // writers: see the doc on `SendHandle::last_error`.
+            slot.as_ref()?
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone()
         };
         let send = from(&self.send.as_ref().map(|s| s.last_error.clone()));
         let recv = from(&self.recv.as_ref().map(|r| r.last_error.clone()));
