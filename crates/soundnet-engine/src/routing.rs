@@ -833,8 +833,287 @@ fn join_running(running: RunningRoute) {
 
 #[cfg(test)]
 mod tests {
-    use super::{backoff_for_attempts, route_port};
+    use super::{
+        apply_route, backoff_for_attempts, record_failure, remove_route, retry_pending_for_peer,
+        route_port, validate_route, RunningRoute,
+    };
+    use crate::state::{EngineIdentity, EngineState};
+    use soundnet_protocol::{
+        Encoding, LocalPort, PortKind, PortRef, Route, RouteHealth, SampleFormat, StreamSpec,
+        StreamStats,
+    };
+    use std::net::{IpAddr, Ipv4Addr};
+    use std::sync::Arc;
     use std::time::Duration;
+
+    // ---- fixtures ---------------------------------------------------
+    //
+    // Everything below runs with no sound card, no peer and no libroc, and
+    // that is not a compromise — it is a property of the code under test.
+    // `EngineState::new` allocates maps and a broadcast channel and nothing
+    // else, and `try_start_inner` looks up the local port and the destination
+    // peer *before* it asks for a roc context. So a route whose port or peer
+    // is unknown exercises the whole failure-and-backoff path and stops short
+    // of the one dependency a test machine cannot have.
+    //
+    // If a later change moves `roc_context()` above those lookups, these
+    // tests will start trying to open a real roc context, and this comment is
+    // the explanation of why they suddenly need a library.
+
+    const SELF_ID: &str = "self-node";
+    const PEER_A: &str = "peer-a";
+    const PEER_B: &str = "peer-b";
+
+    fn engine() -> Arc<EngineState> {
+        EngineState::new(EngineIdentity {
+            node_id: SELF_ID.to_string(),
+            hostname: "test-host".to_string(),
+            addr: std::sync::RwLock::new(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+            control_port: 7788,
+            audio_port: 10_001,
+            version: "test".to_string(),
+        })
+    }
+
+    fn spec() -> StreamSpec {
+        StreamSpec {
+            encoding: Encoding::Pcm,
+            rate: 48_000,
+            channels: 2,
+            frames_per_period: 128,
+            alsa_format: SampleFormat::S16Le,
+            target_latency_ms: 10,
+            fec: false,
+        }
+    }
+
+    fn port_ref(node: &str, port: &str) -> PortRef {
+        PortRef {
+            node_id: node.to_string(),
+            port_id: port.to_string(),
+            channel_offset: 0,
+        }
+    }
+
+    fn route(id: &str, src: (&str, &str), dst: (&str, &str)) -> Route {
+        Route {
+            id: id.to_string(),
+            src: port_ref(src.0, src.1),
+            dst: port_ref(dst.0, dst.1),
+            spec: spec(),
+        }
+    }
+
+    /// A route between two *other* peers. This engine has no role in it, so
+    /// `try_start` returns without touching a device — which leaves the
+    /// bookkeeping in `apply_route`/`remove_route` as the only thing the test
+    /// is observing.
+    fn foreign_route(id: &str) -> Route {
+        route(id, (PEER_A, "out"), (PEER_B, "in"))
+    }
+
+    fn local_port(id: &str, kind: PortKind) -> LocalPort {
+        LocalPort {
+            node_id: SELF_ID.to_string(),
+            id: id.to_string(),
+            kind,
+            alsa_name: format!("hw:{id}"),
+            label: id.to_string(),
+            max_channels: 2,
+            probe_failed: false,
+            supported_formats: vec![SampleFormat::S16Le],
+            supported_rates: vec![48_000],
+        }
+    }
+
+    /// A `RunningRoute` with no threads behind it, standing in for a live
+    /// pipeline.
+    ///
+    /// Every field is optional, so this costs nothing to build: `is_dead()`
+    /// reads `false` for it and `shutdown_running` finds nothing to join.
+    /// What the tests watch is whether the state machine *removed the entry*
+    /// at the right moment — the part that has gone wrong before. Whether a
+    /// thread actually stopped is the subject of the teardown work, and is
+    /// not something a unit test can honestly claim to have checked.
+    fn idle_running() -> RunningRoute {
+        RunningRoute {
+            send: None,
+            recv: None,
+            level_bits: None,
+            xruns: None,
+            e2e_ns: None,
+            jitter_ns: None,
+            cap_buffer_ns: None,
+            pb_buffer_ns: None,
+            cap_format: None,
+            pb_format: None,
+            cap_xruns: None,
+            clipped: None,
+        }
+    }
+
+    fn stats_sentinel() -> StreamStats {
+        StreamStats {
+            xruns: 7,
+            jitter_ms: 0.0,
+            level_db: -120.0,
+            health: RouteHealth::Ok,
+            roc_e2e_ms: None,
+            capture_buffer_ms: None,
+            playback_buffer_ms: None,
+            capture_format: None,
+            playback_format: None,
+            capture_xruns: None,
+            playback_xruns: None,
+            clipped_samples: None,
+        }
+    }
+
+    // ---- the state machine ------------------------------------------
+
+    /// Ports have a direction, and a route that ignores it would open a
+    /// playback device for reading — an error from ALSA much later, with
+    /// nothing pointing back at the patch that caused it.
+    #[test]
+    fn a_route_cannot_run_backwards_through_a_local_port() {
+        let state = engine();
+        state
+            .local_ports
+            .insert("out".to_string(), local_port("out", PortKind::Playback));
+        state
+            .local_ports
+            .insert("in".to_string(), local_port("in", PortKind::Capture));
+        state
+            .local_ports
+            .insert("tone".to_string(), local_port("tone", PortKind::Tone));
+
+        let err = validate_route(&state, &route("r", (SELF_ID, "out"), (PEER_A, "x")))
+            .expect_err("a Playback port must not be accepted as a source");
+        assert!(
+            format!("{err:#}").contains("Playback"),
+            "the error should name the problem, got: {err:#}"
+        );
+
+        let err = validate_route(&state, &route("r", (PEER_A, "x"), (SELF_ID, "in")))
+            .expect_err("a Capture port must not be accepted as a destination");
+        assert!(
+            format!("{err:#}").contains("Playback"),
+            "the error should say what a destination has to be, got: {err:#}"
+        );
+
+        // The directions that do make sense, including a tone as a source.
+        validate_route(&state, &route("r", (SELF_ID, "in"), (SELF_ID, "out"))).unwrap();
+        validate_route(&state, &route("r", (SELF_ID, "tone"), (SELF_ID, "out"))).unwrap();
+        // A port on a peer is that peer's business to validate; we only know
+        // its id here, so this must not be rejected locally.
+        validate_route(
+            &state,
+            &route("r", (PEER_A, "anything"), (PEER_B, "anything")),
+        )
+        .unwrap();
+    }
+
+    /// Re-sending a route the engine already has must not touch the workers.
+    ///
+    /// The UI re-posts whole routes for edits that change nothing about the
+    /// stream — the channel-offset control sends the entire route back, and
+    /// gossip echoes routes between engines. If every one of those restarted
+    /// the pipelines, audio would drop out each time somebody looked at the
+    /// patch table.
+    #[tokio::test]
+    async fn reapplying_an_unchanged_route_leaves_the_workers_alone() {
+        let state = engine();
+        let r = foreign_route("r1");
+        apply_route(&state, r.clone(), false).await.unwrap();
+
+        state.running.insert(r.id.clone(), idle_running());
+        apply_route(&state, r.clone(), false).await.unwrap();
+
+        assert!(
+            state.running.contains_key(&r.id),
+            "an identical route was re-applied and the running pipeline was torn down anyway"
+        );
+    }
+
+    /// ...and a route that *did* change must restart, and must get an
+    /// immediate attempt rather than serving out the backoff from whatever
+    /// was wrong before the operator changed it.
+    #[tokio::test]
+    async fn changing_a_route_tears_down_the_old_workers_and_clears_the_backoff() {
+        let state = engine();
+        let mut r = foreign_route("r1");
+        apply_route(&state, r.clone(), false).await.unwrap();
+
+        state.running.insert(r.id.clone(), idle_running());
+        record_failure(&state, &r.id, "device or resource busy");
+        assert!(state.failures.contains_key(&r.id), "fixture failed to arm");
+
+        r.spec.rate = 96_000;
+        apply_route(&state, r.clone(), false).await.unwrap();
+
+        assert!(
+            !state.running.contains_key(&r.id),
+            "the pipeline running the old spec must be stopped, not left playing 48k"
+        );
+        assert!(
+            !state.failures.contains_key(&r.id),
+            "the operator just changed something; making them wait out the old              backoff is how a fixed route looks broken"
+        );
+        assert_eq!(state.routes.get(&r.id).unwrap().spec.rate, 96_000);
+    }
+
+    /// A peer coming back must not disturb routes that have nothing to do
+    /// with it. Retrying everything would reset healthy routes' backoff and,
+    /// on a busy patch, restart pipelines that were never affected.
+    #[tokio::test]
+    async fn a_returning_peer_only_retries_its_own_routes() {
+        let state = engine();
+        // Both routes name a local source whose port does not exist, so
+        // `try_start` fails at the port lookup and records a failure. That is
+        // the observable: a route that was retried has a failure entry, one
+        // that was skipped has none.
+        let mine = route("to-a", (SELF_ID, "missing"), (PEER_A, "in"));
+        let other = route("to-b", (SELF_ID, "missing"), (PEER_B, "in"));
+        state.routes.insert(mine.id.clone(), mine.clone());
+        state.routes.insert(other.id.clone(), other.clone());
+
+        retry_pending_for_peer(&state, PEER_A).await;
+
+        assert!(
+            state.failures.contains_key(&mine.id),
+            "the route to the peer that just appeared should have been retried"
+        );
+        assert!(
+            !state.failures.contains_key(&other.id),
+            "a route to an unrelated peer was retried too"
+        );
+    }
+
+    /// Removing a route has to empty every map that knows about it. A
+    /// leftover entry in `running` holds a device open against the next route
+    /// that wants it; one in `failures` makes a deleted route reappear in the
+    /// UI as "retrying" forever, because the stats pump reports failures for
+    /// routes it can no longer find.
+    #[tokio::test]
+    async fn removing_a_route_leaves_nothing_behind() {
+        let state = engine();
+        let r = foreign_route("r1");
+        apply_route(&state, r.clone(), false).await.unwrap();
+        state.running.insert(r.id.clone(), idle_running());
+        record_failure(&state, &r.id, "boom");
+        // Nothing populates `state.stats` today — the stats pump broadcasts a
+        // map it builds locally. The entry is planted by hand so that the
+        // teardown of this map is actually asserted rather than passing by
+        // virtue of always being empty.
+        state.stats.insert(r.id.clone(), stats_sentinel());
+
+        remove_route(&state, &r.id, false).await;
+
+        assert!(!state.routes.contains_key(&r.id), "routes");
+        assert!(!state.running.contains_key(&r.id), "running");
+        assert!(!state.failures.contains_key(&r.id), "failures");
+        assert!(!state.stats.contains_key(&r.id), "stats");
+    }
 
     #[test]
     fn backoff_doubles_then_caps() {
