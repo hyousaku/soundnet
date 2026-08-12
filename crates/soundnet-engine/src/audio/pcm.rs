@@ -123,6 +123,31 @@ pub fn open(
     Ok((pcm, format))
 }
 
+/// Start a capture stream if it is sitting PREPARED rather than running.
+///
+/// This is load-bearing now, and it was not before. `snd_pcm_wait` *observes*
+/// a device; it never drives one. `snd_pcm_readi` does both — handed a
+/// prepared stream it starts it implicitly — which is why the capture loop
+/// used to get away with never thinking about this: after `snd_pcm_recover`
+/// left the stream prepared, the next read started it again for free.
+///
+/// Now that the loop blocks in `snd_pcm_wait` first, a prepared capture
+/// stream is a trap: no data will ever arrive, so every wait times out, and
+/// the route goes permanently silent without ever raising an error. Hence
+/// this call after every recovery, and again on a timeout as a backstop for
+/// any path into that state we haven't thought of.
+///
+/// **Playback must not get the same treatment.** A playback stream starts
+/// itself once `start_threshold` frames have been written; starting one with
+/// an empty buffer would just underrun it immediately.
+pub fn ensure_capture_running(pcm: &alsa::PCM) {
+    if pcm.state() == alsa::pcm::State::Prepared {
+        if let Err(err) = pcm.start() {
+            tracing::warn!("capture start failed: {err}");
+        }
+    }
+}
+
 /// How much audio is currently queued in the device, in nanoseconds.
 ///
 /// `None` when the driver won't say. The negative clamp matters: `delay()`

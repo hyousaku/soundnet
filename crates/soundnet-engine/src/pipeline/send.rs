@@ -13,11 +13,39 @@
 //! roc, which is configured `ROC_CLOCK_SOURCE_EXTERNAL` and returns without
 //! sleeping. Nothing is buffered in between, so there is nothing to drift.
 //!
-//! The blocking read is also what makes it safe to run this thread at
-//! `SCHED_FIFO` (see `rt.rs`): a real-time thread that never blocks would pin
-//! a core at 100% and starve everything below it. Every loop below must keep
-//! exactly one blocking point — that is the invariant the error handling here
-//! is written to preserve.
+//! Blocking is also what makes it safe to run this thread at `SCHED_FIFO`
+//! (see `rt.rs`): a real-time thread that never blocks would pin a core at
+//! 100% and starve everything below it. Every loop below must keep exactly
+//! one blocking point — that is the invariant the error handling here is
+//! written to preserve.
+//!
+//! ## Where the blocking happens, and why it moved
+//!
+//! The loop used to block in `snd_pcm_readi` itself. That satisfied the
+//! invariant but gave the thread no stop latency at all: `readi` returns when
+//! the device says so, so how long a route took to stop was a hardware
+//! question, and a device that stopped answering entirely (USB pulled
+//! mid-stream, driver stuck in D state) kept its thread for the life of the
+//! process. Nothing above could fix that; the caller can only ask.
+//!
+//! So the blocking point is now `snd_pcm_wait` with
+//! `DEVICE_WAIT_TIMEOUT_MS`, immediately before the read. The properties that
+//! matter:
+//!
+//! * **Still exactly one blocking call per iteration.** A wait that returns
+//!   ready means at least `avail_min` frames are queued, and `avail_min`
+//!   defaults to one period — so the `readi` after it is served from what is
+//!   already there instead of waiting for it.
+//! * **Still not a spin.** A timeout sends the loop back around to re-check
+//!   the stop flag and wait again; the time is spent inside `poll`, not
+//!   burning a real-time core. This is the one property that would make the
+//!   whole change unsafe if it were got wrong.
+//! * **Stop latency is now bounded** by the timeout, whatever the device
+//!   does.
+//!
+//! The subtle cost is that `snd_pcm_wait` only observes the device while
+//! `snd_pcm_readi` also *starts* one — see `pcm::ensure_capture_running` for
+//! what that quietly used to do for us after every xrun recovery.
 
 use anyhow::{bail, Result};
 use soundnet_protocol::{StreamSpec, UNKNOWN_FORMAT};
@@ -28,7 +56,7 @@ use std::thread::{self, JoinHandle};
 
 use crate::audio::format::alsa_to_f32;
 use crate::audio::{pcm, window};
-use crate::pipeline::MAX_CONSECUTIVE_ERRORS;
+use crate::pipeline::{DEVICE_WAIT_TIMEOUT_MS, MAX_CONSECUTIVE_ERRORS, STALL_WARN_AFTER};
 use crate::tone;
 use crate::transport::{sender, RocContext};
 
@@ -184,7 +212,10 @@ fn alsa_loop(
     )?;
     format_out.store(format.as_u8(), Ordering::Relaxed);
     let io = pcm.io_bytes();
-    pcm.start().ok(); // Ignore EAGAIN — the first read will start it.
+    // Not an optimization any more: the loop below waits before it reads, and
+    // a wait on a prepared-but-not-started capture stream never returns data.
+    // See `pcm::ensure_capture_running`.
+    pcm::ensure_capture_running(&pcm);
 
     let mut sender = sender::open(ctx, dst_host, dst_port, spec, outgoing)?;
 
@@ -198,11 +229,63 @@ fn alsa_loop(
     let metrics_every = pcm::metrics_every(spec.rate, period_frames);
     let mut ticks = 0_usize;
     let mut consecutive_errors = 0_u32;
+    let mut stalled = 0_u32;
 
     while !stop.load(Ordering::Relaxed) {
-        // The one blocking point in this loop. Everything below returns
-        // promptly, which is exactly why this must not be skipped on an
-        // error path — see the module docs.
+        // The one blocking point in this loop — see the module docs. Waiting
+        // here rather than inside `readi` is what bounds how long a stop
+        // request can go unheard; everything below returns promptly, which is
+        // why no error path may skip it.
+        match pcm.wait(Some(DEVICE_WAIT_TIMEOUT_MS)) {
+            Ok(true) => stalled = 0,
+            Ok(false) => {
+                // Timed out: the device has not produced a period yet.
+                //
+                // Emphatically **not** an xrun — nothing was lost, nothing
+                // was late, the device simply has not spoken. Counting it as
+                // one would corrupt the only number that tells an operator
+                // whether their period size is too aggressive.
+                //
+                // It is not counted against `consecutive_errors` either, so a
+                // stalled device does not eventually kill its own route. That
+                // is deliberate: the supervisor would restart the route
+                // straight back into the same wedged device, and
+                // `snd_pcm_open` on one of those can block far longer than
+                // this loop ever does. A route that is stopped cleanly and
+                // says so beats a restart loop that cannot be stopped at all.
+                stalled += 1;
+                if stalled == STALL_WARN_AFTER {
+                    tracing::warn!(
+                        "capture {alsa_name}: no period for {}ms — device stalled? \
+                         The route is still stoppable; nothing is being counted as an xrun.",
+                        STALL_WARN_AFTER * DEVICE_WAIT_TIMEOUT_MS
+                    );
+                }
+                pcm::ensure_capture_running(&pcm);
+                continue;
+            }
+            Err(err) => {
+                if pcm.try_recover(err, false).is_ok() {
+                    xruns.fetch_add(1, Ordering::Relaxed);
+                    consecutive_errors += 1;
+                    if consecutive_errors >= MAX_CONSECUTIVE_ERRORS {
+                        bail!(
+                            "capture {alsa_name}: {consecutive_errors} consecutive xruns, giving up"
+                        );
+                    }
+                    tracing::warn!("capture {alsa_name} xrun recovered");
+                    pcm::ensure_capture_running(&pcm);
+                    continue;
+                }
+                bail!("capture {alsa_name} wait: {err}");
+            }
+        }
+
+        // The wait returned ready, which means at least `avail_min` frames
+        // are queued, and `avail_min` defaults to one period — so this read
+        // is satisfied from what is already there rather than blocking for
+        // it. An error here is still possible (an xrun between the wait and
+        // the read) and is handled the same way.
         let frames = match io.readi(&mut raw) {
             Ok(frames) => frames,
             Err(err) => {
@@ -210,9 +293,12 @@ fn alsa_loop(
                     xruns.fetch_add(1, Ordering::Relaxed);
                     consecutive_errors += 1;
                     if consecutive_errors >= MAX_CONSECUTIVE_ERRORS {
-                        bail!("capture {alsa_name}: {consecutive_errors} consecutive xruns, giving up");
+                        bail!(
+                            "capture {alsa_name}: {consecutive_errors} consecutive xruns, giving up"
+                        );
                     }
                     tracing::warn!("capture {alsa_name} xrun recovered");
+                    pcm::ensure_capture_running(&pcm);
                     continue;
                 }
                 bail!("capture {alsa_name} read: {err}");

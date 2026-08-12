@@ -13,8 +13,30 @@
 //! single place where network timing slack is absorbed. That is what it is
 //! for; our ring was a worse copy of it.
 //!
-//! As in `send.rs`, the blocking write is what makes `SCHED_FIFO` safe here.
-//! Keep exactly one blocking point in the loop.
+//! As in `send.rs`, blocking is what makes `SCHED_FIFO` safe here. Keep
+//! exactly one blocking point in the loop.
+//!
+//! ## Where the blocking happens
+//!
+//! Same move as `send.rs`, for the same reason: the loop no longer blocks in
+//! `snd_pcm_writei` but in `snd_pcm_wait` with `DEVICE_WAIT_TIMEOUT_MS` just
+//! before it, so a stop request is answered within the timeout no matter what
+//! the device is doing. A wait that returns ready means at least `avail_min`
+//! frames of space — one period by default — so the write it guards is taken
+//! by the buffer rather than waiting for room, and a timeout goes back around
+//! to re-check the stop flag having spent its time inside `poll` rather than
+//! spinning a real-time core.
+//!
+//! One asymmetry with the capture side: the wait sits *inside* the
+//! short-write retry loop here. `writei` can come back having taken only part
+//! of a period when a signal lands mid-syscall, and the remainder has to be
+//! bounded too, or a wedged device could still hold the thread through the
+//! back half of a period forever.
+//!
+//! The other asymmetry is what `send.rs` needs and this file does not:
+//! nothing here corresponds to `pcm::ensure_capture_running`, because a
+//! prepared playback stream has an empty buffer — the wait returns
+//! immediately and the write starts the stream itself.
 
 use anyhow::{bail, Result};
 use soundnet_protocol::{StreamSpec, UNKNOWN_FORMAT};
@@ -24,7 +46,7 @@ use std::thread::{self, JoinHandle};
 
 use crate::audio::format::f32_to_alsa;
 use crate::audio::{pcm, window};
-use crate::pipeline::MAX_CONSECUTIVE_ERRORS;
+use crate::pipeline::{DEVICE_WAIT_TIMEOUT_MS, MAX_CONSECUTIVE_ERRORS, STALL_WARN_AFTER};
 use crate::transport::{receiver, RocContext};
 
 pub struct RecvHandle {
@@ -190,6 +212,7 @@ fn run(
     let metrics_every = pcm::metrics_every(spec.rate, period_frames);
     let mut ticks = 0_usize;
     let mut consecutive_errors = 0_u32;
+    let mut stalled = 0_u32;
 
     while !w.stop.load(Ordering::Relaxed) {
         // Set false by anything that went wrong this iteration. The error
@@ -250,8 +273,54 @@ fn run(
         // blocking, so a short write means the syscall was interrupted
         // rather than the buffer being full — push the remainder instead of
         // dropping it, which would be an audible click every time.
+        //
+        // The wait is inside the retry loop rather than above it so the
+        // remainder after a short write is bounded too: a signal landing
+        // mid-`writei` must not put this thread back into an open-ended
+        // wait for a device that may never take the rest.
         let mut written = 0usize;
         while written < period_frames {
+            match pcm.wait(Some(DEVICE_WAIT_TIMEOUT_MS)) {
+                Ok(true) => stalled = 0,
+                Ok(false) => {
+                    // The device has not freed a period's worth of space.
+                    // Not an xrun (nothing was starved — we have not handed
+                    // it anything yet) and not counted against
+                    // `consecutive_errors`, for the same reasons spelled out
+                    // in `send.rs`.
+                    stalled += 1;
+                    if stalled == STALL_WARN_AFTER {
+                        tracing::warn!(
+                            "playback {alsa_name}: device has taken nothing for {}ms — stalled? \
+                             The route is still stoppable; nothing is being counted as an xrun.",
+                            STALL_WARN_AFTER * DEVICE_WAIT_TIMEOUT_MS
+                        );
+                    }
+                    // The whole point of the timeout: without this the outer
+                    // loop's stop check is unreachable while the device is
+                    // wedged.
+                    if w.stop.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    continue;
+                }
+                Err(err) => {
+                    if pcm.try_recover(err, false).is_ok() {
+                        w.xruns.fetch_add(1, Ordering::Relaxed);
+                        tracing::warn!("playback {alsa_name} xrun recovered");
+                        healthy = false;
+                        break;
+                    }
+                    bail!("playback {alsa_name} wait: {err}");
+                }
+            }
+
+            // Ready: at least `avail_min` frames of space, which defaults to
+            // one period, so this write is taken by the buffer rather than
+            // waiting for room. Playback needs no equivalent of
+            // `ensure_capture_running` — a prepared playback stream has an
+            // empty buffer, so the wait returns immediately and the write
+            // starts the stream itself via `start_threshold`.
             match io.writei(&raw[written * frame_bytes..]) {
                 Ok(frames) if frames > 0 => written += frames,
                 // Zero frames written with no error shouldn't happen on a
