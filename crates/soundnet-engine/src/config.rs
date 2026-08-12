@@ -74,8 +74,10 @@ mod tests {
             std::process::id()
         ));
 
-        let mut cfg = Config::default();
-        cfg.node_id = Some("fixed-test-node-id".to_string());
+        let cfg = Config {
+            node_id: Some("fixed-test-node-id".to_string()),
+            ..Default::default()
+        };
         cfg.save(&path).expect("save");
 
         let loaded = Config::load_or_default(Some(&path)).expect("load");
@@ -116,8 +118,10 @@ mod tests {
             std::process::id()
         ));
 
-        let mut cfg = Config::default();
-        cfg.interface = Some("eth0".to_string());
+        let cfg = Config {
+            interface: Some("eth0".to_string()),
+            ..Default::default()
+        };
         cfg.save(&path).expect("save");
 
         let loaded = Config::load_or_default(Some(&path)).expect("load");

@@ -227,15 +227,21 @@ async fn check_peers_once(state: &Arc<EngineState>, failures: &mut HashMap<Strin
 
     for (id, node) in snapshot {
         let url = format!("http://{}:{}/api/state", node.addr, node.port);
-        let fetched = tokio::task::spawn_blocking(move || {
-            ureq::get(&url)
-                .timeout(LIVENESS_TIMEOUT)
-                .call()
-                .and_then(|resp| {
-                    resp.into_json::<soundnet_protocol::StateSnapshot>()
-                        .map_err(Into::into)
-                })
-        })
+        // The error is flattened to a String rather than carried as
+        // `ureq::Error`: that type is ~270 bytes, so every liveness tick was
+        // moving a `Result` that size per peer through a join handle
+        // (clippy::result_large_err). Nothing downstream does anything with
+        // the error but print it.
+        let fetched = tokio::task::spawn_blocking(
+            move || -> Result<soundnet_protocol::StateSnapshot, String> {
+                let resp = ureq::get(&url)
+                    .timeout(LIVENESS_TIMEOUT)
+                    .call()
+                    .map_err(|e| e.to_string())?;
+                resp.into_json::<soundnet_protocol::StateSnapshot>()
+                    .map_err(|e| e.to_string())
+            },
+        )
         .await;
 
         match fetched {
@@ -393,15 +399,17 @@ pub fn push_ports_to_peers(state: &Arc<EngineState>) {
 
 async fn fetch_peer_state(state: &Arc<EngineState>, node: Node) {
     let url = format!("http://{}:{}/api/state", node.addr, node.port);
-    let fetched = tokio::task::spawn_blocking(move || {
-        ureq::get(&url)
-            .timeout(Duration::from_secs(2))
-            .call()
-            .and_then(|resp| {
-                resp.into_json::<soundnet_protocol::StateSnapshot>()
-                    .map_err(Into::into)
-            })
-    })
+    // Same String-flattening as in `check_peers_once`, for the same reason.
+    let fetched = tokio::task::spawn_blocking(
+        move || -> Result<soundnet_protocol::StateSnapshot, String> {
+            let resp = ureq::get(&url)
+                .timeout(Duration::from_secs(2))
+                .call()
+                .map_err(|e| e.to_string())?;
+            resp.into_json::<soundnet_protocol::StateSnapshot>()
+                .map_err(|e| e.to_string())
+        },
+    )
     .await;
     match fetched {
         Ok(Ok(snap)) => {

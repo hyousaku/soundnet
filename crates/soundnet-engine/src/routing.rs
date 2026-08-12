@@ -651,9 +651,9 @@ pub fn spawn_stats_pump(state: Arc<EngineState>) {
                 // has no role for that component at all, vs. it has the
                 // role but nothing's been sampled yet) — both mean "don't
                 // show a number", so collapsing them is fine.
-                let roc_e2e_ms = running.e2e_ns.as_ref().and_then(|n| ns_to_ms(n));
-                let capture_buffer_ms = running.cap_buffer_ns.as_ref().and_then(|n| ns_to_ms(n));
-                let playback_buffer_ms = running.pb_buffer_ns.as_ref().and_then(|n| ns_to_ms(n));
+                let roc_e2e_ms = running.e2e_ns.as_ref().and_then(ns_to_ms);
+                let capture_buffer_ms = running.cap_buffer_ns.as_ref().and_then(ns_to_ms);
+                let playback_buffer_ms = running.pb_buffer_ns.as_ref().and_then(ns_to_ms);
                 let clipped_samples = running
                     .clipped
                     .as_ref()
@@ -782,7 +782,7 @@ mod tests {
         let b = route_port(10_001, id);
         assert_eq!(a, b, "same id must produce same port on both engines");
         assert!(
-            a >= 10_001 + 3 && a <= 10_001 + 3 + 999 * 3,
+            (10_001 + 3..=10_001 + 3 + 999 * 3).contains(&a),
             "port {a} out of range"
         );
     }
