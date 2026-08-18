@@ -154,3 +154,39 @@ jobs:
 
       - name: Test
         run: cargo test --workspace
+
+  # Every test in the suite is a pure function or a fake. Nothing automated
+  # has ever gone through ALSA, on any machine, which is a strange gap for a
+  # project whose hard-won lessons are almost all about ALSA behaviour.
+  #
+  # `snd-aloop` is the way to close it: a kernel module that presents a
+  # virtual card whose playback subdevices feed its capture subdevices. Before
+  # writing a test against it, find out whether a GitHub runner will load it
+  # at all — that is not documented anywhere reliable, and building the test
+  # first and discovering the answer afterwards would be the expensive order.
+  #
+  # Deliberately allowed to fail: this job exists to produce an answer, not a
+  # verdict. If the answer is no, it goes away and the loopback test becomes
+  # something run by hand with instructions in the README.
+  alsa-probe:
+    name: alsa-probe (can the runner load snd-aloop?)
+    runs-on: ubuntu-24.04
+    continue-on-error: true
+    steps:
+      - name: Try to load snd-aloop
+        run: |
+          echo "--- kernel ---"
+          uname -a
+          echo "--- module present? ---"
+          ls /lib/modules/"$(uname -r)"/kernel/sound/drivers/ 2>&1 || true
+          modinfo snd-aloop 2>&1 || echo "modinfo: not found"
+          echo "--- modprobe ---"
+          sudo modprobe snd-aloop enable=1,1 index=10 2>&1 || echo "modprobe FAILED"
+          echo "--- cards ---"
+          cat /proc/asound/cards 2>&1 || echo "no /proc/asound/cards"
+          echo "--- pcm devices ---"
+          cat /proc/asound/pcm 2>&1 || echo "no /proc/asound/pcm"
+          echo "--- aplay -l ---"
+          sudo apt-get install -y --no-install-recommends alsa-utils >/dev/null 2>&1 || true
+          aplay -l 2>&1 || true
+          arecord -l 2>&1 || true
