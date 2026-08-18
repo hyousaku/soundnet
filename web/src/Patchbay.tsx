@@ -16,6 +16,7 @@ import { useStore } from "./store";
 import PortNode, { type PortRFNode } from "./PortNode";
 import { defaultSpec, type PortRef, type Route } from "./protocol";
 import { summarizeLatency } from "./latency";
+import { describeHealth } from "./health";
 
 const nodeTypes = { port: PortNode };
 
@@ -64,17 +65,25 @@ export default function Patchbay() {
   const rfEdges: Edge[] = useMemo(() => {
     return Object.values(routes).map((r) => {
       const s = stats[r.id];
-      const failing = s?.health.type === "retrying";
+      const health = describeHealth(s?.health);
       const latSummary = summarizeLatency(s);
       // "—" means no data at all (route has no local role on this engine)
       // — don't clutter every unrelated edge with a dash.
       const lat = latSummary.text !== "—" ? ` · ${latSummary.text}` : "";
       const xr = s && s.xruns > 0 ? ` · xr ${s.xruns}` : "";
-      const label = failing && s?.health.type === "retrying"
-        ? `retrying (${s.health.attempts}) — ${s.health.reason}`
+      // A route in trouble says so instead of showing its settings: the
+      // settings are still on the row in the table below, and an edge that
+      // reads "48k · 2ch · 128f" over a device that stopped moving audio is
+      // the exact reassurance this was reporting wrongly before.
+      const label = health.bad
+        ? health.text
         : `${r.spec.rate / 1000}k · ${r.spec.channels}ch · ${r.spec.frames_per_period}f${lat}${xr}`;
-      const color = failing ? "#ef5350" : "#6cf";
-      const labelColor = failing ? "#ef5350" : latSummary.partial ? "#f59e0b" : "#e6e9ef";
+      const color = health.bad ? health.color : "#6cf";
+      const labelColor = health.bad
+        ? health.color
+        : latSummary.partial
+          ? "#f59e0b"
+          : "#e6e9ef";
       return {
         id: r.id,
         source: r.src.node_id,

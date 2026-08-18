@@ -92,6 +92,15 @@ pub struct SendHandle {
     /// samples are simply gone — an audible click, and for a long time one
     /// that no counter anywhere recorded.
     pub xruns: Arc<AtomicUsize>,
+    /// True while the capture device has stopped producing periods — the
+    /// same condition that logs "device stalled?", published so the UI can
+    /// show it instead of a green "ok".
+    ///
+    /// Set once a stall episode has lasted `STALL_WARN_AFTER` timeouts and
+    /// cleared the moment a period arrives, so it tracks the live state of
+    /// the device rather than counting episodes. Never set for a tone
+    /// source: there is no device to stall.
+    pub stalled: Arc<AtomicBool>,
     /// Why this pipeline stopped, if it stopped on its own. Written once, as
     /// the thread unwinds. Without it the UI can only say that a worker
     /// exited — which names the symptom and withholds every fact that would
@@ -154,6 +163,7 @@ pub fn spawn(
     let buffer_ns = Arc::new(AtomicU64::new(u64::MAX));
     let format = Arc::new(AtomicU8::new(UNKNOWN_FORMAT));
     let xruns = Arc::new(AtomicUsize::new(0));
+    let stalled = Arc::new(AtomicBool::new(false));
     let last_error: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
 
     let stop_worker = stop.clone();
@@ -161,6 +171,7 @@ pub fn spawn(
     let buffer_worker = buffer_ns.clone();
     let format_worker = format.clone();
     let xruns_worker = xruns.clone();
+    let stalled_worker = stalled.clone();
     let error_worker = last_error.clone();
     let alsa_name = alsa_name.to_string();
     let dst_host = dst_host.to_string();
@@ -193,6 +204,7 @@ pub fn spawn(
                     &buffer_worker,
                     &format_worker,
                     &xruns_worker,
+                    &stalled_worker,
                     channel_offset as usize,
                 ),
             };
@@ -213,6 +225,7 @@ pub fn spawn(
         buffer_ns,
         format,
         xruns,
+        stalled,
         last_error,
     })
 }
@@ -242,6 +255,7 @@ fn alsa_loop(
     buffer_ns: &Arc<AtomicU64>,
     format_out: &Arc<AtomicU8>,
     xruns: &Arc<AtomicUsize>,
+    stalled_out: &Arc<AtomicBool>,
     channel_offset: usize,
 ) -> Result<()> {
     // Open as many channels as it takes to reach the far edge of the window,
@@ -292,7 +306,15 @@ fn alsa_loop(
         // request can go unheard; everything below returns promptly, which is
         // why no error path may skip it.
         match pcm.wait(Some(DEVICE_WAIT_TIMEOUT_MS)) {
-            Ok(true) => stalled = 0,
+            Ok(true) => {
+                // Only touch the flag on the edge. A store per period would
+                // be harmless but this is the hot path of a SCHED_FIFO loop,
+                // and a stall is by definition rare.
+                if stalled != 0 {
+                    stalled = 0;
+                    stalled_out.store(false, Ordering::Relaxed);
+                }
+            }
             Ok(false) => {
                 // Timed out: the device has not produced a period yet.
                 //
@@ -310,6 +332,10 @@ fn alsa_loop(
                 // says so beats a restart loop that cannot be stopped at all.
                 stalled += 1;
                 if stalled == STALL_WARN_AFTER {
+                    // Same threshold as the log line on purpose: what the
+                    // journal calls a stall and what the UI calls a stall
+                    // should be the same event.
+                    stalled_out.store(true, Ordering::Relaxed);
                     tracing::warn!(
                         "capture {alsa_name}: no period for {}ms — device stalled? \
                          The route is still stoppable; nothing is being counted as an xrun.",

@@ -112,6 +112,27 @@ impl RunningRoute {
         }
     }
 
+    /// Which of this route's local devices have gone quiet: `(capture,
+    /// playback)`. Both can be true at once on a self-loop.
+    ///
+    /// Read through the handles rather than mirrored into a field here,
+    /// because a stall is a live property of the device — it clears the
+    /// moment a period arrives — and a copy taken at start time would be
+    /// permanently false.
+    ///
+    /// This is the state that used to be invisible. A stalled device returns
+    /// no error, counts no xrun and keeps its thread alive, so `is_dead()` is
+    /// false and the route reported a healthy `Ok` while producing silence.
+    fn stalled_sides(&self) -> (bool, bool) {
+        let stalled = |flag: Option<&Arc<std::sync::atomic::AtomicBool>>| {
+            flag.map(|f| f.load(Ordering::Relaxed)).unwrap_or(false)
+        };
+        (
+            stalled(self.send.as_ref().map(|s| &s.stalled)),
+            stalled(self.recv.as_ref().map(|r| &r.stalled)),
+        )
+    }
+
     /// Raise the stop flag on both halves without waiting for either. Cheap
     /// and non-blocking — the threads only act on it when they next come
     /// around their loops.
@@ -847,7 +868,15 @@ pub fn spawn_stats_pump(state: Arc<EngineState>) {
                         .map(|f| f.to_health())
                         .unwrap_or(RouteHealth::Ok)
                 } else {
-                    RouteHealth::Ok
+                    // A live pipeline is not the same as a working one: a
+                    // device that has stopped producing or accepting periods
+                    // keeps its thread, returns no error and counts no xrun,
+                    // so this branch used to report a confident `Ok` over
+                    // silence.
+                    match running.stalled_sides() {
+                        (false, false) => RouteHealth::Ok,
+                        (capture, playback) => RouteHealth::Stalled { capture, playback },
+                    }
                 };
                 let stats = StreamStats {
                     xruns,

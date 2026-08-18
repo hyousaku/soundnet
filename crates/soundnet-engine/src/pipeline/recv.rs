@@ -80,6 +80,10 @@ pub struct RecvHandle {
     /// device. See `StreamStats::clipped_samples` for why this earns a
     /// counter of its own.
     pub clipped: Arc<AtomicUsize>,
+    /// True while the playback device has stopped taking periods — the same
+    /// condition that logs "device stalled?". See the same field on
+    /// `SendHandle`.
+    pub stalled: Arc<AtomicBool>,
     /// Why this pipeline stopped, if it stopped on its own. See the same
     /// field on `SendHandle`.
     pub last_error: Arc<Mutex<Option<String>>>,
@@ -119,10 +123,12 @@ pub fn spawn(
     let jitter_ns = Arc::new(AtomicU64::new(0));
     let format = Arc::new(AtomicU8::new(UNKNOWN_FORMAT));
     let clipped = Arc::new(AtomicUsize::new(0));
+    let stalled = Arc::new(AtomicBool::new(false));
     let last_error: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
 
     let worker = Worker {
         stop: stop.clone(),
+        stalled: stalled.clone(),
         level_bits: level_bits.clone(),
         xruns: xruns.clone(),
         buffer_ns: buffer_ns.clone(),
@@ -167,6 +173,7 @@ pub fn spawn(
         jitter_ns,
         format,
         clipped,
+        stalled,
         last_error,
     })
 }
@@ -175,6 +182,7 @@ pub fn spawn(
 /// doesn't grow a parameter per metric.
 struct Worker {
     stop: Arc<AtomicBool>,
+    stalled: Arc<AtomicBool>,
     level_bits: Arc<AtomicU32>,
     xruns: Arc<AtomicUsize>,
     buffer_ns: Arc<AtomicU64>,
@@ -336,7 +344,13 @@ fn run(
         let mut written = 0usize;
         while written < period_frames {
             match pcm.wait(Some(DEVICE_WAIT_TIMEOUT_MS)) {
-                Ok(true) => stalled = 0,
+                Ok(true) => {
+                    // Edge only — see the same arm in `send.rs`.
+                    if stalled != 0 {
+                        stalled = 0;
+                        w.stalled.store(false, Ordering::Relaxed);
+                    }
+                }
                 Ok(false) => {
                     // The device has not freed a period's worth of space.
                     // Not an xrun (nothing was starved — we have not handed
@@ -345,6 +359,7 @@ fn run(
                     // in `send.rs`.
                     stalled += 1;
                     if stalled == STALL_WARN_AFTER {
+                        w.stalled.store(true, Ordering::Relaxed);
                         tracing::warn!(
                             "playback {alsa_name}: device has taken nothing for {}ms — stalled? \
                              The route is still stoppable; nothing is being counted as an xrun.",

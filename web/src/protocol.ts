@@ -60,9 +60,16 @@ export interface Route {
   spec: StreamSpec;
 }
 
+// "stalled" is a live pipeline whose device has gone quiet: it is neither
+// producing nor accepting periods and has not for some seconds. It is not a
+// failure and nothing is being retried — the engine deliberately does not
+// restart into a wedged device — so it is its own state rather than a flavour
+// of "retrying". It clears by itself when the device comes back. `capture`
+// and `playback` say which side; both can be true on a self-loop.
 export type RouteHealth =
   | { type: "ok" }
-  | { type: "retrying"; attempts: number; reason: string; next_retry_ms: number };
+  | { type: "retrying"; attempts: number; reason: string; next_retry_ms: number }
+  | { type: "stalled"; capture: boolean; playback: boolean };
 
 // No single engine can measure a route's whole path: the sender engine
 // only ever knows its own ALSA capture buffering, the receiver engine only

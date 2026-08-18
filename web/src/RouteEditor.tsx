@@ -1,6 +1,7 @@
 import { useStore } from "./store";
 import type { LocalPort, Route, SampleFormat, StreamSpec, StreamStats } from "./protocol";
 import { summarizeLatency } from "./latency";
+import { describeHealth } from "./health";
 
 const RATES = [44100, 48000, 88200, 96000];
 const FORMATS: SampleFormat[] = ["S16_LE", "S24_LE3", "S32_LE", "F32_LE"];
@@ -78,10 +79,9 @@ export default function RouteEditor() {
         </thead>
         <tbody>
           {routeList.map((r) => {
-            const health = stats[r.id]?.health;
-            const failing = health?.type === "retrying";
+            const health = describeHealth(stats[r.id]?.health);
             return (
-            <tr key={r.id} style={failing ? { background: "rgba(239, 83, 80, 0.08)" } : undefined}>
+            <tr key={r.id} style={health.bad ? { background: `${health.color}14` } : undefined}>
               <td>
                 {nodes[r.src.node_id]?.hostname ?? r.src.node_id.slice(0, 8)} →{" "}
                 {nodes[r.dst.node_id]?.hostname ?? r.dst.node_id.slice(0, 8)}
@@ -174,15 +174,9 @@ export default function RouteEditor() {
                 {stats[r.id]?.clipped_samples ?? "—"}
               </td>
               <td style={{ maxWidth: 220 }}>
-                {failing && health?.type === "retrying" ? (
-                  <span title={health.reason} style={{ color: "#ef5350" }}>
-                    retrying ({health.attempts}) — {health.reason}
-                  </span>
-                ) : health ? (
-                  <span style={{ color: "#4ade80" }}>ok</span>
-                ) : (
-                  "—"
-                )}
+                <span title={health.title} style={{ color: health.color }}>
+                  {health.text}
+                </span>
               </td>
               <td>
                 <button onClick={() => send({ type: "remove_route", id: r.id })}>

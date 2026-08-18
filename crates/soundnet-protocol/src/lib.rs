@@ -170,6 +170,30 @@ pub enum RouteHealth {
         reason: String,
         next_retry_ms: u64,
     },
+    /// The pipeline threads are alive and the route is not retrying, but a
+    /// device has gone quiet: it is neither producing nor accepting periods,
+    /// and has not for some seconds.
+    ///
+    /// This is a state `Ok` used to swallow. Nothing about a stalled device
+    /// looks like a failure from the outside — the thread is running, no
+    /// error was returned, no xrun was counted — so a route with an
+    /// unplugged interface or a wedged driver sat in the UI as a healthy
+    /// green "ok" while producing silence, and the only trace was one line
+    /// in the journal. The one question the health column exists to answer
+    /// is "is audio moving?", and for that case it was answering wrong.
+    ///
+    /// Deliberately not `Retrying`: nothing is being retried, and nothing
+    /// will be. The pipeline does not tear itself down over a stall (see the
+    /// timeout arms in `pipeline/send.rs` and `recv.rs` for why restarting
+    /// into a wedged device is worse), so this state persists until the
+    /// device comes back — at which point it clears on its own.
+    Stalled {
+        /// Whether the capture side is the one that has gone quiet. Both can
+        /// be true at once on a self-loop route.
+        capture: bool,
+        /// Whether the playback side has gone quiet.
+        playback: bool,
+    },
 }
 
 /// Live per-route runtime stats streamed on the WS.
@@ -393,4 +417,74 @@ pub enum ServerMsg {
     Error {
         message: String,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::RouteHealth;
+
+    /// The JSON shape of `RouteHealth` is a contract with `web/src/protocol.ts`,
+    /// and nothing in the build checks the two against each other — a renamed
+    /// variant or a field that serializes differently than the TypeScript
+    /// union expects compiles cleanly on both sides and only shows up as a
+    /// health column that has quietly stopped saying anything.
+    ///
+    /// Pinned here rather than left to `#[serde(rename_all)]` doing the
+    /// obvious thing, because "the obvious thing" is exactly what a later
+    /// attribute change would silently alter.
+    #[test]
+    fn health_serializes_the_way_the_web_ui_reads_it() {
+        let json = |h: &RouteHealth| serde_json::to_value(h).expect("serialize");
+
+        assert_eq!(json(&RouteHealth::Ok), serde_json::json!({ "type": "ok" }));
+
+        assert_eq!(
+            json(&RouteHealth::Retrying {
+                attempts: 3,
+                reason: "device busy".into(),
+                next_retry_ms: 8_000,
+            }),
+            serde_json::json!({
+                "type": "retrying",
+                "attempts": 3,
+                "reason": "device busy",
+                "next_retry_ms": 8_000,
+            })
+        );
+
+        assert_eq!(
+            json(&RouteHealth::Stalled {
+                capture: true,
+                playback: false,
+            }),
+            serde_json::json!({
+                "type": "stalled",
+                "capture": true,
+                "playback": false,
+            })
+        );
+    }
+
+    /// An engine running an older build sends health values that predate
+    /// `stalled`, and gossip means an engine really does parse another
+    /// engine's messages. Both directions have to keep working, so the two
+    /// existing variants must still round-trip unchanged.
+    #[test]
+    fn the_older_health_variants_still_parse() {
+        let ok: RouteHealth = serde_json::from_value(serde_json::json!({ "type": "ok" }))
+            .expect("an older engine's \"ok\" must still parse");
+        assert!(matches!(ok, RouteHealth::Ok));
+
+        let retrying: RouteHealth = serde_json::from_value(serde_json::json!({
+            "type": "retrying",
+            "attempts": 1,
+            "reason": "unknown dst peer",
+            "next_retry_ms": 2_000,
+        }))
+        .expect("an older engine's \"retrying\" must still parse");
+        assert!(matches!(
+            retrying,
+            RouteHealth::Retrying { attempts: 1, .. }
+        ));
+    }
 }
