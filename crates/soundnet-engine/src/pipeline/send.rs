@@ -46,6 +46,23 @@
 //! The subtle cost is that `snd_pcm_wait` only observes the device while
 //! `snd_pcm_readi` also *starts* one — see `pcm::ensure_capture_running` for
 //! what that quietly used to do for us after every xrun recovery.
+//!
+//! ## Why the destination is a list
+//!
+//! The loop reads one period and then walks a `Vec<Subscriber>`, cutting each
+//! one's channel window out of the device frame and writing it to that
+//! subscriber's roc sender. Today the list always has exactly one entry, so
+//! this is the same work in a different shape; it is the shape that lets one
+//! input feed several destinations (`docs/capture-sharing.md`), which is the
+//! next step.
+//!
+//! It matters that the fan-out is *inline* rather than through a queue.
+//! `roc_sender_write` under `ROC_CLOCK_SOURCE_EXTERNAL` packetizes and hands
+//! the datagram to the socket without sleeping, so N of them still leave the
+//! iteration with exactly one blocking point and no buffer between the device
+//! and the network. The ring described above does not need to come back: it
+//! existed because two threads had two clocks, and this still has one thread
+//! and one clock however many destinations hang off it.
 
 use anyhow::{bail, Result};
 use soundnet_protocol::{StreamSpec, UNKNOWN_FORMAT};
@@ -242,6 +259,34 @@ fn peak_of(samples: &[f32]) -> f32 {
     samples.iter().fold(0.0_f32, |acc, s| acc.max(s.abs()))
 }
 
+/// One destination fed from a capture device: a roc sender, the channel
+/// window it carries, and the state that belongs to that route rather than
+/// to the device.
+///
+/// Today there is always exactly one of these per device. It is a `Vec` and
+/// a loop rather than a single field because sharing one input across
+/// several destinations is the next step (see `docs/capture-sharing.md`),
+/// and landing the shape of the hot loop separately from the device
+/// lifetime is what makes it possible to attribute any latency or xrun
+/// change to one or the other. This commit is meant to measure as identical
+/// to the previous one.
+struct Subscriber {
+    sender: sender::Sender,
+    /// Where in the device's frame this route's channels start, and how many
+    /// it takes. Per-subscriber because two routes off one interface will
+    /// usually want different channels of it.
+    channel_offset: usize,
+    channels: usize,
+    level_bits: Arc<AtomicU32>,
+    /// Scratch for this subscriber's extracted window. Owned here so the
+    /// audio thread never allocates inside the loop.
+    floats: Vec<f32>,
+    /// Counted per subscriber, not per device: once there is more than one,
+    /// a destination that has gone bad must not be able to take the device —
+    /// and everybody else on it — down with it.
+    consecutive_errors: u32,
+}
+
 #[allow(clippy::too_many_arguments)]
 fn alsa_loop(
     alsa_name: &str,
@@ -258,12 +303,19 @@ fn alsa_loop(
     stalled_out: &Arc<AtomicBool>,
     channel_offset: usize,
 ) -> Result<()> {
-    // Open as many channels as it takes to reach the far edge of the window,
-    // and no more: to read a device's channel 5 you must open 5 channels, but
-    // opening all 16 of a 16-channel interface to carry one of them is wasted
-    // USB bandwidth on every period.
+    // Open as many channels as it takes to reach the far edge of the widest
+    // window any subscriber asks for, and no more: to read a device's channel
+    // 5 you must open 5 channels, but opening all 16 of a 16-channel
+    // interface to carry one of them is wasted USB bandwidth on every period.
     let channels = spec.channels as usize;
-    let device_channels = channel_offset + channels;
+    // The windows first, because the device has to be opened wide enough for
+    // all of them and the senders can only be built after it opens.
+    let windows = [(channel_offset, channels)];
+    let device_channels = windows
+        .iter()
+        .map(|&(offset, count)| offset + count)
+        .max()
+        .expect("at least one window");
     let (pcm, format) = pcm::open(
         alsa_name,
         alsa::Direction::Capture,
@@ -277,14 +329,24 @@ fn alsa_loop(
     // See `pcm::ensure_capture_running`.
     pcm::ensure_capture_running(&pcm);
 
-    let mut sender = sender::open(ctx, dst_host, dst_port, spec, outgoing)?;
+    let period_frames = spec.frames_per_period as usize;
+    let mut subscribers: Vec<Subscriber> = Vec::with_capacity(windows.len());
+    for &(offset, count) in &windows {
+        subscribers.push(Subscriber {
+            sender: sender::open(ctx.clone(), dst_host, dst_port, spec, outgoing)?,
+            channel_offset: offset,
+            channels: count,
+            level_bits: level_bits.clone(),
+            floats: Vec::with_capacity(period_frames * count),
+            consecutive_errors: 0,
+        });
+    }
 
     let frame_bytes = device_channels * format.bytes_per_sample();
-    let period_frames = spec.frames_per_period as usize;
     let mut raw = vec![0u8; period_frames * frame_bytes];
-    // Everything the device gives us, then just the window that goes on the wire.
+    // Everything the device gives us; each subscriber then takes its own
+    // window out of it.
     let mut device_floats: Vec<f32> = Vec::with_capacity(period_frames * device_channels);
-    let mut floats: Vec<f32> = Vec::with_capacity(period_frames * channels);
 
     let metrics_every = pcm::metrics_every(spec.rate, period_frames);
     let mut ticks = 0_usize;
@@ -394,23 +456,37 @@ fn alsa_loop(
         // A short read (signal during the syscall) would otherwise send the
         // tail of the *previous* period again, so convert only what arrived.
         alsa_to_f32(format, &raw[..frames * frame_bytes], &mut device_floats);
-        window::extract(
-            &device_floats,
-            device_channels,
-            channel_offset,
-            channels,
-            &mut floats,
-        );
-        fade.apply(&mut floats, channels);
-        publish_level(level_bits, peak_of(&floats));
+        // Ramped on the whole frame before the windows are cut out of it,
+        // rather than on each window afterwards. Identical arithmetic — the
+        // ramp is one scalar gain per frame and extraction only selects
+        // channels — but it is now applied once for the device instead of
+        // once per destination, which is what it always described.
+        fade.apply(&mut device_floats, device_channels);
 
-        if let Err(err) = sender.write(&mut floats) {
-            consecutive_errors += 1;
-            if consecutive_errors >= MAX_CONSECUTIVE_ERRORS {
-                return Err(err.context("sender failed repeatedly"));
+        for sub in subscribers.iter_mut() {
+            window::extract(
+                &device_floats,
+                device_channels,
+                sub.channel_offset,
+                sub.channels,
+                &mut sub.floats,
+            );
+            publish_level(&sub.level_bits, peak_of(&sub.floats));
+
+            // Non-blocking under ROC_CLOCK_SOURCE_EXTERNAL: it packetizes and
+            // hands the datagram to the socket without sleeping. That is the
+            // property that lets this be a loop at all — N of these still
+            // leave the iteration with exactly one blocking point, the
+            // `snd_pcm_wait` above.
+            if let Err(err) = sub.sender.write(&mut sub.floats) {
+                sub.consecutive_errors += 1;
+                if sub.consecutive_errors >= MAX_CONSECUTIVE_ERRORS {
+                    return Err(err.context("sender failed repeatedly"));
+                }
+                tracing::warn!("send pipeline {alsa_name}: {err:#}");
+                continue;
             }
-            tracing::warn!("send pipeline {alsa_name}: {err:#}");
-            continue;
+            sub.consecutive_errors = 0;
         }
         consecutive_errors = 0;
 

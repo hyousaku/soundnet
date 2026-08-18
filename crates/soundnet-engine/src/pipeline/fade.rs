@@ -118,6 +118,49 @@ mod tests {
 
     const RATE: u32 = 48_000;
 
+    /// The capture pipeline ramps the whole device frame before cutting each
+    /// destination's channel window out of it, rather than ramping each
+    /// window afterwards. That is only equivalent if the ramp advances by
+    /// *frames* and not by samples — otherwise a 6-channel interface would
+    /// race through its fade three times faster than a stereo one, and the
+    /// two-second caution that exists to keep a returning stream from
+    /// arriving as a bang would silently become two thirds of a second.
+    #[test]
+    fn a_ramp_advances_by_frames_whatever_the_channel_count() {
+        let frames = 480;
+        let mut narrow = Fade::new(RATE);
+        let mut wide = Fade::new(RATE);
+        narrow.arm(1_000);
+        wide.arm(1_000);
+
+        let mut two_channel = vec![1.0_f32; frames * 2];
+        let mut six_channel = vec![1.0_f32; frames * 6];
+        narrow.apply(&mut two_channel, 2);
+        wide.apply(&mut six_channel, 6);
+
+        // Same position in the ramp: the last frame of each must have been
+        // multiplied by the same gain.
+        let last_narrow = two_channel[(frames - 1) * 2];
+        let last_wide = six_channel[(frames - 1) * 6];
+        assert!(
+            (last_narrow - last_wide).abs() < 1e-6,
+            "same frame, different gain: {last_narrow} vs {last_wide}"
+        );
+
+        // And both must have the same amount of ramp left, so the next
+        // period continues from the same place.
+        let mut narrow_next = vec![1.0_f32; 2];
+        let mut wide_next = vec![1.0_f32; 6];
+        narrow.apply(&mut narrow_next, 2);
+        wide.apply(&mut wide_next, 6);
+        assert!(
+            (narrow_next[0] - wide_next[0]).abs() < 1e-6,
+            "the ramps have drifted apart across periods: {} vs {}",
+            narrow_next[0],
+            wide_next[0]
+        );
+    }
+
     fn db(gain: f32) -> f32 {
         20.0 * gain.log10()
     }
