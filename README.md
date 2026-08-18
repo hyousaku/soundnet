@@ -484,6 +484,41 @@ Tests:
 cargo test --workspace
 ```
 
+#### The loopback test
+
+`cargo test --workspace` is entirely pure functions and fakes. Nothing in it
+goes through ALSA — which is an odd gap for a project whose hard-won lessons
+are nearly all about ALSA behaviour, and every one of those is held in place
+by a comment rather than by a check.
+
+There is one test that closes the gap, and it needs a kernel module, so it is
+marked `#[ignore]` and run deliberately:
+
+```bash
+sudo modprobe snd-aloop
+cargo test --test loopback -- --ignored --nocapture
+```
+
+`snd-aloop` presents a virtual card whose playback subdevices feed its capture
+subdevices. The test starts an engine on its own ports and config, patches a
+tone source to `hw:CARD=Loopback,DEV=0`, reads the far side back from
+`hw:CARD=Loopback,DEV=1`, and checks in the frequency domain that what comes
+out is the 440 Hz tone that went in and not noise, silence or a stuck buffer.
+It covers the whole playback path and the whole transport: the RTP really
+leaves the socket and really comes back.
+
+It is not in CI because it cannot be. GitHub's `ubuntu-24.04` runner has no
+`/lib/modules/$(uname -r)` tree at all — not "snd-aloop is not loaded" but
+"there are no modules and no `/proc/asound`" — so `modprobe` has nothing to
+load. That was measured on the runner, not assumed. CI still compiles the
+test on every push, so it cannot rot into something that no longer matches
+the API it drives; it just never runs it.
+
+If you have a second sound interface you can run the same shape of check
+against real hardware by patching a tone to it and recording the output, but
+the automated version wants `snd-aloop` specifically, because its capture side
+is bit-exact with its playback side.
+
 ### Continuous integration
 
 `.github/workflows/ci.yml` runs on pushes to `main` and on every pull
