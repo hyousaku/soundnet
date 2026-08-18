@@ -275,9 +275,44 @@ A linear ramp would already be at -6 dB by the same point.
 
 **This is not a limiter.** It bounds how fast the level arrives, not how high.
 If the source is genuinely producing full-scale noise, that is what plays once
-the ramp finishes. If a machine in your setup can come up with a hot input
-after a reboot, fix that where it lives — `alsactl` state, the mixer, the
-interface's own gain — because nothing here will hold it down.
+the ramp finishes.
+
+### If a machine comes back loud, look at its mixer first
+
+That is what happened here, and the mixer said so plainly:
+
+```bash
+amixer -c 0 contents | grep -A3 -i "capture\|boost"
+```
+
+```
+numid=15,name='Capture Volume'            : values=63,63   (max=63)
+  | dBscale-min=-17.25dB,step=0.75dB      →  +30.0 dB
+numid=17,name='Internal Mic Boost Volume' : values=3,3     (max=3)
+  | dBscale-min=0.00dB,step=10.00dB       →  +30.0 dB
+```
+
+Read the `dBscale` line to turn a raw value into decibels: value x step, offset
+by the minimum. Both of those are pegged, so that laptop's internal microphone
+was running at **+60 dB** — enough that the microphone's own self-noise is a
+full-scale hiss before anything in the room contributes.
+
+Nothing about a fresh boot sets sensible capture gain on its own. If you took a
+card away from PipeWire so SoundNet could have it exclusively, you also took
+away the thing that had been managing these controls, and the card now comes up
+at whatever the driver defaults to.
+
+```bash
+amixer -c 0 sset 'Internal Mic Boost' 0
+amixer -c 0 sset 'Capture' 40            # 63 is +30 dB; 40 is about +12 dB
+sudo alsactl store 0                     # survive the next reboot
+sudo systemctl enable alsa-restore.service
+```
+
+Check `Capture Source` too — a card can be listening to its internal mic while
+you are talking into the one you plugged in. `arecord -D hw:0,0 -V mono
+-f S32_LE -c 2 -r 48000 /dev/null` gives a live meter to set it against, and
+the route's `in` meter in the UI shows the same thing once audio is flowing.
 
 The capture side ramps too, over 200 ms, at device open and after every xrun
 recovery: both are moments when the driver has just restarted its DMA ring,
