@@ -264,7 +264,24 @@ fn run(
         // sound enough proxy — so a long run of them followed by signal is
         // the sender coming back, which is precisely when the level is
         // unknown and must not arrive as a step.
-        let raw_peak = floats.iter().fold(0.0_f32, |acc, s| acc.max(s.abs()));
+        //
+        // Samples past the rails are counted here, in the same pass, and
+        // deliberately *before* the ramp — see the note on the meter below
+        // for why the two measurements sit on opposite sides of it.
+        let mut raw_peak = 0.0_f32;
+        let mut over = 0usize;
+        for &s in floats.iter() {
+            let a = s.abs();
+            if a > raw_peak {
+                raw_peak = a;
+            }
+            if a > 1.0 {
+                over += 1;
+            }
+        }
+        if over > 0 {
+            w.clipped.fetch_add(over, Ordering::Relaxed);
+        }
         if raw_peak == 0.0 {
             silent_frames = silent_frames.saturating_add(period_frames as u64);
         } else {
@@ -298,23 +315,22 @@ fn run(
 
         // Rolling peak for the level meter, decayed so brief silence still
         // reads as quiet without the meter feeling twitchy. Measured after
-        // the ramp, so the meter shows what actually leaves the machine. The
-        // same pass counts samples past the rails, since `f32_to_alsa` clamps
-        // them a few lines below and the information would be gone by then.
-        let mut peak = 0.0_f32;
-        let mut over = 0usize;
-        for &s in floats.iter() {
-            let a = s.abs();
-            if a > peak {
-                peak = a;
-            }
-            if a > 1.0 {
-                over += 1;
-            }
-        }
-        if over > 0 {
-            w.clipped.fetch_add(over, Ordering::Relaxed);
-        }
+        // the ramp, so the meter shows what actually leaves the machine.
+        //
+        // The clip counter is measured *before* it, a few lines up, and the
+        // asymmetry is the point: the meter answers "what is coming out of
+        // this machine", which the ramp is part of, while the clip counter
+        // answers "what is the source doing", which the ramp is not.
+        //
+        // Counting after the ramp meant the counter read zero for the whole
+        // two seconds of a cold resume, no matter how hard the incoming
+        // audio was hitting the rails — the ramp had already scaled it under
+        // 1.0. That is exactly backwards. A machine that has just rebooted
+        // with its mixer at some unknown gain is the single most likely
+        // moment for a gain accident, which is why the long ramp exists at
+        // all, and the instrument for spotting one was closing its eyes for
+        // precisely that window.
+        let peak = floats.iter().fold(0.0_f32, |acc, s| acc.max(s.abs()));
         publish_level(&w.level_bits, peak);
 
         window::scatter(
