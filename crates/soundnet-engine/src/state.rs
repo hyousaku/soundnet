@@ -2,7 +2,7 @@
 
 use dashmap::DashMap;
 use mdns_sd::ServiceDaemon;
-use soundnet_protocol::{LocalPort, Node, PortId, Route, RouteId, StreamStats};
+use soundnet_protocol::{LocalPort, Node, PortId, Route, RouteId};
 use std::net::IpAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock as StdRwLock};
@@ -56,9 +56,6 @@ pub struct EngineState {
     /// which for a patch bay is nothing.
     pub route_locks: DashMap<RouteId, Arc<Mutex<()>>>,
 
-    /// Rolling per-route stats (updated by workers).
-    pub stats: DashMap<RouteId, StreamStats>,
-
     /// Persisted config path we write back to on route/manual-host changes.
     pub config_path: RwLock<Option<PathBuf>>,
 
@@ -106,7 +103,6 @@ impl EngineState {
             running: DashMap::new(),
             failures: DashMap::new(),
             route_locks: DashMap::new(),
-            stats: DashMap::new(),
             config_path: RwLock::new(None),
             manual_hosts: RwLock::new(Vec::new()),
             selected_interface: RwLock::new(None),

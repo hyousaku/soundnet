@@ -666,7 +666,6 @@ pub async fn remove_route(state: &Arc<EngineState>, id: &str, gossip: bool) {
         }
         state.failures.remove(id);
     }
-    state.stats.remove(id);
     persist(state).await;
     if gossip {
         if let Some(route) = route {
@@ -1014,8 +1013,7 @@ mod tests {
     use crate::state::{EngineIdentity, EngineState};
     use crate::transport::receiver::BIND_FAILED;
     use soundnet_protocol::{
-        Encoding, LocalPort, PortKind, PortRef, Route, RouteHealth, SampleFormat, StreamSpec,
-        StreamStats,
+        Encoding, LocalPort, PortKind, PortRef, Route, SampleFormat, StreamSpec,
     };
     use std::net::{IpAddr, Ipv4Addr};
     use std::sync::Arc;
@@ -1124,23 +1122,6 @@ mod tests {
             pb_format: None,
             cap_xruns: None,
             clipped: None,
-        }
-    }
-
-    fn stats_sentinel() -> StreamStats {
-        StreamStats {
-            xruns: 7,
-            capture_level_db: None,
-            playback_level_db: None,
-            health: RouteHealth::Ok,
-            roc_e2e_ms: None,
-            capture_buffer_ms: None,
-            playback_buffer_ms: None,
-            capture_format: None,
-            playback_format: None,
-            capture_xruns: None,
-            playback_xruns: None,
-            clipped_samples: None,
         }
     }
 
@@ -1276,18 +1257,11 @@ mod tests {
         apply_route(&state, r.clone(), false).await.unwrap();
         state.running.insert(r.id.clone(), idle_running());
         record_failure(&state, &r.id, "boom");
-        // Nothing populates `state.stats` today — the stats pump broadcasts a
-        // map it builds locally. The entry is planted by hand so that the
-        // teardown of this map is actually asserted rather than passing by
-        // virtue of always being empty.
-        state.stats.insert(r.id.clone(), stats_sentinel());
-
         remove_route(&state, &r.id, false).await;
 
         assert!(!state.routes.contains_key(&r.id), "routes");
         assert!(!state.running.contains_key(&r.id), "running");
         assert!(!state.failures.contains_key(&r.id), "failures");
-        assert!(!state.stats.contains_key(&r.id), "stats");
     }
 
     /// `retry_pending_for_peer` and the supervisor both iterate a snapshot of
