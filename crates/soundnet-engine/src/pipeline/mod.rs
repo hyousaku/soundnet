@@ -6,6 +6,7 @@
 //! with a ring buffer in between; see the module docs on `send.rs` for why
 //! that ring had to go.)
 
+pub mod fade;
 pub mod recv;
 pub mod send;
 
@@ -82,6 +83,30 @@ pub const DEVICE_WAIT_TIMEOUT_MS: u32 = 100;
 /// the counter resets on the next successful wait, so a device that stalls
 /// repeatedly produces one line each time rather than ten a second forever.
 pub const STALL_WARN_AFTER: u32 = 10;
+
+/// How long audio takes to come back up to full level after a gap.
+///
+/// Applied by both pipelines through `fade::Fade` — see that module for what
+/// a ramp does and does not protect against, and for the incident that put it
+/// there. 200 ms is a compromise: long enough that a burst arrives as a swell
+/// somebody can react to and short enough that a stream resuming on purpose
+/// does not feel broken.
+pub const RESUME_FADE_MS: u32 = 200;
+
+/// How much unbroken digital silence counts as "the stream was gone", after
+/// which the receiver ramps the audio back in rather than resuming at full
+/// level.
+///
+/// The test is exact zeros, which is a proxy for "roc has no session": with
+/// no sender connected `roc_receiver_read` zero-fills the frame, while a real
+/// converter's idea of silence always carries some noise in the low bits. The
+/// proxy is not perfect — a digitally muted source does produce exact zeros —
+/// but the consequence of a false positive is a 200 ms fade-in on a passage
+/// that was already silent, which nobody can hear.
+///
+/// Half a second is well past any musical gap and well short of the time it
+/// takes to notice a machine has dropped off.
+pub const SILENCE_BEFORE_FADE_MS: u32 = 500;
 
 #[cfg(test)]
 mod tests {

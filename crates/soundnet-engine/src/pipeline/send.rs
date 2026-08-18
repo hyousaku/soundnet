@@ -56,8 +56,9 @@ use std::thread::{self, JoinHandle};
 
 use crate::audio::format::alsa_to_f32;
 use crate::audio::{pcm, window};
+use crate::pipeline::fade::Fade;
 use crate::pipeline::{
-    publish_level, DEVICE_WAIT_TIMEOUT_MS, MAX_CONSECUTIVE_ERRORS, STALL_WARN_AFTER,
+    publish_level, DEVICE_WAIT_TIMEOUT_MS, MAX_CONSECUTIVE_ERRORS, RESUME_FADE_MS, STALL_WARN_AFTER,
 };
 use crate::tone;
 use crate::transport::{sender, RocContext};
@@ -276,6 +277,15 @@ fn alsa_loop(
     let mut consecutive_errors = 0_u32;
     let mut stalled = 0_u32;
 
+    // Ramp in from silence whenever this device starts producing, which means
+    // at open and again after every xrun recovery. Both are moments when the
+    // driver has just (re)started its DMA ring, and the first period or two
+    // out of a freshly started ring is not reliably audio — on some hardware
+    // it is whatever was in that memory. Shipping that at full scale is one
+    // of the ways a remote machine's speakers get a bang out of nowhere.
+    let mut fade = Fade::new(spec.rate, RESUME_FADE_MS);
+    fade.arm();
+
     while !stop.load(Ordering::Relaxed) {
         // The one blocking point in this loop — see the module docs. Waiting
         // here rather than inside `readi` is what bounds how long a stop
@@ -320,6 +330,9 @@ fn alsa_loop(
                     }
                     tracing::warn!("capture {alsa_name} xrun recovered");
                     pcm::ensure_capture_running(&pcm);
+                    // The ring was just reset; treat what comes out of it
+                    // next like a fresh start.
+                    fade.arm();
                     continue;
                 }
                 bail!("capture {alsa_name} wait: {err}");
@@ -344,6 +357,9 @@ fn alsa_loop(
                     }
                     tracing::warn!("capture {alsa_name} xrun recovered");
                     pcm::ensure_capture_running(&pcm);
+                    // The ring was just reset; treat what comes out of it
+                    // next like a fresh start.
+                    fade.arm();
                     continue;
                 }
                 bail!("capture {alsa_name} read: {err}");
@@ -359,6 +375,7 @@ fn alsa_loop(
             channels,
             &mut floats,
         );
+        fade.apply(&mut floats, channels);
         publish_level(level_bits, peak_of(&floats));
 
         if let Err(err) = sender.write(&mut floats) {
@@ -400,6 +417,11 @@ fn tone_loop(
     level_bits: &Arc<AtomicU32>,
 ) -> Result<()> {
     let mut sender = sender::open(ctx, dst_host, dst_port, spec, outgoing)?;
+    // A test tone is a known, bounded amplitude, so this is not about safety
+    // here — it is so a preview tone arrives as a note rather than as a click
+    // into whatever monitors happen to be up.
+    let mut fade = Fade::new(spec.rate, RESUME_FADE_MS);
+    fade.arm();
 
     let period_frames = spec.frames_per_period as usize;
     let mut buf: Vec<f32> = Vec::with_capacity(period_frames * spec.channels as usize);
@@ -418,6 +440,7 @@ fn tone_loop(
             &mut phase,
             &mut buf,
         );
+        fade.apply(&mut buf, spec.channels as usize);
         publish_level(level_bits, peak_of(&buf));
         if let Err(err) = sender.write(&mut buf) {
             consecutive_errors += 1;

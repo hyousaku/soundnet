@@ -46,8 +46,10 @@ use std::thread::{self, JoinHandle};
 
 use crate::audio::format::f32_to_alsa;
 use crate::audio::{pcm, window};
+use crate::pipeline::fade::Fade;
 use crate::pipeline::{
-    publish_level, DEVICE_WAIT_TIMEOUT_MS, MAX_CONSECUTIVE_ERRORS, STALL_WARN_AFTER,
+    publish_level, DEVICE_WAIT_TIMEOUT_MS, MAX_CONSECUTIVE_ERRORS, RESUME_FADE_MS,
+    SILENCE_BEFORE_FADE_MS, STALL_WARN_AFTER,
 };
 use crate::transport::{receiver, RocContext};
 
@@ -218,6 +220,16 @@ fn run(
     let mut consecutive_errors = 0_u32;
     let mut stalled = 0_u32;
 
+    // Ramp the output up whenever audio arrives after the stream has been
+    // away — see `fade.rs` for the incident this is here for. Armed from the
+    // start, because a route that has only just opened is the same situation
+    // as one whose sender vanished and came back: about to play material this
+    // engine has never seen at a level nobody has checked.
+    let mut fade = Fade::new(spec.rate, RESUME_FADE_MS);
+    fade.arm();
+    let silence_before_fade = spec.rate as u64 * SILENCE_BEFORE_FADE_MS as u64 / 1000;
+    let mut silent_frames: u64 = 0;
+
     while !w.stop.load(Ordering::Relaxed) {
         // Set false by anything that went wrong this iteration. The error
         // budget is per *iteration*, not per call site: a healthy receiver
@@ -231,17 +243,44 @@ fn run(
         if let Err(err) = rx.read(&mut floats) {
             healthy = false;
             tracing::warn!("recv pipeline {alsa_name}: {err:#}");
-            // Deliberately fall through to the write below rather than
-            // `continue`: `floats` still holds the previous period, and
-            // skipping the write would skip this loop's only blocking call.
-            // A real-time thread spinning on a failing receiver would pin a
-            // core; playing one stale period costs nothing by comparison.
+            // Silence, not the previous period. Falling through to the write
+            // is deliberate — skipping it would skip this loop's only
+            // blocking call, and a real-time thread spinning on a failing
+            // receiver would pin a core — but *what* gets written matters.
+            // `floats` still holds the last period roc produced, and replaying
+            // it means a receiver failing every read emits that fragment over
+            // and over at period rate. If the last thing through was loud,
+            // so is the loop. Writing a period of silence keeps the pacing
+            // and cannot make noise.
+            floats.fill(0.0);
         }
 
+        // What roc handed over, before any ramp of ours. Exact zeros mean it
+        // has no session — see `SILENCE_BEFORE_FADE_MS` for why that is a
+        // sound enough proxy — so a long run of them followed by signal is
+        // the sender coming back, which is precisely when the level is
+        // unknown and must not arrive as a step.
+        let raw_peak = floats.iter().fold(0.0_f32, |acc, s| acc.max(s.abs()));
+        if raw_peak == 0.0 {
+            silent_frames = silent_frames.saturating_add(period_frames as u64);
+        } else {
+            if silent_frames >= silence_before_fade {
+                tracing::info!(
+                    "recv pipeline {alsa_name}: audio resumed after {:.1}s of silence, \
+                     ramping in over {RESUME_FADE_MS}ms",
+                    silent_frames as f64 / spec.rate as f64
+                );
+                fade.arm();
+            }
+            silent_frames = 0;
+        }
+        fade.apply(&mut floats, channels);
+
         // Rolling peak for the level meter, decayed so brief silence still
-        // reads as quiet without the meter feeling twitchy. The same pass
-        // counts samples past the rails, since `f32_to_alsa` clamps them a
-        // few lines below and the information would be gone by then.
+        // reads as quiet without the meter feeling twitchy. Measured after
+        // the ramp, so the meter shows what actually leaves the machine. The
+        // same pass counts samples past the rails, since `f32_to_alsa` clamps
+        // them a few lines below and the information would be gone by then.
         let mut peak = 0.0_f32;
         let mut over = 0usize;
         for &s in floats.iter() {
