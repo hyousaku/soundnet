@@ -4,7 +4,7 @@ import { summarizeLatency } from "./latency";
 import { describeHealth } from "./health";
 
 const RATES = [44100, 48000, 88200, 96000];
-const FORMATS: SampleFormat[] = ["S16_LE", "S24_LE3", "S32_LE", "F32_LE"];
+const FORMATS: SampleFormat[] = ["S16_LE", "S24_LE3", "S24_LE", "S32_LE", "F32_LE"];
 const PERIODS = [32, 64, 128, 256, 512];
 const LATENCIES = [3, 5, 10, 20, 40, 80];
 

@@ -24,6 +24,7 @@ use crate::state::EngineState;
 
 const CANDIDATE_FORMATS: &[(alsa::pcm::Format, SampleFormat)] = &[
     (alsa::pcm::Format::S243LE, SampleFormat::S24Le3),
+    (alsa::pcm::Format::S24LE, SampleFormat::S24Le),
     (alsa::pcm::Format::s16(), SampleFormat::S16Le),
     (alsa::pcm::Format::s32(), SampleFormat::S32Le),
     (alsa::pcm::Format::float(), SampleFormat::F32Le),

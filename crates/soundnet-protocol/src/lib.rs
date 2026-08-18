@@ -23,6 +23,12 @@ pub enum PortKind {
 pub enum SampleFormat {
     S16Le,
     S24Le3,
+    /// 24 bits right-justified in a 4-byte little-endian word, with the top
+    /// byte carrying the sign. The third of ALSA's three 24-bit formats, and
+    /// distinct from `S32Le`, which is 24 bits *left*-justified in the same
+    /// container. Reading one as the other is a 256x error, not a rounding
+    /// difference.
+    S24Le,
     S32Le,
     F32Le,
 }
@@ -32,6 +38,7 @@ impl SampleFormat {
         match self {
             SampleFormat::S16Le => 2,
             SampleFormat::S24Le3 => 3,
+            SampleFormat::S24Le => 4,
             SampleFormat::S32Le => 4,
             SampleFormat::F32Le => 4,
         }
@@ -48,6 +55,11 @@ impl SampleFormat {
             SampleFormat::S24Le3 => 1,
             SampleFormat::S32Le => 2,
             SampleFormat::F32Le => 3,
+            // Appended rather than slotted in next to S24Le3, because these
+            // numbers travel between engines: renumbering an existing format
+            // would make an older peer read every reported format as a
+            // different one.
+            SampleFormat::S24Le => 4,
         }
     }
 
@@ -57,6 +69,7 @@ impl SampleFormat {
             1 => Some(SampleFormat::S24Le3),
             2 => Some(SampleFormat::S32Le),
             3 => Some(SampleFormat::F32Le),
+            4 => Some(SampleFormat::S24Le),
             _ => None,
         }
     }
@@ -420,7 +433,38 @@ pub enum ServerMsg {
 
 #[cfg(test)]
 mod tests {
-    use super::RouteHealth;
+    use super::{RouteHealth, SampleFormat};
+
+    /// `SampleFormat` names travel two ways that nothing in the build
+    /// checks: into `web/src/protocol.ts`, whose union has to match
+    /// character for character, and between engines over gossip. The
+    /// `as_u8`/`from_u8` pair is a third encoding again, used to publish the
+    /// negotiated format out of a `SCHED_FIFO` audio thread — a variant added
+    /// without a discriminant would silently read back as `None` and the UI
+    /// would say the device had not been opened.
+    #[test]
+    fn sample_format_names_and_codes_match_what_the_other_side_expects() {
+        let expected = [
+            (SampleFormat::S16Le, "S16_LE", 0u8),
+            (SampleFormat::S24Le3, "S24_LE3", 1),
+            (SampleFormat::S24Le, "S24_LE", 4),
+            (SampleFormat::S32Le, "S32_LE", 2),
+            (SampleFormat::F32Le, "F32_LE", 3),
+        ];
+        for (fmt, name, code) in expected {
+            assert_eq!(
+                serde_json::to_value(fmt).expect("serialize"),
+                serde_json::json!(name),
+                "{fmt:?} does not serialize as the TypeScript union expects"
+            );
+            assert_eq!(fmt.as_u8(), code, "{fmt:?} changed its wire code");
+            assert_eq!(
+                SampleFormat::from_u8(code),
+                Some(fmt),
+                "code {code} no longer decodes to {fmt:?}"
+            );
+        }
+    }
 
     /// The JSON shape of `RouteHealth` is a contract with `web/src/protocol.ts`,
     /// and nothing in the build checks the two against each other — a renamed

@@ -9,6 +9,7 @@ pub fn to_alsa_format(fmt: SampleFormat) -> alsa::pcm::Format {
     match fmt {
         SampleFormat::S16Le => alsa::pcm::Format::s16(),
         SampleFormat::S24Le3 => alsa::pcm::Format::S243LE,
+        SampleFormat::S24Le => alsa::pcm::Format::S24LE,
         SampleFormat::S32Le => alsa::pcm::Format::s32(),
         SampleFormat::F32Le => alsa::pcm::Format::float(),
     }
@@ -35,9 +36,10 @@ pub fn to_alsa_format(fmt: SampleFormat) -> alsa::pcm::Format {
 /// subslots), `S32_LE` carries them left-justified in a 32-bit word with the
 /// low 8 ignored (common everywhere else, and *not* a sign that the device is
 /// only doing 16 or 32 bit work), and `S24_LE` right-justifies them in 4
-/// bytes — that third one is not in this list or in
-/// `devices::CANDIDATE_FORMATS`, so a device offering only `S24_LE` still
-/// looks 24-bit-incapable to this engine.
+/// bytes. All three are here now. `S24_LE` used to be missing, which meant a
+/// device offering only that one looked 24-bit-incapable: it never appeared
+/// in the port's format list, and a 24-bit route on it got substituted down
+/// to whatever else it happened to offer.
 ///
 /// This is the same *set* as `devices::CANDIDATE_FORMATS`, which is what the
 /// UI lists as a port's supported formats — so substitution can never land on
@@ -48,6 +50,10 @@ const FALLBACK_FORMATS: &[SampleFormat] = &[
     // The likeliest exact match for a 24-bit device, and no loss for anything
     // else in the list.
     SampleFormat::S24Le3,
+    // The other 24-bit-in-4-bytes layout. Same resolution as S24_3LE, so it
+    // ranks with it and above the 32-bit container only because a device
+    // offering it is telling us 24 bits is what it actually has.
+    SampleFormat::S24Le,
     // 32-bit container: holds everything f32 can represent.
     SampleFormat::S32Le,
     // Exactly what the wire carries, so no conversion at all — but rarely
@@ -106,6 +112,20 @@ pub fn alsa_to_f32(fmt: SampleFormat, bytes: &[u8], out: &mut Vec<f32>) {
                 out.push(signed as f32 / 8_388_607.0);
             }
         }
+        SampleFormat::S24Le => {
+            out.reserve(bytes.len() / 4);
+            for chunk in bytes.chunks_exact(4) {
+                // Right-justified: the value occupies the low 24 bits and the
+                // top byte is padding, so it has to be sign-extended from bit
+                // 23 rather than read as an i32. Reading it as one would be
+                // wrong by a factor of 256 for a device that zero-pads, and
+                // would turn every negative sample into a large positive one
+                // for a device that sign-extends.
+                let raw = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+                let signed = ((raw << 8) as i32) >> 8;
+                out.push(signed as f32 / 8_388_607.0);
+            }
+        }
         SampleFormat::S32Le => {
             out.reserve(bytes.len() / 4);
             for chunk in bytes.chunks_exact(4) {
@@ -142,6 +162,19 @@ pub fn f32_to_alsa(fmt: SampleFormat, samples: &[f32], out: &mut Vec<u8>) {
                 out.push((v & 0xFF) as u8);
                 out.push(((v >> 8) & 0xFF) as u8);
                 out.push(((v >> 16) & 0xFF) as u8);
+            }
+        }
+        SampleFormat::S24Le => {
+            out.reserve(samples.len() * 4);
+            for &s in samples {
+                let clamped = s.clamp(-1.0, 1.0);
+                let v = (clamped * 8_388_607.0) as i32;
+                // Sign-extend into the top byte rather than zeroing it. ALSA
+                // specifies the padding as "don't care", but drivers that do
+                // look at it expect a sign-extended word, and writing zeroes
+                // there makes every negative sample read as a large positive
+                // one on those. Sign-extension is correct for both.
+                out.extend_from_slice(&v.to_le_bytes());
             }
         }
         SampleFormat::S32Le => {
@@ -273,6 +306,7 @@ mod tests {
         let all = vec![
             SampleFormat::S16Le,
             SampleFormat::S24Le3,
+            SampleFormat::S24Le,
             SampleFormat::S32Le,
             SampleFormat::F32Le,
         ];
@@ -280,11 +314,87 @@ mod tests {
             match f {
                 SampleFormat::S16Le
                 | SampleFormat::S24Le3
+                | SampleFormat::S24Le
                 | SampleFormat::S32Le
                 | SampleFormat::F32Le => {}
             }
         }
         all
+    }
+
+    /// The format this variant exists for. `S24_LE` and `S32_LE` share a
+    /// container and differ only in where the 24 bits sit inside it, so the
+    /// one thing that must not happen is reading one as the other.
+    #[test]
+    fn s24_le_is_not_s32_le_with_extra_steps() {
+        let src = vec![0.5_f32];
+        let mut as_s24 = Vec::new();
+        let mut as_s32 = Vec::new();
+        f32_to_alsa(SampleFormat::S24Le, &src, &mut as_s24);
+        f32_to_alsa(SampleFormat::S32Le, &src, &mut as_s32);
+        assert_eq!(as_s24.len(), 4);
+        assert_eq!(as_s32.len(), 4);
+        assert_ne!(
+            as_s24, as_s32,
+            "24 bits right-justified and 24 bits left-justified must not \
+             produce the same word — mixing them up is a 256x error"
+        );
+
+        // Read back the wrong way round to pin down which way the mistake
+        // goes, so a future change that "fixes" one by breaking the other
+        // gets caught.
+        let mut misread = Vec::new();
+        alsa_to_f32(SampleFormat::S32Le, &as_s24, &mut misread);
+        assert!(
+            misread[0].abs() < 0.01,
+            "reading right-justified 24-bit as 32-bit should collapse to near \
+             silence, got {}",
+            misread[0]
+        );
+    }
+
+    /// Negative samples are where the padding byte matters: a device that
+    /// reads the top byte expects it sign-extended, and zeroing it turns
+    /// every negative sample into a large positive one.
+    #[test]
+    fn roundtrip_s24_le_including_negatives() {
+        let src = vec![0.0_f32, 0.25, -0.25, 0.75, -0.9, 1.0, -1.0];
+        let mut bytes = Vec::new();
+        f32_to_alsa(SampleFormat::S24Le, &src, &mut bytes);
+        assert_eq!(bytes.len(), src.len() * 4);
+        let mut back = Vec::new();
+        alsa_to_f32(SampleFormat::S24Le, &bytes, &mut back);
+        assert_eq!(back.len(), src.len());
+        for (a, b) in src.iter().zip(back.iter()) {
+            assert!(
+                (a - b).abs() < 1.0 / 8_388_607.0 * 2.0,
+                "{a} came back as {b}"
+            );
+        }
+
+        // The padding really is sign-extended, not zeroed.
+        let negative = &bytes[2 * 4..3 * 4];
+        assert_eq!(
+            negative[3], 0xFF,
+            "the pad byte of a negative sample should be sign-extended, got {:#04x}",
+            negative[3]
+        );
+    }
+
+    /// A device that only offers `S24_LE` used to look 24-bit-incapable: the
+    /// format was in neither the fallback list nor the probe candidates, so a
+    /// 24-bit route on it was substituted down to whatever else it had.
+    #[test]
+    fn a_device_offering_only_s24_le_is_not_treated_as_16_bit() {
+        let chosen = pick_format(SampleFormat::S24Le3, |f| {
+            matches!(f, SampleFormat::S16Le | SampleFormat::S24Le)
+        });
+        assert_eq!(
+            chosen,
+            Some(SampleFormat::S24Le),
+            "asked for 24 bits, the device offered 24 bits in a different \
+             layout, and 16 was chosen instead"
+        );
     }
 
     #[test]

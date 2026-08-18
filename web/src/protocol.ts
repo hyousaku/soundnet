@@ -9,7 +9,7 @@ export type RouteId = string;
 
 export type PortKind = "capture" | "playback" | "tone";
 
-export type SampleFormat = "S16_LE" | "S24_LE3" | "S32_LE" | "F32_LE";
+export type SampleFormat = "S16_LE" | "S24_LE3" | "S24_LE" | "S32_LE" | "F32_LE";
 
 export interface Node {
   id: NodeId;
