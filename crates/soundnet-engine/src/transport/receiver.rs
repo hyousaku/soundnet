@@ -13,6 +13,17 @@ use std::sync::Arc;
 
 use super::{endpoint_free, endpoint_from_uri, RocContext};
 
+/// Prefix of the error a failed `roc_receiver_bind` produces.
+///
+/// A constant rather than a literal because `routing` matches on it: a bind
+/// failure here is almost always two routes hashing onto the same UDP port,
+/// and routing is the only place that knows the other route's name. libroc
+/// gives us a return code and nothing else — no errno, no "address in use" —
+/// so the text is the only handle there is. Reworded here without updating
+/// the matcher, the diagnosis silently stops appearing; sharing the constant
+/// makes that impossible.
+pub const BIND_FAILED: &str = "receiver bind";
+
 pub struct Receiver {
     raw: *mut roc::roc_receiver,
     /// Keeps the shared context alive for at least as long as this receiver.
@@ -128,7 +139,7 @@ pub fn open(ctx: Arc<RocContext>, host: &str, port: u16, spec: &StreamSpec) -> R
         let rc = unsafe { roc::roc_receiver_bind(receiver.raw, roc::ROC_SLOT_DEFAULT, iface, ep) };
         endpoint_free(ep);
         if rc != 0 {
-            bail!("receiver bind {what} failed ({rc})");
+            bail!("{BIND_FAILED} {what} failed ({rc})");
         }
         Ok(())
     };

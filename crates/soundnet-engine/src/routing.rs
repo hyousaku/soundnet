@@ -200,10 +200,29 @@ async fn roc_context() -> Result<Arc<RocContext>> {
 /// a control channel. Widening the stride to 3 keeps each route's 3-port
 /// window disjoint from its neighbors' by construction.
 ///
-/// Range: `audio_port + 3 * (1..=1000)` — that's still 1000 concurrent
-/// inbound routes per engine before same-bucket collisions become likely
-/// (see `route_ports_never_partially_overlap` for what "collide" does and
-/// doesn't mean here).
+/// Range: `audio_port + 3 * (1..=1000)`. This used to say that meant 1000
+/// concurrent inbound routes before collisions became likely, which is the
+/// birthday problem read backwards and wrong by two orders of magnitude. With
+/// 1000 buckets the chance that *some* pair of routes shares one is roughly
+/// `1 - exp(-n(n-1)/2000)`: about **4% at 10 routes, 39% at 32, and even odds
+/// by 38**. For a patch bay of a few dozen routes this is a thing that
+/// happens, not a thing that theoretically could.
+///
+/// What a collision does: the receiver's `roc_receiver_bind` fails with
+/// EADDRINUSE for whichever route starts second, and that route retries
+/// forever. Audio never mixes — the receive sockets are opened without
+/// SO_REUSEADDR, so the second bind is refused rather than shared. The
+/// symptom is one route out of many that just won't start, with a libroc
+/// return code that names no cause, which is why `port_conflict` below
+/// works out the other route's name and puts it in the error.
+///
+/// Deliberately *not* fixed by reallocating on collision (next free bucket,
+/// probing, anything adaptive): both engines derive this independently with
+/// no negotiation, so the two ends would have to agree on the reallocation
+/// too. Their route sets differ transiently all the time — gossip in flight,
+/// a peer mid-restart — and disagreeing means each end listens on a port the
+/// other isn't using, which is a silent failure. A loud one that names the
+/// conflicting route is worth more here than a clever one.
 ///
 /// This is a pure function of `route_id` and the peer's advertised
 /// `audio_port` — it has to stay that way, since both engines derive it
@@ -214,6 +233,58 @@ pub fn route_port(audio_port_base: u16, route_id: &str) -> u16 {
     route_id.hash(&mut hasher);
     let h = hasher.finish();
     audio_port_base.saturating_add(3 + ((h % 1000) as u16) * 3)
+}
+
+/// Other routes this engine also receives for whose port window is the same
+/// as `route_id`'s. Empty in the overwhelmingly common case.
+///
+/// Only inbound routes matter: the port is bound on the destination engine,
+/// so two routes sharing a bucket are harmless unless this machine is the
+/// destination for both.
+fn port_conflicts(state: &Arc<EngineState>, route_id: &str) -> Vec<String> {
+    let base = state.identity.audio_port;
+    let port = route_port(base, route_id);
+    let mut ids: Vec<String> = state
+        .routes
+        .iter()
+        .filter(|e| e.value().dst.node_id == state.identity.node_id)
+        .map(|e| e.key().clone())
+        .filter(|id| id != route_id && route_port(base, id) == port)
+        .collect();
+    // `DashMap` iteration order is arbitrary; sort so the same conflict reads
+    // the same way every time it is reported.
+    ids.sort();
+    ids
+}
+
+/// Turn libroc's bare "receiver bind source failed (-1)" into something that
+/// says what to do about it.
+///
+/// A failed bind is nearly always two routes landing in the same port bucket
+/// (see `route_port` for how often that actually happens — much more often
+/// than the old comment claimed). libroc reports a return code and nothing
+/// else: no errno, no address, no hint that another socket is involved. From
+/// the UI it looks like one route out of many that mysteriously refuses to
+/// start, and the only way to find out why was to work the hash out by hand.
+///
+/// This engine already knows every route it is the destination for, so it can
+/// just say which one is sitting on the port.
+fn explain_failure(state: &Arc<EngineState>, route_id: &str, reason: String) -> String {
+    if !reason.contains(crate::transport::receiver::BIND_FAILED) {
+        return reason;
+    }
+    let others = port_conflicts(state, route_id);
+    if others.is_empty() {
+        return reason;
+    }
+    let port = route_port(state.identity.audio_port, route_id);
+    format!(
+        "{reason}; UDP ports {port}-{} are already claimed by route {} \
+         (route ids hash onto a shared set of ports, and these landed on the \
+         same one) — recreate either route to move it to a different port",
+        port + 2,
+        others.join(", ")
+    )
 }
 
 /// Whether this route asks for a route source and this engine is the sender.
@@ -382,6 +453,7 @@ async fn start_locked(state: &Arc<EngineState>, route: &Route) -> Result<()> {
             shutdown_running(dead_route).await;
         }
         let reason = dead_reason.unwrap_or_else(|| "pipeline exited".to_string());
+        let reason = explain_failure(state, &route.id, reason);
         tracing::warn!(
             "route {} pipeline died: {reason}; backing off before retry",
             route.id
@@ -406,7 +478,12 @@ async fn start_locked(state: &Arc<EngineState>, route: &Route) -> Result<()> {
         }
         Ok(None) => Ok(()),
         Err(err) => {
-            record_failure(state, &route.id, &format!("{err:#}"));
+            // A bind failure can't reach here today (the bind happens on the
+            // spawned thread, so `recv::spawn` returns Ok long before it), but
+            // routing this through the same explainer means it stays diagnosed
+            // if that ever changes.
+            let reason = explain_failure(state, &route.id, format!("{err:#}"));
+            record_failure(state, &route.id, &reason);
             Err(err)
         }
     }
@@ -912,10 +989,11 @@ fn join_running(running: RunningRoute) {
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_route, backoff_for_attempts, record_failure, remove_route, retry_pending_for_peer,
-        route_port, try_start, validate_route, RunningRoute,
+        apply_route, backoff_for_attempts, explain_failure, record_failure, remove_route,
+        retry_pending_for_peer, route_port, try_start, validate_route, RunningRoute,
     };
     use crate::state::{EngineIdentity, EngineState};
+    use crate::transport::receiver::BIND_FAILED;
     use soundnet_protocol::{
         Encoding, LocalPort, PortKind, PortRef, Route, RouteHealth, SampleFormat, StreamSpec,
         StreamStats,
@@ -1284,6 +1362,101 @@ mod tests {
             assert!(cur >= prev, "backoff decreased at attempt {attempt}");
             prev = cur;
         }
+    }
+
+    /// Two route ids that hash into the same port bucket.
+    ///
+    /// Searched for rather than hardcoded: `route_port` is built on
+    /// `DefaultHasher`, whose output std explicitly does not promise to keep
+    /// stable across Rust releases, so a baked-in pair would quietly stop
+    /// colliding one toolchain upgrade later and the test would pass while
+    /// checking nothing. With 1000 buckets, a few thousand candidates make a
+    /// collision a certainty by pigeonhole.
+    fn colliding_ids(base: u16) -> (String, String) {
+        let mut seen: std::collections::HashMap<u16, String> = std::collections::HashMap::new();
+        for i in 0..10_000 {
+            let id = format!("collision-probe-{i}");
+            let port = route_port(base, &id);
+            if let Some(first) = seen.get(&port) {
+                return (first.clone(), id);
+            }
+            seen.insert(port, id);
+        }
+        panic!("no collision in 10000 ids over 1000 buckets — route_port changed shape");
+    }
+
+    /// A bind failure is nearly always two routes landing in the same port
+    /// bucket, and libroc reports it as a bare return code: no errno, no
+    /// address, nothing that points at another socket. From the UI it looks
+    /// like one route out of many that just refuses to start. This engine
+    /// knows every route it receives for, so it can name the one holding the
+    /// port.
+    #[test]
+    fn a_bind_failure_names_the_route_already_holding_the_port() {
+        let state = engine();
+        let (a, b) = colliding_ids(state.identity.audio_port);
+        for id in [&a, &b] {
+            state
+                .routes
+                .insert(id.clone(), route(id, (PEER_A, "out"), (SELF_ID, "in")));
+        }
+
+        let raw = format!("{BIND_FAILED} source failed (-1)");
+        let explained = explain_failure(&state, &a, raw.clone());
+
+        assert!(
+            explained.contains(&b),
+            "the conflicting route should be named, got: {explained}"
+        );
+        let port = route_port(state.identity.audio_port, &a);
+        assert!(
+            explained.contains(&port.to_string()),
+            "the port should be named, got: {explained}"
+        );
+        assert!(
+            explained.contains(&raw),
+            "the original libroc error must survive, got: {explained}"
+        );
+    }
+
+    /// The port is bound on the *destination* engine, so two ids sharing a
+    /// bucket are harmless unless this machine receives both. Blaming an
+    /// outbound route would send the operator to rebuild a route that has
+    /// nothing to do with it.
+    #[test]
+    fn an_outbound_route_in_the_same_bucket_is_not_blamed() {
+        let state = engine();
+        let (a, b) = colliding_ids(state.identity.audio_port);
+        state
+            .routes
+            .insert(a.clone(), route(&a, (PEER_A, "out"), (SELF_ID, "in")));
+        // Same bucket, but its receiver lives on a peer.
+        state
+            .routes
+            .insert(b.clone(), route(&b, (SELF_ID, "in"), (PEER_B, "out")));
+
+        let raw = format!("{BIND_FAILED} source failed (-1)");
+        assert_eq!(
+            explain_failure(&state, &a, raw.clone()),
+            raw,
+            "a route this engine does not receive for cannot be holding the port"
+        );
+    }
+
+    /// Every other failure — a busy ALSA device, a format nothing accepts —
+    /// must come through untouched. Appending a port theory to an unrelated
+    /// error is how a diagnosis becomes a red herring.
+    #[test]
+    fn an_unrelated_failure_is_not_given_a_port_theory() {
+        let state = engine();
+        let (a, b) = colliding_ids(state.identity.audio_port);
+        for id in [&a, &b] {
+            state
+                .routes
+                .insert(id.clone(), route(id, (PEER_A, "out"), (SELF_ID, "in")));
+        }
+        let raw = "opening hw:CARD=USB,DEV=0: Device or resource busy".to_string();
+        assert_eq!(explain_failure(&state, &a, raw.clone()), raw);
     }
 
     #[test]
