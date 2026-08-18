@@ -277,6 +277,43 @@ A linear ramp would already be at -6 dB by the same point.
 If the source is genuinely producing full-scale noise, that is what plays once
 the ramp finishes.
 
+### Devices are named, not numbered
+
+A route stores which device it uses as an ALSA device string, and that string
+names the card rather than counting to it:
+
+```
+plughw:CARD=Scarlett18i20,DEV=0      not   plughw:2,0
+```
+
+Card *indices* are handed out in registration order, so an interface that was
+card 0 yesterday is card 1 today, or absent — and whatever registered first
+takes the number it used to have. A route saved against an index therefore
+resolves after a reboot to whichever card holds that number now. It resolves
+silently, so the route starts and streams from a device nobody chose.
+
+That is not hypothetical. It is how a route pointed at an audio interface came
+back pointed at a laptop's internal microphone, which was in the same room as
+the speakers that route fed, at +60 dB of capture gain. The result was acoustic
+feedback, unattended.
+
+Named, the route simply fails to open until the card it names is present, and
+the supervisor starts it the moment it appears — so an interface that is slow
+to enumerate delays the route instead of misdirecting it. Failing closed and
+retrying is what makes unattended recovery safe.
+
+`aplay -L` and `arecord -L` list the names your machine will use.
+
+> **Routes made before this change need remaking.** They hold ids of the old
+> `plughw_2_0_in` form, which no longer match anything, and they show in the UI
+> as unknown ports. There is deliberately no automatic migration: the only way
+> to translate an old id is to look up whatever holds that index right now,
+> which is exactly the guess being removed.
+
+If you run two identical interfaces, ALSA gives them ids like `USB` and
+`USB_1` and *that* suffix is assigned in registration order — pin the card
+numbers with a udev rule or `modprobe ... index=` in that case.
+
 ### If a machine comes back loud, look at its mixer first
 
 That is what happened here, and the mixer said so plainly:

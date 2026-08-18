@@ -51,6 +51,19 @@ pub fn refresh(state: &Arc<EngineState>) -> Result<()> {
             }
         };
 
+        // The card's *id* — "PCH", "USB", "Scarlett18i20" — not its index.
+        // See `alsa_device` for why the difference is the whole point.
+        let card_id = match ctl.card_info().and_then(|i| i.get_id().map(str::to_owned)) {
+            Ok(id) if !id.is_empty() => Some(id),
+            _ => {
+                tracing::warn!(
+                    "card {card_idx} ({card_name}) reports no id; falling back to its index, \
+                     which means a route on it can land on a different card after a reboot"
+                );
+                None
+            }
+        };
+
         for device_idx in alsa::ctl::DeviceIter::new(&ctl) {
             for dir in [alsa::Direction::Capture, alsa::Direction::Playback] {
                 let info = match ctl.pcm_info(device_idx as u32, 0, dir) {
@@ -70,13 +83,16 @@ pub fn refresh(state: &Arc<EngineState>) -> Result<()> {
                 // stereo interface would advertise 32 channels. The hardware
                 // is the truth for both, since plughw only ever converts
                 // down onto the same device.
-                let probed = probe(&format!("hw:{card_idx},{device_idx}"), dir);
+                let probed = probe(
+                    &alsa_device("hw", card_id.as_deref(), card_idx, device_idx as u32),
+                    dir,
+                );
 
                 // Preferred: plughw — libasound converts rate/format/channels
                 // on the fly, so almost any route spec will Just Work.
                 add_port(
                     state,
-                    &format!("plughw:{card_idx},{device_idx}"),
+                    &alsa_device("plughw", card_id.as_deref(), card_idx, device_idx as u32),
                     &format!("{card_name} — {dev_name}"),
                     kind,
                     /* raw */ false,
@@ -86,7 +102,7 @@ pub fn refresh(state: &Arc<EngineState>) -> Result<()> {
                 // Also expose the raw device for advanced/low-latency use.
                 add_port(
                     state,
-                    &format!("hw:{card_idx},{device_idx}"),
+                    &alsa_device("hw", card_id.as_deref(), card_idx, device_idx as u32),
                     &format!("{card_name} — {dev_name}"),
                     kind,
                     /* raw */ true,
@@ -98,6 +114,54 @@ pub fn refresh(state: &Arc<EngineState>) -> Result<()> {
 
     tracing::info!("enumerated {} local ports", state.local_ports.len());
     Ok(())
+}
+
+/// Build the ALSA device string for one card/device pair.
+///
+/// `card_id` is ALSA's card *id* string — the thing `aplay -L` prints as
+/// `hw:CARD=PCH,DEV=0` — and using it instead of the kernel's card index is
+/// not cosmetic. Card indices are handed out in registration order, so a USB
+/// interface that was card 0 yesterday can be card 1 today, or absent, and
+/// whatever else registered first takes the number it used to have.
+///
+/// That matters because a route's port id is derived from this string and
+/// persisted (see `port_id` and `config.rs`). With indices, a route saved
+/// against "card 0" would resolve after a reboot to whichever card is card 0
+/// *now* — and it resolves silently, so the route starts and streams from a
+/// device nobody chose. That is not hypothetical: it is how a route pointed
+/// at an audio interface came back pointed at a laptop's internal
+/// microphone, which was sitting in the same room as the speakers the route
+/// fed, at +60 dB of capture gain. The result was acoustic feedback with
+/// nobody present.
+///
+/// Named, the same route simply fails to open until the card it names is
+/// actually there, and the route supervisor starts it the moment it appears.
+/// Failing closed and retrying is what makes unattended recovery safe.
+///
+/// The index remains as a fallback for a card with no id, which should not
+/// happen; it is warned about at the call site rather than silently accepted.
+///
+/// Residual limitation: two identical interfaces get ids like `USB` and
+/// `USB_1`, and *that* suffix is assigned in registration order. Pin the card
+/// numbers with a udev rule or `modprobe ... index=` if you run a pair.
+fn alsa_device(prefix: &str, card_id: Option<&str>, card_idx: i32, device_idx: u32) -> String {
+    match card_id {
+        Some(id) => format!("{prefix}:CARD={id},DEV={device_idx}"),
+        None => format!("{prefix}:{card_idx},{device_idx}"),
+    }
+}
+
+/// The stable identifier a route stores to name this port.
+///
+/// Derived from the ALSA device string, so it inherits that string's
+/// stability — which is the reason `alsa_device` prefers the card id.
+fn port_id(alsa_name: &str, kind: PortKind) -> String {
+    alsa_name.replace([':', ',', '/', ' ', '='], "_")
+        + match kind {
+            PortKind::Capture => "_in",
+            PortKind::Playback => "_out",
+            PortKind::Tone => "",
+        }
 }
 
 /// Put a port list in a stable, meaningful order.
@@ -138,12 +202,7 @@ fn add_port(
     if matches!(kind, PortKind::Tone) {
         return;
     }
-    let id = alsa_name.replace([':', ',', '/', ' '], "_")
-        + match kind {
-            PortKind::Capture => "_in",
-            PortKind::Playback => "_out",
-            PortKind::Tone => "",
-        };
+    let id = port_id(alsa_name, kind);
     let dir_label = match kind {
         PortKind::Capture => "in",
         PortKind::Playback => "out",
@@ -244,6 +303,75 @@ fn probe(alsa_name: &str, dir: alsa::Direction) -> Probe {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The property the whole naming scheme exists for: a port's identity
+    /// must not move when the kernel hands out card numbers differently.
+    ///
+    /// This is the bug that produced acoustic feedback in the field — a route
+    /// saved against "card 0" came back after a reboot resolving to a
+    /// different card 0, silently, and streamed a laptop's internal
+    /// microphone into speakers in the same room. If this test ever fails,
+    /// that failure mode is back.
+    #[test]
+    fn a_ports_identity_survives_the_card_being_renumbered() {
+        let yesterday = alsa_device("hw", Some("Scarlett18i20"), 0, 0);
+        let today = alsa_device("hw", Some("Scarlett18i20"), 2, 0);
+        assert_eq!(yesterday, today, "the index must not appear in the name");
+        assert_eq!(yesterday, "hw:CARD=Scarlett18i20,DEV=0");
+        assert_eq!(
+            port_id(&yesterday, PortKind::Capture),
+            port_id(&today, PortKind::Capture),
+            "a route stored against this port must still find it"
+        );
+    }
+
+    /// Two different cards must never produce the same port id, however the
+    /// indices land — that is the other half of "the route means what it
+    /// says".
+    #[test]
+    fn different_cards_and_devices_stay_distinct() {
+        let names = [
+            alsa_device("hw", Some("PCH"), 0, 0),
+            alsa_device("hw", Some("PCH"), 0, 1),
+            alsa_device("plughw", Some("PCH"), 0, 0),
+            alsa_device("hw", Some("USB"), 1, 0),
+        ];
+        let mut ids: Vec<String> = names
+            .iter()
+            .flat_map(|n| {
+                [
+                    port_id(n, PortKind::Capture),
+                    port_id(n, PortKind::Playback),
+                ]
+            })
+            .collect();
+        let count = ids.len();
+        ids.sort();
+        ids.dedup();
+        assert_eq!(ids.len(), count, "port ids collided: {ids:?}");
+    }
+
+    /// A card with no id falls back to its index. Worse, but it is what the
+    /// old scheme did for everything, and the call site warns about it.
+    #[test]
+    fn falls_back_to_the_index_when_a_card_has_no_id() {
+        assert_eq!(alsa_device("hw", None, 3, 1), "hw:3,1");
+    }
+
+    /// Ids stay free of the punctuation ALSA device strings carry, since they
+    /// travel through JSON, React keys and DOM attributes.
+    #[test]
+    fn port_ids_carry_no_alsa_punctuation() {
+        let id = port_id(
+            &alsa_device("plughw", Some("USB"), 1, 0),
+            PortKind::Playback,
+        );
+        assert_eq!(id, "plughw_CARD_USB_DEV_0_out");
+        assert!(
+            !id.contains([':', ',', '=', ' ', '/']),
+            "unexpected punctuation in {id}"
+        );
+    }
 
     fn port(id: &str, alsa_name: &str, kind: PortKind) -> LocalPort {
         LocalPort {
