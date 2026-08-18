@@ -385,6 +385,33 @@ Back off:
 All parameters are editable per-route in the UI while audio is running — the
 worker restarts transparently.
 
+### Channel count and packet size are not the period's business
+
+The period sets latency. It does *not* set how much goes in a network packet,
+though it used to: roc was told to packetise exactly one period, which is a
+comfortable 1 KB in stereo and 16 KB at 32 channels — past the Ethernet MTU,
+and past roc's own 2 KB packet pool.
+
+The sender now halves the frames-per-packet until the payload fits inside one
+Ethernet frame, independently of the period. Periods are powers of two, so the
+result always divides the period evenly and no packet straddles two of them.
+Smaller packets leave sooner, so this cannot add latency.
+
+The practical effect is that **channel count is no longer limited by the
+period.** 32 channels at period 128 sends sixteen 1 KB packets instead of one
+16 KB one. It shows in the log when it happens:
+
+```
+sender 10.0.0.5:10001: 32 channels at period 128 would need a 16384-byte
+payload, so packetising 8 frames at a time (16 packets per period) to stay
+inside one Ethernet frame
+```
+
+If you were running 256 frames of stereo, that was a 2048-byte payload and was
+already being fragmented by IP — silently, because roc counts packets and the
+kernel reassembles or drops fragments beneath it. It now goes as two whole
+packets.
+
 ### Why the period size sets the playback floor
 
 The playback device is opened with two periods and does not start until both

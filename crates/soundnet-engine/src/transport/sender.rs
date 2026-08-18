@@ -75,7 +75,55 @@ fn interface_config_for(ip: IpAddr) -> Result<roc::roc_interface_config> {
     })
 }
 
-/// Convert a period size in frames to roc's `packet_length` field, which is
+/// Biggest audio payload we let roc put in one packet, in bytes.
+///
+/// Sized so the datagram fits inside a standard 1500-byte Ethernet MTU:
+/// 1500 - 40 (IPv6 header; IPv4's 20 only leaves more room) - 8 (UDP)
+/// - 12 (RTP) - slack for roc's FEC headers, rounded down to a round number.
+///
+/// Past this the datagram is fragmented by IP, and a fragmented datagram is
+/// all-or-nothing: lose either fragment and the whole packet is gone. That is
+/// the loss pattern FEC is worst at absorbing, and roc cannot even see it —
+/// it counts packets, and the kernel reassembles or discards fragments
+/// beneath it. So a fragmented stream degrades in a way that is both harsher
+/// and less visible than an unfragmented one.
+const MAX_PACKET_PAYLOAD_BYTES: u32 = 1400;
+
+/// Bytes per sample on the wire. The packet encoding registered by
+/// `RocContext::ensure_encoding` is `ROC_FORMAT_PCM_FLOAT32`, so four.
+const WIRE_BYTES_PER_SAMPLE: u32 = 4;
+
+/// How many frames roc should put in one packet.
+///
+/// This used to be the ALSA period exactly, which was right for the reason it
+/// was chosen — a packet per period adds no chunking delay of its own — and
+/// wrong in a way that only shows up with channel count. roc's payload is
+/// `frames x channels x 4` bytes, so the period that produces a comfortable
+/// 1 KB packet in stereo produces 16 KB at 32 channels. roc allocates packets
+/// from a pool of `max_packet_size` (2048 bytes by default), and well before
+/// that the datagram stops fitting in an Ethernet frame.
+///
+/// So the period keeps setting the *latency* and this sets the *packet size*,
+/// independently: halve the frames-per-packet until the payload fits. Periods
+/// are powers of two, so halving always lands on a whole divisor and each
+/// period still ends on a packet boundary — no packet ever straddles two
+/// periods, which keeps the "one period in, N whole packets out" property the
+/// original choice was after.
+///
+/// Sending smaller packets sooner cannot add latency; roc emits a packet as
+/// soon as it is full, so this only ever makes the first packet leave earlier.
+fn frames_per_packet(frames_per_period: u32, channels: u8) -> u32 {
+    let channels = channels.max(1) as u64;
+    let mut frames = frames_per_period.max(1);
+    while frames > 1
+        && frames as u64 * channels * WIRE_BYTES_PER_SAMPLE as u64 > MAX_PACKET_PAYLOAD_BYTES as u64
+    {
+        frames /= 2;
+    }
+    frames
+}
+
+/// Convert a frame count to roc's `packet_length` field, which is
 /// in nanoseconds rather than frames. Returns 0 — roc's own sentinel for
 /// "pick a default" — for inputs that can't produce a sane duration: a zero
 /// frame count or rate would otherwise divide into garbage, and a period
@@ -84,11 +132,11 @@ fn interface_config_for(ip: IpAddr) -> Result<roc::roc_interface_config> {
 /// Uses u128 for the intermediate product so a large `frames_per_period`
 /// can't silently wrap a 64-bit multiply before the divide brings it back
 /// down to a normal nanosecond count.
-fn packet_length_ns(frames_per_period: u32, rate: u32) -> u64 {
-    if frames_per_period == 0 || rate == 0 {
+fn packet_length_ns(frames: u32, rate: u32) -> u64 {
+    if frames == 0 || rate == 0 {
         return 0;
     }
-    let ns = (frames_per_period as u128 * 1_000_000_000u128) / rate as u128;
+    let ns = (frames as u128 * 1_000_000_000u128) / rate as u128;
     if ns == 0 || ns > 1_000_000_000 {
         return 0;
     }
@@ -109,6 +157,18 @@ pub fn open(
     // we register a custom packet encoding below so libroc doesn't try to
     // pick a built-in that doesn't exist for our rate/format.
     let packet_encoding = ctx.ensure_encoding(spec.rate, spec.channels);
+    let packet_frames = frames_per_packet(spec.frames_per_period, spec.channels);
+    if packet_frames != spec.frames_per_period {
+        tracing::info!(
+            "sender {host}:{audio_port}: {} channels at period {} would need a \
+             {}-byte payload, so packetising {packet_frames} frames at a time \
+             ({} packets per period) to stay inside one Ethernet frame",
+            spec.channels,
+            spec.frames_per_period,
+            spec.frames_per_period * spec.channels as u32 * WIRE_BYTES_PER_SAMPLE,
+            spec.frames_per_period / packet_frames,
+        );
+    }
     let cfg = roc::roc_sender_config {
         frame_encoding: roc::roc_media_encoding {
             rate: spec.rate,
@@ -125,11 +185,13 @@ pub fn open(
         // integer rather than a Rust enum precisely because the value we put
         // in it is never one of that enum's variants — see build.rs.)
         packet_encoding: packet_encoding as roc::roc_packet_encoding::Type,
-        // Match packetisation to the ALSA period instead of leaving it at
-        // roc's own (larger) default quantum — otherwise the network hop
-        // adds a chunking delay independent of, and typically bigger than,
-        // the period itself.
-        packet_length: packet_length_ns(spec.frames_per_period, spec.rate),
+        // Packetise at or below the ALSA period rather than at roc's own
+        // (larger) default quantum — otherwise the network hop adds a
+        // chunking delay independent of, and typically bigger than, the
+        // period itself. At or *below*: see `frames_per_packet` for why the
+        // period alone cannot decide this once a route carries more than a
+        // few channels.
+        packet_length: packet_length_ns(packet_frames, spec.rate),
         packet_interleaving: 0,
         fec_encoding: if spec.fec {
             roc::roc_fec_encoding::ROC_FEC_ENCODING_RS8M
@@ -247,6 +309,73 @@ pub fn open(
 mod tests {
     use super::*;
     use std::net::Ipv4Addr;
+
+    /// Every rate/period the UI offers, against every channel count a device
+    /// plausibly has. The payload must fit an Ethernet frame in all of them —
+    /// that is the property, and checking it exhaustively is cheap enough
+    /// that there is no reason to check it by example instead.
+    #[test]
+    fn no_combination_the_ui_offers_can_fragment_a_datagram() {
+        for period in [32u32, 64, 128, 256, 512] {
+            for channels in 1..=64u8 {
+                let frames = frames_per_packet(period, channels);
+                let payload = frames as u64 * channels as u64 * WIRE_BYTES_PER_SAMPLE as u64;
+                assert!(
+                    payload <= MAX_PACKET_PAYLOAD_BYTES as u64,
+                    "period {period} x {channels}ch: {frames} frames is a {payload}-byte payload"
+                );
+                assert!(
+                    frames >= 1,
+                    "period {period} x {channels}ch produced no frames"
+                );
+                assert!(
+                    period % frames == 0,
+                    "period {period} x {channels}ch: {frames} frames does not divide the \
+                     period, so a packet would straddle two of them"
+                );
+                assert!(
+                    frames <= period,
+                    "period {period} x {channels}ch: packetising {frames} frames would hold \
+                     audio back beyond the period and add latency"
+                );
+            }
+        }
+    }
+
+    /// A stereo route at the recommended period already fits, and must be
+    /// left exactly as it was — this change is meant to be invisible to the
+    /// configurations that were fine.
+    #[test]
+    fn a_period_that_already_fits_is_left_alone() {
+        assert_eq!(frames_per_packet(128, 2), 128); // 1024 bytes
+        assert_eq!(frames_per_packet(64, 4), 64); // 1024 bytes
+        assert_eq!(frames_per_packet(32, 8), 32); // 1024 bytes
+    }
+
+    /// And the configurations that were quietly fragmenting get split. 256
+    /// frames of stereo is 2048 bytes, which is over both the Ethernet MTU
+    /// and roc's own 2048-byte packet pool — it is what this project was
+    /// running when the limit was found.
+    #[test]
+    fn the_configurations_that_were_fragmenting_get_split() {
+        assert_eq!(frames_per_packet(256, 2), 128, "2048 bytes -> two packets");
+        assert_eq!(frames_per_packet(128, 8), 32, "4096 bytes -> four packets");
+        assert_eq!(
+            frames_per_packet(128, 32),
+            8,
+            "16384 bytes -> sixteen packets"
+        );
+    }
+
+    /// Nonsense in must not produce a zero-length packet, which roc reads as
+    /// "pick your own default" — silently undoing the whole calculation.
+    #[test]
+    fn degenerate_input_still_yields_a_usable_packet() {
+        assert_eq!(frames_per_packet(0, 2), 1);
+        assert_eq!(frames_per_packet(128, 0), 128);
+        assert_eq!(frames_per_packet(128, 255), 1);
+        assert!(packet_length_ns(frames_per_packet(128, 255), 48_000) > 0);
+    }
 
     /// `outgoing_address` is a fixed 48-byte NUL-terminated C string that
     /// libroc reads directly — this checks the byte-by-byte fill lands the
