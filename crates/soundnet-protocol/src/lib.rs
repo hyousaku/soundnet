@@ -224,7 +224,6 @@ pub struct StreamStats {
     /// playback side only, which let a route drop capture periods while
     /// reporting a clean zero.
     pub xruns: u32,
-    pub jitter_ms: f32,
     /// Peak level, in dBFS, of what this engine captured and put on the wire.
     ///
     /// Split from the playback level rather than sharing one field, for the

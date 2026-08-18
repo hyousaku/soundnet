@@ -69,10 +69,6 @@ pub struct RecvHandle {
     /// Last observed roc end-to-end latency in nanoseconds. Requires the
     /// RTCP control endpoint; `u64::MAX` until a sender actually connects.
     pub e2e_ns: Arc<AtomicU64>,
-    /// Reserved for a jitter estimate. libroc 0.4 dropped the `niq_latency`
-    /// field the old estimate was derived from, so this stays at 0 rather
-    /// than reporting a number nothing computes.
-    pub jitter_ns: Arc<AtomicU64>,
     /// The format the playback device was actually opened with, as
     /// `SampleFormat::as_u8`; `UNKNOWN_FORMAT` until the device is open.
     pub format: Arc<AtomicU8>,
@@ -120,7 +116,6 @@ pub fn spawn(
     let xruns = Arc::new(AtomicUsize::new(0));
     let buffer_ns = Arc::new(AtomicU64::new(u64::MAX));
     let e2e_ns = Arc::new(AtomicU64::new(u64::MAX));
-    let jitter_ns = Arc::new(AtomicU64::new(0));
     let format = Arc::new(AtomicU8::new(UNKNOWN_FORMAT));
     let clipped = Arc::new(AtomicUsize::new(0));
     let stalled = Arc::new(AtomicBool::new(false));
@@ -170,7 +165,6 @@ pub fn spawn(
         xruns,
         buffer_ns,
         e2e_ns,
-        jitter_ns,
         format,
         clipped,
         stalled,

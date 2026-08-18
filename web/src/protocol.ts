@@ -80,7 +80,6 @@ export type RouteHealth =
 // StreamStats in crates/soundnet-protocol/src/lib.rs and latency.ts.
 export interface StreamStats {
   xruns: number;
-  jitter_ms: number;
   /** Peak dBFS of what this engine captured; null when it holds no capture
    *  side of the route. null and -120 are different: -120 is silence. */
   capture_level_db: number | null;

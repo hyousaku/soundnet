@@ -43,7 +43,6 @@ pub struct RunningRoute {
     pub pb_level_bits: Option<Arc<AtomicU32>>,
     pub xruns: Option<Arc<AtomicUsize>>,
     pub e2e_ns: Option<Arc<AtomicU64>>,
-    pub jitter_ns: Option<Arc<AtomicU64>>,
     /// ALSA capture-buffer delay, only ever set when this engine holds the
     /// route's capture side (see the honesty note on `StreamStats`).
     pub cap_buffer_ns: Option<Arc<AtomicU64>>,
@@ -521,7 +520,6 @@ async fn try_start_inner(state: &Arc<EngineState>, route: &Route) -> Result<Opti
         pb_level_bits: None,
         xruns: None,
         e2e_ns: None,
-        jitter_ns: None,
         cap_buffer_ns: None,
         pb_buffer_ns: None,
         cap_format: None,
@@ -593,7 +591,6 @@ async fn try_start_inner(state: &Arc<EngineState>, route: &Route) -> Result<Opti
         running.pb_level_bits = Some(pipeline.level_bits.clone());
         running.xruns = Some(pipeline.xruns.clone());
         running.e2e_ns = Some(pipeline.e2e_ns.clone());
-        running.jitter_ns = Some(pipeline.jitter_ns.clone());
         running.pb_buffer_ns = Some(pipeline.buffer_ns.clone());
         running.pb_format = Some(pipeline.format.clone());
         running.clipped = Some(pipeline.clipped.clone());
@@ -836,11 +833,6 @@ pub fn spawn_stats_pump(state: Arc<EngineState>) {
                     .as_ref()
                     .map(|c| c.load(Ordering::Relaxed) as u32);
                 let xruns = capture_xruns.unwrap_or(0) + playback_xruns.unwrap_or(0);
-                let jitter_ms = running
-                    .jitter_ns
-                    .as_ref()
-                    .map(|n| n.load(Ordering::Relaxed) as f32 / 1_000_000.0)
-                    .unwrap_or(0.0);
                 // Each of these is only ever populated on the engine that
                 // holds the corresponding half of the route — see the
                 // honesty note on StreamStats. `None` covers two distinct
@@ -880,7 +872,6 @@ pub fn spawn_stats_pump(state: Arc<EngineState>) {
                 };
                 let stats = StreamStats {
                     xruns,
-                    jitter_ms,
                     capture_level_db,
                     playback_level_db,
                     health,
@@ -908,7 +899,6 @@ pub fn spawn_stats_pump(state: Arc<EngineState>) {
                     route_id,
                     StreamStats {
                         xruns: 0,
-                        jitter_ms: 0.0,
                         capture_level_db: None,
                         playback_level_db: None,
                         health: entry.value().to_health(),
@@ -1128,7 +1118,6 @@ mod tests {
             pb_level_bits: None,
             xruns: None,
             e2e_ns: None,
-            jitter_ns: None,
             cap_buffer_ns: None,
             pb_buffer_ns: None,
             cap_format: None,
@@ -1141,7 +1130,6 @@ mod tests {
     fn stats_sentinel() -> StreamStats {
         StreamStats {
             xruns: 7,
-            jitter_ms: 0.0,
             capture_level_db: None,
             playback_level_db: None,
             health: RouteHealth::Ok,

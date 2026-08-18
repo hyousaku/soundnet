@@ -38,7 +38,9 @@
 //!   `roc_connection_metrics {e2e_latency}` (only) is an out-array, and
 //!   `roc_receiver_metrics {connection_count}` /
 //!   `roc_sender_metrics {connection_count}` are the slot-level structs. The
-//!   dropped `niq_latency` is why `StreamStats::jitter_ms` reports nothing.
+//!   dropped `niq_latency` is why SoundNet no longer reports a jitter figure
+//!   at all — the `StreamStats::jitter_ms` field that used to carry it was
+//!   removed rather than left showing a permanent 0.00 ms.
 //! * `roc_receiver_query` / `roc_sender_query` grew a fourth and fifth
 //!   argument (slot metrics, connection metrics array, count).
 //!
