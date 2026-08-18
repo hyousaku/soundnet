@@ -249,14 +249,26 @@ pub async fn apply_route(state: &Arc<EngineState>, route: Route, gossip: bool) -
     // actually supports), so this deserves an immediate attempt rather than
     // waiting out whatever window the last failure scheduled.
     if is_new_or_changed {
-        if let Some((_, existing)) = state.running.remove(&route.id) {
-            shutdown_running(existing).await;
-        }
-        state.failures.remove(&route.id);
-        if let Err(err) = try_start(state, &route).await {
-            tracing::warn!("route {} could not start yet: {err:#}", route.id);
+        {
+            // One critical section for the whole reboot, not one per step.
+            // Between the `remove` and the start there are several awaits,
+            // and a supervisor tick landing in that window would find
+            // nothing running and start the route itself — from the route
+            // it just read out of `state.routes`, i.e. the new spec, using
+            // the device this teardown has not finished releasing.
+            let lock = state.route_lock(&route.id);
+            let _guard = lock.lock().await;
+            if let Some((_, existing)) = state.running.remove(&route.id) {
+                shutdown_running(existing).await;
+            }
+            state.failures.remove(&route.id);
+            if let Err(err) = start_locked(state, &route).await {
+                tracing::warn!("route {} could not start yet: {err:#}", route.id);
+            }
         }
         if gossip {
+            // Outside the lock: this is HTTP to another host with a 3s
+            // timeout, and nothing about it touches our pipelines.
             gossip_add(state, &route).await;
         }
     }
@@ -309,7 +321,49 @@ fn validate_route(state: &Arc<EngineState>, route: &Route) -> Result<()> {
 /// `record_failure`/`backoff_for_attempts`. Called both on-demand (peer
 /// discovery) and from a periodic sweep (`spawn_route_supervisor`), so this
 /// needs to be cheap to call repeatedly when there's nothing to do.
+///
+/// Serialized per route, and it has to be. Three callers reach this
+/// concurrently for the same route id — `apply_route` (UI or gossip),
+/// `retry_pending_for_peer` (mDNS resolve) and `spawn_route_supervisor`
+/// (every 3s) — and the body reads `state.running`, awaits, and only then
+/// writes it back. `try_start_inner` awaits at least twice on the way
+/// (`roc_context()`, `selected_interface.read()`), so two callers could both
+/// see nothing running, both spawn a full pipeline, and the second `insert`
+/// would drop the first `RunningRoute` on the floor.
+///
+/// That drop is the expensive part. Nothing implements `Drop` on
+/// `SendHandle`/`RecvHandle`, so dropping the handle *detaches* its thread:
+/// the stop flag goes with it, and the pipeline keeps running forever,
+/// holding its `hw:` device against every later attempt to open it and
+/// still putting audio on the wire. Serializing is what makes the
+/// check-then-insert atomic; per-route rather than global so one device
+/// opening slowly doesn't stall the others.
+///
+/// A skip-guard ("if someone else is starting this, return") would be
+/// cheaper and is wrong here: `apply_route` would then be able to skip its
+/// own start because a supervisor tick got there first, leaving the route
+/// running the spec the operator just changed away from, indefinitely.
+/// Waiting costs a few milliseconds; skipping costs a wrong-sounding patch
+/// with no error anywhere.
 pub async fn try_start(state: &Arc<EngineState>, route: &Route) -> Result<()> {
+    let lock = state.route_lock(&route.id);
+    let _guard = lock.lock().await;
+    start_locked(state, route).await
+}
+
+/// The body of `try_start`, for callers that already hold the route's lock.
+async fn start_locked(state: &Arc<EngineState>, route: &Route) -> Result<()> {
+    // Both retry paths iterate a *snapshot* of `state.routes`, so by the time
+    // this runs the operator may have deleted the route — and `remove_route`
+    // drops it from `state.routes` before it takes this lock, precisely so
+    // that this check sees the deletion. Without it a supervisor tick holding
+    // a stale clone would start a pipeline for a route that no longer exists,
+    // and nothing would ever stop it again: teardown is driven from
+    // `state.routes`.
+    if !state.routes.contains_key(&route.id) {
+        return Ok(());
+    }
+
     if let Some(entry) = state.running.get(&route.id) {
         let dead = entry.is_dead();
         let dead_reason = if dead {
@@ -503,11 +557,20 @@ pub fn spawn_route_supervisor(state: Arc<EngineState>) {
 }
 
 pub async fn remove_route(state: &Arc<EngineState>, id: &str, gossip: bool) {
+    // Drop it from `state.routes` *before* taking the lock. Anyone already
+    // queued on the lock to start this route re-checks `state.routes` first
+    // thing (see `start_locked`), so doing it in this order means the
+    // deletion wins the race instead of being overwritten by a start that
+    // was decided a moment earlier.
     let route = state.routes.remove(id).map(|(_, r)| r);
-    if let Some((_, running)) = state.running.remove(id) {
-        shutdown_running(running).await;
+    {
+        let lock = state.route_lock(id);
+        let _guard = lock.lock().await;
+        if let Some((_, running)) = state.running.remove(id) {
+            shutdown_running(running).await;
+        }
+        state.failures.remove(id);
     }
-    state.failures.remove(id);
     state.stats.remove(id);
     persist(state).await;
     if gossip {
@@ -850,7 +913,7 @@ fn join_running(running: RunningRoute) {
 mod tests {
     use super::{
         apply_route, backoff_for_attempts, record_failure, remove_route, retry_pending_for_peer,
-        route_port, validate_route, RunningRoute,
+        route_port, try_start, validate_route, RunningRoute,
     };
     use crate::state::{EngineIdentity, EngineState};
     use soundnet_protocol::{
@@ -1130,6 +1193,75 @@ mod tests {
         assert!(!state.running.contains_key(&r.id), "running");
         assert!(!state.failures.contains_key(&r.id), "failures");
         assert!(!state.stats.contains_key(&r.id), "stats");
+    }
+
+    /// `retry_pending_for_peer` and the supervisor both iterate a snapshot of
+    /// `state.routes`, so a route deleted mid-sweep is still handed to
+    /// `try_start` afterwards. Acting on that stale clone spawns a pipeline
+    /// for a route nothing knows about any more — and since teardown is
+    /// driven from `state.routes`, nothing would ever stop it: the device
+    /// stays busy and the audio keeps flowing until the process dies.
+    ///
+    /// Observable here without a sound card: the route names a local port
+    /// that doesn't exist, so a start that got as far as `try_start_inner`
+    /// leaves a `failures` entry behind — which is also how a deleted route
+    /// comes back in the UI as "retrying" forever.
+    #[tokio::test]
+    async fn a_route_deleted_mid_sweep_is_not_started_from_the_stale_copy() {
+        let state = engine();
+        let r = route("r1", (SELF_ID, "missing"), (PEER_A, "in"));
+        apply_route(&state, r.clone(), false).await.unwrap();
+        state.failures.remove(&r.id);
+
+        // What a sweep is holding when the operator hits delete.
+        let stale = r.clone();
+        remove_route(&state, &r.id, false).await;
+        try_start(&state, &stale).await.unwrap();
+
+        assert!(
+            !state.failures.contains_key(&r.id),
+            "a deleted route was started again from a stale copy"
+        );
+        assert!(!state.running.contains_key(&r.id), "running");
+        assert!(!state.routes.contains_key(&r.id), "routes");
+    }
+
+    /// The check in `try_start` ("is it already running?") and the insert at
+    /// the end are separated by several awaits, so without a lock two callers
+    /// can both spawn a full pipeline and the loser's handles get dropped —
+    /// which detaches its threads, taking the stop flag with them and leaving
+    /// an unstoppable pipeline holding the device.
+    ///
+    /// Proven here by holding the route's lock by hand: a start for that
+    /// route must not make progress, and a start for a different route must
+    /// not be affected by it.
+    #[tokio::test]
+    async fn two_starts_of_the_same_route_cannot_overlap() {
+        let state = engine();
+        let r = route("r1", (SELF_ID, "missing"), (PEER_A, "in"));
+        let other = route("r2", (SELF_ID, "missing"), (PEER_A, "in"));
+        state.routes.insert(r.id.clone(), r.clone());
+        state.routes.insert(other.id.clone(), other.clone());
+
+        let held = state.route_lock(&r.id);
+        let guard = held.lock().await;
+
+        let blocked = tokio::time::timeout(Duration::from_millis(200), try_start(&state, &r)).await;
+        assert!(
+            blocked.is_err(),
+            "a second start of the same route ran while the first still held the route"
+        );
+
+        tokio::time::timeout(Duration::from_millis(200), try_start(&state, &other))
+            .await
+            .expect("an unrelated route must not queue behind this one")
+            .expect_err("r2's local port does not exist, so its start should fail");
+
+        drop(guard);
+        tokio::time::timeout(Duration::from_millis(200), try_start(&state, &r))
+            .await
+            .expect("the start should proceed once the route is free again")
+            .expect_err("r1's local port does not exist either");
     }
 
     #[test]

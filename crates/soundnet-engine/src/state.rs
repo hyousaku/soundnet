@@ -6,7 +6,7 @@ use soundnet_protocol::{LocalPort, Node, PortId, Route, RouteId, StreamStats};
 use std::net::IpAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock as StdRwLock};
-use tokio::sync::{broadcast, RwLock};
+use tokio::sync::{broadcast, Mutex, RwLock};
 
 use crate::config::ManualHost;
 use crate::routing::{RouteFailure, RunningRoute};
@@ -43,6 +43,18 @@ pub struct EngineState {
     /// Backoff bookkeeping for routes this engine has a local role in but
     /// that failed to start (or whose workers died) — see `routing::try_start`.
     pub failures: DashMap<RouteId, RouteFailure>,
+
+    /// One mutex per route id, serializing everything that starts or stops
+    /// that route's pipelines. Taken via `route_lock`; see the comment on
+    /// `routing::try_start` for what races without it.
+    ///
+    /// Entries are never removed, on purpose. A lock that can be dropped
+    /// while somebody is waiting on it stops being a lock: the waiter would
+    /// hold an `Arc` to a map entry nobody can find any more, and the next
+    /// caller would create a fresh mutex and walk straight past it. The cost
+    /// of keeping them is a mutex per route id the engine has ever seen,
+    /// which for a patch bay is nothing.
+    pub route_locks: DashMap<RouteId, Arc<Mutex<()>>>,
 
     /// Rolling per-route stats (updated by workers).
     pub stats: DashMap<RouteId, StreamStats>,
@@ -93,6 +105,7 @@ impl EngineState {
             routes: DashMap::new(),
             running: DashMap::new(),
             failures: DashMap::new(),
+            route_locks: DashMap::new(),
             stats: DashMap::new(),
             config_path: RwLock::new(None),
             manual_hosts: RwLock::new(Vec::new()),
@@ -100,6 +113,26 @@ impl EngineState {
             events: tx,
             mdns: RwLock::new(None),
         })
+    }
+
+    /// The mutex guarding start/stop for one route, creating it on first
+    /// use. Cheap enough to call on every supervisor tick.
+    ///
+    /// The returned `Arc` deliberately outlives the map borrow: awaiting
+    /// `lock()` while still holding a `DashMap` reference would pin one of
+    /// the map's shards for as long as the pipeline takes to open its
+    /// device, and any other route hashing to that shard would block behind
+    /// it — a lock that is supposed to be per-route quietly becoming
+    /// per-shard.
+    pub fn route_lock(&self, id: &str) -> Arc<Mutex<()>> {
+        if let Some(existing) = self.route_locks.get(id) {
+            return existing.value().clone();
+        }
+        self.route_locks
+            .entry(id.to_string())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .value()
+            .clone()
     }
 
     pub fn self_node(&self) -> Node {
