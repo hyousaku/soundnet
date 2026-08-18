@@ -240,6 +240,58 @@ The engine has no opinion about which interface you use — pin one per node
 under **This node → Egress interface** in the UI — so the same node can be
 wired for a session and wireless for a soundcheck.
 
+## Recovery: what happens when a machine comes back
+
+Routes are persisted and restored at startup, so a host that reboots rejoins
+on its own with no one present. That is the point of it, and it is also how
+this bit them once: a laptop holding the capture end of a route was closed by
+accident, and when it came back the machine at the other end — the one with
+the speakers — put out full-scale noise unattended.
+
+Recovery is still automatic. What changed is the level it happens at.
+
+When audio starts flowing after a gap, the receiver ramps it in rather than
+resuming at whatever level arrives. How cautious the ramp is depends on how
+long the audio was away:
+
+| Silence before it returned | Ramp | Why |
+|---|---|---|
+| under 0.5 s | none | not a gap, just audio |
+| 0.5 s to 5 s | 200 ms | a dropped-packet run; same stream, same level, needs declicking only |
+| over 5 s, or a route that just opened | 2 s | something structural happened at the far end and the level is no longer known |
+
+The long ramp is cubic, not linear, and that is the part that matters:
+
+| elapsed | gain |
+|---|---|
+| 0.5 s | -36 dB |
+| 1.0 s | -18 dB |
+| 1.5 s | -7.5 dB |
+| 2.0 s | 0 dB |
+
+So the first full second is at or below -18 dB. A burst arriving into that is
+startling rather than damaging, and there is a second in hand to reach a fader.
+A linear ramp would already be at -6 dB by the same point.
+
+**This is not a limiter.** It bounds how fast the level arrives, not how high.
+If the source is genuinely producing full-scale noise, that is what plays once
+the ramp finishes. If a machine in your setup can come up with a hot input
+after a reboot, fix that where it lives — `alsactl` state, the mixer, the
+interface's own gain — because nothing here will hold it down.
+
+The capture side ramps too, over 200 ms, at device open and after every xrun
+recovery: both are moments when the driver has just restarted its DMA ring,
+and the first period out of a freshly started ring is not reliably audio on
+all hardware.
+
+Each ramp logs a line naming how long the audio was away, so an unexplained
+swell can be traced afterwards:
+
+```
+recv pipeline hw:0,0: audio resumed after 47.3s of silence, ramping in over
+2000ms (level unknown after a long absence)
+```
+
 ## Latency tuning
 
 Start with the defaults (48 kHz / S24 / 2 ch / period 128 / target 10 ms /

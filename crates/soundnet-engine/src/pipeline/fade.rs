@@ -1,52 +1,89 @@
-//! A short gain ramp applied whenever audio starts flowing again.
+//! The gain ramp applied whenever audio starts flowing again.
 //!
 //! This exists because of an incident, not a theory. A laptop holding the
 //! capture end of a route was closed by accident; on reboot the service
 //! restored its routes and started streaming immediately, and the machine at
-//! the other end — the one with the speakers — emitted full-scale noise with
+//! the other end — the one with the speakers — put out full-scale noise with
 //! nobody touching anything.
 //!
-//! What a ramp does and does not fix is worth being exact about, because it
-//! is easy to mistake for a safety feature it is not:
+//! The goal is to keep that automatic recovery, because a system that needs a
+//! human to press a button after every power cut is not much of an unattended
+//! system. What has to change is the level it comes back at.
 //!
-//! * It **removes the step.** Going from silence to full scale in one sample
-//!   is the part that is hard on drivers, and it is the part that makes a
-//!   burst feel like a bang rather than a swell.
-//! * It **buys reaction time.** A couple of hundred milliseconds is enough
-//!   for a person to reach a fader or pull a plug.
-//! * It **does not cap the level.** If the source is genuinely producing
-//!   full-scale noise, that is what plays once the ramp completes. Nothing
-//!   here is a limiter, and calling it one would be a lie an operator might
-//!   rely on.
+//! ## The curve is cubic, and that is the whole point
 //!
-//! Cheap enough for the audio thread: one multiply per sample, and only while
-//! a ramp is actually running.
+//! A linear ramp is only half a second's protection at best: halfway along it
+//! is already at -6 dB, which is not quiet. `gain = (t/T)^3` spends most of
+//! its length genuinely low and then arrives:
+//!
+//! | elapsed | linear | cubic |
+//! |---------|--------|-------|
+//! | 25% | -12 dB | -36 dB |
+//! | 50% | -6 dB | -18 dB |
+//! | 75% | -2.5 dB | -7.5 dB |
+//! | 100% | 0 dB | 0 dB |
+//!
+//! So a two-second cubic ramp holds the output at or below -18 dB for the
+//! first full second. A burst arriving into that is quiet enough to be
+//! startling rather than damaging, and there is a second in hand to reach a
+//! fader before it is loud.
+//!
+//! ## Two lengths, because two situations
+//!
+//! How cautious the return should be depends on how long the audio was away,
+//! and the pipelines pick the length accordingly (see `pipeline/mod.rs`):
+//!
+//! * **A brief gap** — a dropped packet run, a peer restarting a worker — is
+//!   audio whose level was fine a moment ago and will be fine now. It needs
+//!   declicking, not caution: a short ramp.
+//! * **A long absence, or a route that has only just opened** — the machine
+//!   at the other end rebooted, or this is the first audio of the session.
+//!   Nothing is known about what is about to arrive, including its level.
+//!   That gets the long one.
+//!
+//! ## What this does not do
+//!
+//! It does not cap the level. If the source is genuinely producing full-scale
+//! noise, that is what plays once the ramp completes. Nothing here is a
+//! limiter, and calling it one would be a claim an operator might rely on
+//! while standing in front of a loudspeaker.
+//!
+//! Cheap enough for the audio thread: a multiply per sample, and only while a
+//! ramp is actually running.
 
-/// A linear ramp from silence to unity over a fixed number of frames.
+/// A cubic ramp from silence to unity.
 #[derive(Debug)]
 pub struct Fade {
     /// Frames still to ramp. Zero means "not fading", and `apply` is then a
     /// no-op that does not even touch the buffer.
     remaining: u32,
-    /// Full length of the ramp, in frames.
+    /// Length of the ramp currently running, in frames.
     length: u32,
+    rate: u32,
 }
 
 impl Fade {
-    /// A ramp lasting `ms` at `rate`, initially inactive.
+    /// A fade for a stream at `rate`, initially inactive.
     ///
     /// Inactive is the right default even for a pipeline that arms it
     /// immediately: a `Fade` nobody ever arms can then only be a no-op, so
     /// forgetting to arm one silences nothing.
-    pub fn new(rate: u32, ms: u32) -> Self {
+    pub fn new(rate: u32) -> Self {
         Self {
             remaining: 0,
-            length: (rate as u64 * ms as u64 / 1000) as u32,
+            length: 0,
+            rate,
         }
     }
 
-    /// Start (or restart) the ramp from silence.
-    pub fn arm(&mut self) {
+    /// Start a ramp lasting `ms`, from silence.
+    ///
+    /// Re-arming mid-ramp restarts from silence rather than from wherever the
+    /// old one had reached. That is the safe direction: the reason to re-arm
+    /// is that something happened, and something having happened is not a
+    /// reason to be further along.
+    pub fn arm(&mut self, ms: u32) {
+        self.length = (self.rate as u64 * ms as u64 / 1000) as u32;
         self.remaining = self.length;
     }
 
@@ -64,7 +101,8 @@ impl Fade {
         let already_done = self.length.saturating_sub(self.remaining);
         for (i, frame) in samples.chunks_mut(channels).enumerate() {
             let position = already_done as u64 + i as u64;
-            let gain = (position as f32 / self.length as f32).min(1.0);
+            let linear = (position as f32 / self.length as f32).min(1.0);
+            let gain = linear * linear * linear;
             for s in frame.iter_mut() {
                 *s *= gain;
             }
@@ -78,17 +116,17 @@ impl Fade {
 mod tests {
     use super::Fade;
 
-    /// 48 kHz, 200 ms — the shape the pipelines use.
-    const RAMP_FRAMES: usize = 48_000 * 200 / 1000;
+    const RATE: u32 = 48_000;
 
-    fn fade() -> Fade {
-        Fade::new(48_000, 200)
+    fn db(gain: f32) -> f32 {
+        20.0 * gain.log10()
     }
 
-    /// Push `frames` of full-scale audio through and return the gain applied
+    /// Push `ms` worth of full-scale audio through and return the gain applied
     /// to each frame. Full scale in means each output sample *is* the gain,
     /// which is what makes the assertions below readable.
-    fn gains_over(f: &mut Fade, frames: usize, channels: usize) -> Vec<f32> {
+    fn gains_over(f: &mut Fade, ms: u32, channels: usize) -> Vec<f32> {
+        let frames = (RATE as usize) * ms as usize / 1000;
         let mut out = Vec::with_capacity(frames);
         let mut done = 0;
         while done < frames {
@@ -106,7 +144,7 @@ mod tests {
     /// needed it.
     #[test]
     fn does_nothing_until_armed() {
-        let mut f = fade();
+        let mut f = Fade::new(RATE);
         let mut buf = vec![0.5_f32, -0.5, 1.0, -1.0];
         let before = buf.clone();
         f.apply(&mut buf, 2);
@@ -121,9 +159,9 @@ mod tests {
     /// to remove.
     #[test]
     fn ramps_from_silence_to_unity_without_ever_dipping() {
-        let mut f = fade();
-        f.arm();
-        let gains = gains_over(&mut f, RAMP_FRAMES, 2);
+        let mut f = Fade::new(RATE);
+        f.arm(2_000);
+        let gains = gains_over(&mut f, 2_000, 2);
 
         assert_eq!(gains[0], 0.0, "the ramp must begin at silence");
         assert!(
@@ -135,13 +173,30 @@ mod tests {
             "the ramp must reach unity by the end of its length: {:?}",
             gains.last()
         );
-        // Halfway along it should be halfway up. A ramp that spent most of
-        // its length near full scale would satisfy the checks above while
-        // still delivering very nearly a step.
-        let middle = gains[RAMP_FRAMES / 2];
+    }
+
+    /// The property the safety argument actually rests on: a two-second ramp
+    /// keeps the output at or below -18 dB for the first full second. A linear
+    /// ramp would be at -6 dB by then, which is not a level anyone would call
+    /// safe to be surprised by.
+    #[test]
+    fn a_two_second_ramp_stays_quiet_for_the_first_second() {
+        let mut f = Fade::new(RATE);
+        f.arm(2_000);
+        let gains = gains_over(&mut f, 2_000, 2);
+
+        let first_second = &gains[..RATE as usize];
+        let loudest = first_second.iter().copied().fold(0.0_f32, f32::max);
         assert!(
-            (middle - 0.5).abs() < 0.01,
-            "expected roughly half gain at the midpoint, got {middle}"
+            db(loudest) <= -18.0,
+            "first second peaked at {:.1} dB, expected -18 dB or quieter",
+            db(loudest)
+        );
+        // And it does arrive — quiet for a second is protection, quiet for
+        // two would just be a broken route.
+        assert!(
+            gains[gains.len() - 1] > 0.99,
+            "the ramp has to finish, not merely start softly"
         );
     }
 
@@ -150,8 +205,8 @@ mod tests {
     /// ran.
     #[test]
     fn every_channel_of_a_frame_is_scaled_alike() {
-        let mut f = fade();
-        f.arm();
+        let mut f = Fade::new(RATE);
+        f.arm(200);
         let mut period = vec![1.0_f32; 64 * 4];
         f.apply(&mut period, 4);
         for frame in period.chunks(4) {
@@ -166,23 +221,39 @@ mod tests {
     /// stream is not permanently scaled by a stale ramp.
     #[test]
     fn passes_audio_through_once_spent() {
-        let mut f = fade();
-        f.arm();
-        gains_over(&mut f, RAMP_FRAMES, 2);
+        let mut f = Fade::new(RATE);
+        f.arm(200);
+        gains_over(&mut f, 200, 2);
         let mut buf = vec![0.25_f32, -0.75];
         let before = buf.clone();
         f.apply(&mut buf, 2);
         assert_eq!(buf, before);
     }
 
-    /// A zero-length ramp (a nonsense rate, say) must be a no-op rather than
-    /// a division by zero that silences the route forever.
+    /// Re-arming restarts from silence. The reason to re-arm is that
+    /// something happened, and that is not a reason to be further along the
+    /// ramp than before.
+    #[test]
+    fn re_arming_restarts_from_silence() {
+        let mut f = Fade::new(RATE);
+        f.arm(200);
+        gains_over(&mut f, 100, 2);
+        f.arm(2_000);
+        let mut buf = vec![1.0_f32; 2];
+        f.apply(&mut buf, 2);
+        assert_eq!(buf[0], 0.0, "a re-armed ramp must start over at silence");
+    }
+
+    /// A zero-length ramp (a nonsense rate, or 0 ms) must be a no-op rather
+    /// than a division by zero that silences the route forever.
     #[test]
     fn a_zero_length_ramp_is_harmless() {
-        let mut f = Fade::new(0, 200);
-        f.arm();
-        let mut buf = vec![1.0_f32, 1.0];
-        f.apply(&mut buf, 2);
-        assert_eq!(buf, vec![1.0, 1.0]);
+        for (rate, ms) in [(0, 200), (RATE, 0)] {
+            let mut f = Fade::new(rate);
+            f.arm(ms);
+            let mut buf = vec![1.0_f32, 1.0];
+            f.apply(&mut buf, 2);
+            assert_eq!(buf, vec![1.0, 1.0], "rate={rate} ms={ms}");
+        }
     }
 }

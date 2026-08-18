@@ -283,8 +283,8 @@ fn alsa_loop(
     // out of a freshly started ring is not reliably audio — on some hardware
     // it is whatever was in that memory. Shipping that at full scale is one
     // of the ways a remote machine's speakers get a bang out of nowhere.
-    let mut fade = Fade::new(spec.rate, RESUME_FADE_MS);
-    fade.arm();
+    let mut fade = Fade::new(spec.rate);
+    fade.arm(RESUME_FADE_MS);
 
     while !stop.load(Ordering::Relaxed) {
         // The one blocking point in this loop — see the module docs. Waiting
@@ -332,7 +332,7 @@ fn alsa_loop(
                     pcm::ensure_capture_running(&pcm);
                     // The ring was just reset; treat what comes out of it
                     // next like a fresh start.
-                    fade.arm();
+                    fade.arm(RESUME_FADE_MS);
                     continue;
                 }
                 bail!("capture {alsa_name} wait: {err}");
@@ -359,7 +359,7 @@ fn alsa_loop(
                     pcm::ensure_capture_running(&pcm);
                     // The ring was just reset; treat what comes out of it
                     // next like a fresh start.
-                    fade.arm();
+                    fade.arm(RESUME_FADE_MS);
                     continue;
                 }
                 bail!("capture {alsa_name} read: {err}");
@@ -420,8 +420,8 @@ fn tone_loop(
     // A test tone is a known, bounded amplitude, so this is not about safety
     // here — it is so a preview tone arrives as a note rather than as a click
     // into whatever monitors happen to be up.
-    let mut fade = Fade::new(spec.rate, RESUME_FADE_MS);
-    fade.arm();
+    let mut fade = Fade::new(spec.rate);
+    fade.arm(RESUME_FADE_MS);
 
     let period_frames = spec.frames_per_period as usize;
     let mut buf: Vec<f32> = Vec::with_capacity(period_frames * spec.channels as usize);

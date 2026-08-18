@@ -48,8 +48,8 @@ use crate::audio::format::f32_to_alsa;
 use crate::audio::{pcm, window};
 use crate::pipeline::fade::Fade;
 use crate::pipeline::{
-    publish_level, DEVICE_WAIT_TIMEOUT_MS, MAX_CONSECUTIVE_ERRORS, RESUME_FADE_MS,
-    SILENCE_BEFORE_FADE_MS, STALL_WARN_AFTER,
+    publish_level, COLD_RESUME_FADE_MS, DEVICE_WAIT_TIMEOUT_MS, LONG_ABSENCE_MS,
+    MAX_CONSECUTIVE_ERRORS, RESUME_FADE_MS, SILENCE_BEFORE_FADE_MS, STALL_WARN_AFTER,
 };
 use crate::transport::{receiver, RocContext};
 
@@ -225,9 +225,11 @@ fn run(
     // start, because a route that has only just opened is the same situation
     // as one whose sender vanished and came back: about to play material this
     // engine has never seen at a level nobody has checked.
-    let mut fade = Fade::new(spec.rate, RESUME_FADE_MS);
-    fade.arm();
-    let silence_before_fade = spec.rate as u64 * SILENCE_BEFORE_FADE_MS as u64 / 1000;
+    let mut fade = Fade::new(spec.rate);
+    fade.arm(COLD_RESUME_FADE_MS);
+    let frames_in = |ms: u32| spec.rate as u64 * ms as u64 / 1000;
+    let silence_before_fade = frames_in(SILENCE_BEFORE_FADE_MS);
+    let long_absence = frames_in(LONG_ABSENCE_MS);
     let mut silent_frames: u64 = 0;
 
     while !w.stop.load(Ordering::Relaxed) {
@@ -265,12 +267,28 @@ fn run(
             silent_frames = silent_frames.saturating_add(period_frames as u64);
         } else {
             if silent_frames >= silence_before_fade {
+                // How cautious to be depends on how long it was away. A short
+                // gap is the same stream at the same level and only needs
+                // declicking; past `LONG_ABSENCE_MS` something structural
+                // happened at the other end and the level is no longer
+                // something this engine knows.
+                let cold = silent_frames >= long_absence;
+                let ms = if cold {
+                    COLD_RESUME_FADE_MS
+                } else {
+                    RESUME_FADE_MS
+                };
                 tracing::info!(
                     "recv pipeline {alsa_name}: audio resumed after {:.1}s of silence, \
-                     ramping in over {RESUME_FADE_MS}ms",
-                    silent_frames as f64 / spec.rate as f64
+                     ramping in over {ms}ms{}",
+                    silent_frames as f64 / spec.rate as f64,
+                    if cold {
+                        " (level unknown after a long absence)"
+                    } else {
+                        ""
+                    }
                 );
-                fade.arm();
+                fade.arm(ms);
             }
             silent_frames = 0;
         }

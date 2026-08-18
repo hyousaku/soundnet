@@ -84,14 +84,29 @@ pub const DEVICE_WAIT_TIMEOUT_MS: u32 = 100;
 /// repeatedly produces one line each time rather than ten a second forever.
 pub const STALL_WARN_AFTER: u32 = 10;
 
-/// How long audio takes to come back up to full level after a gap.
+/// Ramp length for audio returning after a *brief* interruption.
 ///
-/// Applied by both pipelines through `fade::Fade` — see that module for what
-/// a ramp does and does not protect against, and for the incident that put it
-/// there. 200 ms is a compromise: long enough that a burst arrives as a swell
-/// somebody can react to and short enough that a stream resuming on purpose
-/// does not feel broken.
+/// Short because nothing is unknown here. A run of dropped packets or a peer
+/// restarting a worker is audio whose level was fine a moment ago; it needs
+/// declicking, not caution. Also what the capture side uses at device open
+/// and after each xrun recovery, where the concern is a freshly started DMA
+/// ring rather than an unknown level.
 pub const RESUME_FADE_MS: u32 = 200;
+
+/// Ramp length for audio returning after a *long* absence, and for the first
+/// audio of a newly opened route.
+///
+/// This is the one that makes unattended recovery safe. The machine at the
+/// other end may have rebooted; its mixer may have come up differently; the
+/// first periods out of its capture device may not be audio at all. Nothing
+/// about the level that is about to arrive is known, so it arrives quietly:
+/// the cubic curve in `fade.rs` holds a two-second ramp at or below -18 dB
+/// for its first full second, which is enough to make a burst startling
+/// rather than damaging and to leave a second in hand to reach a fader.
+///
+/// The cost is paid only when audio was actually away, so a route that runs
+/// continuously never sees it.
+pub const COLD_RESUME_FADE_MS: u32 = 2_000;
 
 /// How much unbroken digital silence counts as "the stream was gone", after
 /// which the receiver ramps the audio back in rather than resuming at full
@@ -101,12 +116,25 @@ pub const RESUME_FADE_MS: u32 = 200;
 /// no sender connected `roc_receiver_read` zero-fills the frame, while a real
 /// converter's idea of silence always carries some noise in the low bits. The
 /// proxy is not perfect — a digitally muted source does produce exact zeros —
-/// but the consequence of a false positive is a 200 ms fade-in on a passage
-/// that was already silent, which nobody can hear.
+/// but the consequence of a false positive is a fade-in on a passage that was
+/// already silent, which nobody can hear.
 ///
 /// Half a second is well past any musical gap and well short of the time it
 /// takes to notice a machine has dropped off.
 pub const SILENCE_BEFORE_FADE_MS: u32 = 500;
+
+/// Silence beyond which the receiver stops assuming it knows the level.
+///
+/// Below this, a gap is a glitch: the sender is the same process it was a
+/// moment ago, streaming the same source at the same gain, and a long
+/// cautious ramp on every network hiccup would be worse than the hiccup. At
+/// five seconds and beyond, something structural happened — a suspend, a
+/// service restart, a reboot — and on the other side of that, the level is
+/// not something this engine knows any more.
+///
+/// Five seconds is chosen to sit clearly above any plausible packet-loss run
+/// and clearly below the shortest reboot.
+pub const LONG_ABSENCE_MS: u32 = 5_000;
 
 #[cfg(test)]
 mod tests {
