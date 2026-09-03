@@ -6,7 +6,11 @@ import { describeHealth } from "./health";
 const RATES = [44100, 48000, 88200, 96000];
 const FORMATS: SampleFormat[] = ["S16_LE", "S24_LE3", "S24_LE", "S32_LE", "F32_LE"];
 const PERIODS = [32, 64, 128, 256, 512];
-const LATENCIES = [3, 5, 10, 20, 40, 80];
+// 120 and 200 exist for paths that leave the LAN entirely — over the public
+// internet (a Tailscale tunnel, say) jitter runs much larger than on a wire,
+// and 80ms of buffer can still be too little to absorb it. See the README's
+// "Running over Tailscale" section.
+const LATENCIES = [3, 5, 10, 20, 40, 80, 120, 200];
 
 export default function RouteEditor() {
   const routes = useStore((s) => s.routes);

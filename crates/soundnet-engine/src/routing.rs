@@ -25,7 +25,7 @@ use tokio::sync::Mutex;
 use crate::config::Config;
 use crate::pipeline::{recv, send};
 use crate::state::EngineState;
-use crate::transport::RocContext;
+use crate::transport::{sender, RocContext};
 
 /// Live handles for a Route on this engine.
 pub struct RunningRoute {
@@ -548,10 +548,42 @@ async fn try_start_inner(state: &Arc<EngineState>, route: &Route) -> Result<Opti
         // Only pin the sender's outgoing interface when the operator
         // explicitly chose one; otherwise leave it to the OS routing table,
         // same as before this feature existed (see transport/sender.rs).
-        let outgoing = if state.selected_interface.read().await.is_some() {
+        let selected_interface = state.selected_interface.read().await.clone();
+        let outgoing = if selected_interface.is_some() {
             Some(*state.identity.addr.read().unwrap())
         } else {
             None
+        };
+        // The packet payload cap follows the pinned interface's real MTU
+        // rather than assuming Ethernet — see
+        // `transport::sender::max_payload_for_mtu`. This is the case
+        // Tailscale motivated: `tailscale0` defaults to a 1280-byte MTU, well
+        // under Ethernet's 1500, and a fixed 1400-byte cap produced datagrams
+        // that fragmented on every hop through the tunnel.
+        //
+        // When nothing is pinned this falls back to the Ethernet default,
+        // same as before this feature existed: with no interface chosen, the
+        // engine cannot know which one the kernel will actually pick for a
+        // given destination without doing its own route lookup, so there is
+        // no MTU to derive a better cap from. This is also why Tailscale
+        // users are told (see README) to pin `tailscale0` regardless — they
+        // already have to, so the advertised address is the tailnet one, and
+        // doing so fixes the packet size as a side effect.
+        let max_payload = match selected_interface.as_deref().and_then(crate::iface::mtu_of) {
+            Some(mtu) => {
+                let cap = sender::max_payload_for_mtu(mtu);
+                // Logged once per route start, at info: an operator debugging
+                // a fragmenting link should be able to find the MTU-derived
+                // cap actually in force in the journal instead of inferring
+                // it from packet captures.
+                tracing::info!(
+                    "route {}: egress interface {:?} has mtu {mtu}, packet payload cap {cap} bytes",
+                    route.id,
+                    selected_interface.as_deref().unwrap_or(""),
+                );
+                cap
+            }
+            None => sender::DEFAULT_MAX_PACKET_PAYLOAD_BYTES,
         };
         let pipeline = send::spawn(
             &port.alsa_name,
@@ -560,6 +592,7 @@ async fn try_start_inner(state: &Arc<EngineState>, route: &Route) -> Result<Opti
             &dst_node.addr,
             dst_port,
             outgoing,
+            max_payload,
             route.src.channel_offset,
             &route.id,
             &state.capture,

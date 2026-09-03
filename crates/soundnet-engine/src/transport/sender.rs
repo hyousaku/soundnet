@@ -5,6 +5,16 @@
 //! pipeline (see `pipeline/send.rs`), which reads a period from ALSA and
 //! hands it straight here — there is deliberately no buffer in between, so
 //! the sound card's clock is the only clock in the path.
+//!
+//! The packet payload cap (see `frames_per_packet`) follows the egress
+//! interface's MTU rather than assuming Ethernet: `routing::try_start_inner`
+//! derives it from whichever interface is pinned and passes it in as
+//! `open`'s `max_payload` argument, falling back to
+//! `DEFAULT_MAX_PACKET_PAYLOAD_BYTES` when nothing is pinned. The case that
+//! motivated this is a tunnel with a smaller MTU than Ethernet's 1500 —
+//! Tailscale's `tailscale0` defaults to 1280 — where the old fixed
+//! Ethernet-sized cap produced datagrams that fragmented on every hop
+//! through the tunnel.
 
 use anyhow::{anyhow, bail, Result};
 use core::ffi::c_char;
@@ -85,11 +95,17 @@ fn interface_config_for(ip: IpAddr) -> Result<roc::roc_interface_config> {
     })
 }
 
-/// Biggest audio payload we let roc put in one packet, in bytes.
+/// Fallback biggest audio payload we let roc put in one packet, in bytes,
+/// used when the egress interface's MTU can't be determined (nothing
+/// pinned, or the pinned name doesn't currently resolve — see
+/// `routing::try_start_inner`).
 ///
 /// Sized so the datagram fits inside a standard 1500-byte Ethernet MTU:
 /// 1500 - 40 (IPv6 header; IPv4's 20 only leaves more room) - 8 (UDP)
 /// - 12 (RTP) - slack for roc's FEC headers, rounded down to a round number.
+///
+/// See `max_payload_for_mtu` for the general form this constant is now a
+/// special case of.
 ///
 /// Past this the datagram is fragmented by IP, and a fragmented datagram is
 /// all-or-nothing: lose either fragment and the whole packet is gone. That is
@@ -97,7 +113,38 @@ fn interface_config_for(ip: IpAddr) -> Result<roc::roc_interface_config> {
 /// it counts packets, and the kernel reassembles or discards fragments
 /// beneath it. So a fragmented stream degrades in a way that is both harsher
 /// and less visible than an unfragmented one.
-const MAX_PACKET_PAYLOAD_BYTES: u32 = 1400;
+///
+/// This used to be the only cap there was, sized for Ethernet and nothing
+/// else. It stopped being safe the day someone ran a route over a Tailscale
+/// tunnel: `tailscale0` defaults to a 1280-byte MTU, and this constant alone
+/// let a 1400-byte payload become a 1420-byte-plus IP packet that fragments
+/// on every hop through the tunnel — invisibly, in exactly the way the
+/// paragraph above describes. `max_payload_for_mtu` is what fixed that; this
+/// constant now only covers the case where the engine has no MTU to derive
+/// the cap from.
+pub const DEFAULT_MAX_PACKET_PAYLOAD_BYTES: u32 = 1400;
+
+/// Floor under `max_payload_for_mtu`'s output. Below this the arithmetic
+/// (`mtu - 100` for headers) stops being about headroom and starts being
+/// about running out of MTU altogether — a pathological or misreported MTU
+/// (some tunnel interfaces have reported MTUs in the low hundreds, or even
+/// 0, in real deployments) must not be allowed to produce a near-zero or
+/// zero-size packet, which would make `frames_per_packet` spin down to 1
+/// frame per packet and turn every route into a packet-rate flood.
+const MIN_PACKET_PAYLOAD_BYTES: u32 = 128;
+
+/// Derive the packet payload cap from an interface's MTU, following the same
+/// budget as `DEFAULT_MAX_PACKET_PAYLOAD_BYTES`: `mtu - 100` for the IP/UDP/
+/// RTP/FEC overhead documented there, clamped to `MIN_PACKET_PAYLOAD_BYTES`
+/// so a pathological MTU can't produce a degenerate packet size.
+///
+/// `max_payload_for_mtu(1500) == DEFAULT_MAX_PACKET_PAYLOAD_BYTES` by
+/// construction — see the test of the same name, which is what makes this
+/// change a no-op on ordinary Ethernet rather than a behaviour change for
+/// everyone who was already fine.
+pub fn max_payload_for_mtu(mtu: u32) -> u32 {
+    mtu.saturating_sub(100).max(MIN_PACKET_PAYLOAD_BYTES)
+}
 
 /// Bytes per sample on the wire. The packet encoding registered by
 /// `RocContext::ensure_encoding` is `ROC_FORMAT_PCM_FLOAT32`, so four.
@@ -122,11 +169,17 @@ const WIRE_BYTES_PER_SAMPLE: u32 = 4;
 ///
 /// Sending smaller packets sooner cannot add latency; roc emits a packet as
 /// soon as it is full, so this only ever makes the first packet leave earlier.
-fn frames_per_packet(frames_per_period: u32, channels: u8) -> u32 {
+///
+/// `max_payload` is the cap to packetise against — Ethernet's 1400 bytes by
+/// default, but derived from the egress interface's real MTU when one is
+/// pinned (see `max_payload_for_mtu` and `routing::try_start_inner`), because
+/// a fixed Ethernet-sized cap is wrong the moment the packets leave over
+/// something with a smaller MTU, such as a Tailscale tunnel (`tailscale0` is
+/// 1280 by default).
+fn frames_per_packet(frames_per_period: u32, channels: u8, max_payload: u32) -> u32 {
     let channels = channels.max(1) as u64;
     let mut frames = frames_per_period.max(1);
-    while frames > 1
-        && frames as u64 * channels * WIRE_BYTES_PER_SAMPLE as u64 > MAX_PACKET_PAYLOAD_BYTES as u64
+    while frames > 1 && frames as u64 * channels * WIRE_BYTES_PER_SAMPLE as u64 > max_payload as u64
     {
         frames /= 2;
     }
@@ -155,24 +208,35 @@ fn packet_length_ns(frames: u32, rate: u32) -> u64 {
 
 /// Open a sender connected to `host`'s audio port trio. `outgoing` pins the
 /// local address packets leave from (a specific NIC's IP); `None` leaves it
-/// to the OS routing table.
+/// to the OS routing table. `max_payload` is the packet payload cap to
+/// packetise against — see `frames_per_packet` and `max_payload_for_mtu`;
+/// callers pass `DEFAULT_MAX_PACKET_PAYLOAD_BYTES` when there is no MTU to
+/// derive a better one from.
 pub fn open(
     ctx: Arc<RocContext>,
     host: &str,
     audio_port: u16,
     spec: &StreamSpec,
     outgoing: Option<IpAddr>,
+    max_payload: u32,
 ) -> Result<Sender> {
     // Always use MULTITRACK layout — same code path for 1..32 channels, and
     // we register a custom packet encoding below so libroc doesn't try to
     // pick a built-in that doesn't exist for our rate/format.
     let packet_encoding = ctx.ensure_encoding(spec.rate, spec.channels);
-    let packet_frames = frames_per_packet(spec.frames_per_period, spec.channels);
+    let packet_frames = frames_per_packet(spec.frames_per_period, spec.channels, max_payload);
+    // Logged once per open (not per period) at info, unconditionally — so an
+    // operator debugging a fragmenting link can find the cap actually in
+    // force in the journal instead of inferring it from packet captures.
+    // Which interface and MTU (if any) produced this number is logged
+    // alongside where those are known — see routing::try_start_inner — this
+    // line is what ties that back to a concrete sender.
+    tracing::info!("sender {host}:{audio_port}: packet payload cap {max_payload} bytes in force");
     if packet_frames != spec.frames_per_period {
         tracing::info!(
             "sender {host}:{audio_port}: {} channels at period {} would need a \
              {}-byte payload, so packetising {packet_frames} frames at a time \
-             ({} packets per period) to stay inside one Ethernet frame",
+             ({} packets per period) to stay inside the {max_payload}-byte packet cap",
             spec.channels,
             spec.frames_per_period,
             spec.frames_per_period * spec.channels as u32 * WIRE_BYTES_PER_SAMPLE,
@@ -328,10 +392,10 @@ mod tests {
     fn no_combination_the_ui_offers_can_fragment_a_datagram() {
         for period in [32u32, 64, 128, 256, 512] {
             for channels in 1..=64u8 {
-                let frames = frames_per_packet(period, channels);
+                let frames = frames_per_packet(period, channels, DEFAULT_MAX_PACKET_PAYLOAD_BYTES);
                 let payload = frames as u64 * channels as u64 * WIRE_BYTES_PER_SAMPLE as u64;
                 assert!(
-                    payload <= MAX_PACKET_PAYLOAD_BYTES as u64,
+                    payload <= DEFAULT_MAX_PACKET_PAYLOAD_BYTES as u64,
                     "period {period} x {channels}ch: {frames} frames is a {payload}-byte payload"
                 );
                 assert!(
@@ -352,14 +416,93 @@ mod tests {
         }
     }
 
+    /// Same sweep, but at the payload cap a Tailscale tunnel actually
+    /// produces (`tailscale0`'s default 1280-byte MTU). No combination the UI
+    /// offers may produce an IP packet bigger than 1280 bytes — the full
+    /// on-wire size, not just the roc payload, since it's the *datagram* that
+    /// fragments at the tunnel's MTU. 20 (IPv4) + 8 (UDP) + 12 (RTP) is the
+    /// same header budget `max_payload_for_mtu`'s doc comment accounts for.
+    #[test]
+    fn no_combination_the_ui_offers_can_fragment_a_datagram_over_tailscale() {
+        const TAILSCALE_MTU: u32 = 1280;
+        let max_payload = max_payload_for_mtu(TAILSCALE_MTU);
+        for period in [32u32, 64, 128, 256, 512] {
+            for channels in 1..=64u8 {
+                let frames = frames_per_packet(period, channels, max_payload);
+                let payload = frames as u64 * channels as u64 * WIRE_BYTES_PER_SAMPLE as u64;
+                let ip_packet = payload + 12 /* RTP */ + 8 /* UDP */ + 20 /* IPv4 */;
+                assert!(
+                    ip_packet <= TAILSCALE_MTU as u64,
+                    "period {period} x {channels}ch over tailscale0 (mtu {TAILSCALE_MTU}): \
+                     {frames} frames is a {ip_packet}-byte IP packet, which fragments on \
+                     every hop through the tunnel — the same all-or-nothing loss FEC is \
+                     worst at absorbing, and invisible to roc"
+                );
+                assert!(
+                    frames >= 1,
+                    "period {period} x {channels}ch over tailscale0 produced no frames"
+                );
+            }
+        }
+    }
+
+    /// Pins the regression this change fixes. At the old fixed 1400-byte
+    /// Ethernet cap and the recommended 128-frame period, halving the frame
+    /// count until the payload fits under 1400 bytes lands on exactly a
+    /// 1280-byte payload for 5, 10 and 20 channels alike (64, 32 and 16
+    /// frames respectively) — a 1320-byte IP packet, which fragments over
+    /// `tailscale0`'s 1280-byte MTU. Power-of-two channel counts (2, 4, 8,
+    /// 16, 32) stay at a 1024-byte payload throughout and were never
+    /// affected — this test is specifically about the counts that were.
+    #[test]
+    fn channel_counts_that_fragmented_over_tailscale_are_fixed() {
+        const OLD_ETHERNET_CAP: u32 = DEFAULT_MAX_PACKET_PAYLOAD_BYTES;
+        const TAILSCALE_MTU: u32 = 1280;
+        let tailscale_cap = max_payload_for_mtu(TAILSCALE_MTU);
+
+        for channels in [5u8, 10, 20] {
+            let old_frames = frames_per_packet(128, channels, OLD_ETHERNET_CAP);
+            let old_payload = old_frames as u64 * channels as u64 * WIRE_BYTES_PER_SAMPLE as u64;
+            let old_ip_packet = old_payload + 12 + 8 + 20;
+            assert_eq!(
+                old_ip_packet, 1320,
+                "{channels}ch at the old 1400-byte cap: expected the known 1320-byte \
+                 IP packet that fragments over a 1280-MTU tunnel, got {old_ip_packet}"
+            );
+            assert!(
+                old_ip_packet > TAILSCALE_MTU as u64,
+                "{channels}ch: {old_ip_packet}-byte packet does not actually exceed the \
+                 tunnel MTU, so this isn't the regression being tested"
+            );
+
+            let new_frames = frames_per_packet(128, channels, tailscale_cap);
+            let new_payload = new_frames as u64 * channels as u64 * WIRE_BYTES_PER_SAMPLE as u64;
+            let new_ip_packet = new_payload + 12 + 8 + 20;
+            assert!(
+                new_ip_packet <= TAILSCALE_MTU as u64,
+                "{channels}ch at the MTU-derived cap should no longer fragment over \
+                 tailscale0, got a {new_ip_packet}-byte IP packet"
+            );
+        }
+    }
+
     /// A stereo route at the recommended period already fits, and must be
     /// left exactly as it was — this change is meant to be invisible to the
     /// configurations that were fine.
     #[test]
     fn a_period_that_already_fits_is_left_alone() {
-        assert_eq!(frames_per_packet(128, 2), 128); // 1024 bytes
-        assert_eq!(frames_per_packet(64, 4), 64); // 1024 bytes
-        assert_eq!(frames_per_packet(32, 8), 32); // 1024 bytes
+        assert_eq!(
+            frames_per_packet(128, 2, DEFAULT_MAX_PACKET_PAYLOAD_BYTES),
+            128
+        ); // 1024 bytes
+        assert_eq!(
+            frames_per_packet(64, 4, DEFAULT_MAX_PACKET_PAYLOAD_BYTES),
+            64
+        ); // 1024 bytes
+        assert_eq!(
+            frames_per_packet(32, 8, DEFAULT_MAX_PACKET_PAYLOAD_BYTES),
+            32
+        ); // 1024 bytes
     }
 
     /// And the configurations that were quietly fragmenting get split. 256
@@ -368,10 +511,18 @@ mod tests {
     /// running when the limit was found.
     #[test]
     fn the_configurations_that_were_fragmenting_get_split() {
-        assert_eq!(frames_per_packet(256, 2), 128, "2048 bytes -> two packets");
-        assert_eq!(frames_per_packet(128, 8), 32, "4096 bytes -> four packets");
         assert_eq!(
-            frames_per_packet(128, 32),
+            frames_per_packet(256, 2, DEFAULT_MAX_PACKET_PAYLOAD_BYTES),
+            128,
+            "2048 bytes -> two packets"
+        );
+        assert_eq!(
+            frames_per_packet(128, 8, DEFAULT_MAX_PACKET_PAYLOAD_BYTES),
+            32,
+            "4096 bytes -> four packets"
+        );
+        assert_eq!(
+            frames_per_packet(128, 32, DEFAULT_MAX_PACKET_PAYLOAD_BYTES),
             8,
             "16384 bytes -> sixteen packets"
         );
@@ -381,10 +532,53 @@ mod tests {
     /// "pick your own default" — silently undoing the whole calculation.
     #[test]
     fn degenerate_input_still_yields_a_usable_packet() {
-        assert_eq!(frames_per_packet(0, 2), 1);
-        assert_eq!(frames_per_packet(128, 0), 128);
-        assert_eq!(frames_per_packet(128, 255), 1);
-        assert!(packet_length_ns(frames_per_packet(128, 255), 48_000) > 0);
+        assert_eq!(frames_per_packet(0, 2, DEFAULT_MAX_PACKET_PAYLOAD_BYTES), 1);
+        assert_eq!(
+            frames_per_packet(128, 0, DEFAULT_MAX_PACKET_PAYLOAD_BYTES),
+            128
+        );
+        assert_eq!(
+            frames_per_packet(128, 255, DEFAULT_MAX_PACKET_PAYLOAD_BYTES),
+            1
+        );
+        assert!(
+            packet_length_ns(
+                frames_per_packet(128, 255, DEFAULT_MAX_PACKET_PAYLOAD_BYTES),
+                48_000
+            ) > 0
+        );
+    }
+
+    /// This is what makes deriving the cap from the interface MTU a no-op on
+    /// ordinary Ethernet: a 1500-byte MTU must reproduce the exact constant
+    /// that used to be hardcoded, so every host that was fine before this
+    /// change stays fine after it.
+    #[test]
+    fn mtu_derived_cap_matches_ethernet_default_at_1500() {
+        assert_eq!(
+            max_payload_for_mtu(1500),
+            DEFAULT_MAX_PACKET_PAYLOAD_BYTES,
+            "deriving the cap from a standard Ethernet MTU must reproduce the old constant"
+        );
+    }
+
+    /// Tailscale's `tailscale0` is the case that motivated this: a 1280 MTU
+    /// yields an 1180-byte payload cap, well under the old fixed 1400.
+    #[test]
+    fn mtu_derived_cap_shrinks_for_tailscale() {
+        assert_eq!(max_payload_for_mtu(1280), 1180);
+    }
+
+    /// A pathologically small or zero MTU must not be allowed to produce a
+    /// near-zero or zero-size packet cap — that would make
+    /// `frames_per_packet` spin down to one frame per packet regardless of
+    /// channel count, turning every route into a packet-rate flood instead
+    /// of failing in some more obvious way.
+    #[test]
+    fn mtu_derived_cap_has_a_floor() {
+        assert_eq!(max_payload_for_mtu(0), MIN_PACKET_PAYLOAD_BYTES);
+        assert_eq!(max_payload_for_mtu(50), MIN_PACKET_PAYLOAD_BYTES);
+        assert_eq!(max_payload_for_mtu(100), MIN_PACKET_PAYLOAD_BYTES);
     }
 
     /// `outgoing_address` is a fixed 48-byte NUL-terminated C string that

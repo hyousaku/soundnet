@@ -16,6 +16,32 @@ use crate::discovery;
 use crate::routing;
 use crate::state::EngineState;
 
+/// Read an interface's MTU straight from sysfs.
+///
+/// `/sys/class/net/<name>/mtu` rather than a netlink socket or an `ioctl`:
+/// the value is a single integer the kernel already publishes as a plain
+/// text file, so reading it costs nothing beyond `std::fs` and doesn't pull
+/// in a netlink dependency (or an ioctl + raw socket dance) for one number
+/// this project only ever needs once per sender open. Linux-only, same as
+/// the rest of this module — the project is ALSA-only, so there is nowhere
+/// else this runs.
+///
+/// Returns `None` if the file doesn't exist (interface renamed or gone since
+/// it was pinned — same "fall back, don't fail to start" contract as
+/// [`resolve`]) or doesn't parse as a plain integer.
+pub fn mtu_of(name: &str) -> Option<u32> {
+    // `name` is config that can be copied between machines or edited by
+    // hand, and it becomes a path component below. Refuse anything that
+    // could walk it out of /sys/class/net (a `/` or `..` segment) or that
+    // would corrupt the path outright (an embedded NUL) rather than let
+    // `std::fs::read_to_string` chase it wherever it leads.
+    if name.is_empty() || name.contains('/') || name.contains('\0') || name.contains("..") {
+        return None;
+    }
+    let raw = std::fs::read_to_string(format!("/sys/class/net/{name}/mtu")).ok()?;
+    raw.trim().parse().ok()
+}
+
 /// Interfaces worth offering to the operator: IPv4, not loopback, not
 /// link-local (169.254/16 self-assigned addresses aren't useful to bind
 /// audio to).
@@ -151,5 +177,57 @@ mod tests {
         let ifaces = vec![fake_iface("eth0", Ipv4Addr::new(192, 168, 10, 135))];
         assert_eq!(resolve_in("eth1", &ifaces), None);
         assert_eq!(resolve_in("nonexistent0", &[]), None);
+    }
+
+    /// The one assertion here that touches the real host: sysfs is readable
+    /// and the value parses. `lo` is the only interface every Linux machine
+    /// has, so it is the only safe subject.
+    ///
+    /// Deliberately not asserting the exact number. 65536 is the usual
+    /// loopback default, but it is a kernel default rather than a guarantee
+    /// and a container or a tuned host can set it otherwise — and this test
+    /// exists to prove the read and the parse work, not to police somebody's
+    /// loopback configuration. Pinning the exact value would fail for a
+    /// reason that has nothing to do with the code under test.
+    #[test]
+    fn mtu_of_reads_a_real_interface() {
+        let mtu = mtu_of("lo").expect("every Linux host has lo with an mtu in sysfs");
+        assert!(
+            mtu >= 1000,
+            "lo reported an implausible mtu of {mtu} — the parse is probably wrong"
+        );
+    }
+
+    #[test]
+    fn mtu_of_missing_interface_returns_none() {
+        assert_eq!(mtu_of("nonexistent0"), None);
+    }
+
+    /// `name` is config, not something this process chose, so it must not be
+    /// trusted as a path component.
+    ///
+    /// The first case is the one that earns this test. `../net/lo` traverses
+    /// straight back into the directory it started from — `/sys/class/net/..`
+    /// is `/sys/class`, so `/sys/class/net/../net/lo/mtu` resolves to a real,
+    /// readable, parseable file. Without the guard this returns `Some`, which
+    /// is a traversal that *worked*.
+    ///
+    /// The rest are documentation rather than proof, and saying so matters:
+    /// they come back `None` with or without the guard, because `/mtu` is
+    /// appended to whatever is given and none of them lands on a directory
+    /// that contains such a file. A test that passes for a reason unrelated
+    /// to the code it names is worse than no test — it looks like coverage.
+    #[test]
+    fn mtu_of_rejects_path_escaping_names() {
+        assert_eq!(
+            mtu_of("../net/lo"),
+            None,
+            "a `..` segment walked back into /sys/class/net and read a real mtu"
+        );
+        assert_eq!(mtu_of("../../etc/passwd"), None);
+        assert_eq!(mtu_of("eth0/../../etc/passwd"), None);
+        assert_eq!(mtu_of("eth0/mtu"), None);
+        assert_eq!(mtu_of("eth0\0"), None);
+        assert_eq!(mtu_of(""), None);
     }
 }

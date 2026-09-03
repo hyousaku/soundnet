@@ -219,6 +219,9 @@ impl SendHandle {
 /// Spawn the send side of a route: read from `alsa_name` (or synthesize a
 /// tone, for `tone:` names) and stream to `dst_host`'s audio port trio.
 /// `outgoing` pins the NIC packets leave from; `None` leaves it to the OS.
+/// `max_payload` is the packet payload cap to packetise against — see
+/// `transport::sender::max_payload_for_mtu` and `routing::try_start_inner`,
+/// which derives it from the pinned egress interface's MTU.
 #[allow(clippy::too_many_arguments)]
 pub fn spawn(
     alsa_name: &str,
@@ -227,6 +230,7 @@ pub fn spawn(
     dst_host: &str,
     dst_port: u16,
     outgoing: Option<IpAddr>,
+    max_payload: u32,
     channel_offset: u8,
     route_id: &str,
     registry: &Arc<capture::CaptureRegistry>,
@@ -241,6 +245,7 @@ pub fn spawn(
                 dst_host,
                 dst_port,
                 outgoing,
+                max_payload,
             )?,
             interrupted: Vec::new(),
         });
@@ -250,7 +255,7 @@ pub fn spawn(
     // the device will actually take this route, so a route that is about to
     // be refused does not open a UDP socket first.
     let dst = dst_host.to_string();
-    let build = || sender::open(ctx, &dst, dst_port, spec, outgoing);
+    let build = || sender::open(ctx, &dst, dst_port, spec, outgoing, max_payload);
 
     let sub = registry.subscribe(
         alsa_name,
@@ -295,6 +300,7 @@ fn spawn_tone(
     dst_host: &str,
     dst_port: u16,
     outgoing: Option<IpAddr>,
+    max_payload: u32,
 ) -> Result<SendHandle> {
     let stop = Arc::new(AtomicBool::new(false));
     let level_bits = Arc::new(AtomicU32::new(0));
@@ -318,6 +324,7 @@ fn spawn_tone(
                 &dst,
                 dst_port,
                 outgoing,
+                max_payload,
                 &stop_worker,
                 &level_worker,
             ) {
@@ -361,10 +368,11 @@ fn tone_loop(
     dst_host: &str,
     dst_port: u16,
     outgoing: Option<IpAddr>,
+    max_payload: u32,
     stop: &Arc<AtomicBool>,
     level_bits: &Arc<AtomicU32>,
 ) -> Result<()> {
-    let mut sender = sender::open(ctx, dst_host, dst_port, spec, outgoing)?;
+    let mut sender = sender::open(ctx, dst_host, dst_port, spec, outgoing, max_payload)?;
     // A test tone is a known, bounded amplitude, so this is not about safety
     // here — it is so a preview tone arrives as a note rather than as a click
     // into whatever monitors happen to be up.

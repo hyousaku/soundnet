@@ -240,6 +240,52 @@ The engine has no opinion about which interface you use — pin one per node
 under **This node → Egress interface** in the UI — so the same node can be
 wired for a session and wireless for a soundcheck.
 
+## Running over Tailscale
+
+Everything above assumes one LAN. SoundNet also works between hosts on
+different networks over a [Tailscale](https://tailscale.com/) tunnel, for
+distribution and monitoring at internet-typical latencies — it is not a
+substitute for a wired LAN when you need in-ear-monitor-grade timing.
+
+**mDNS does not cross Tailscale.** Auto-discovery is a LAN thing: mDNS is
+link-local multicast, and Tailscale is a layer-3 overlay that doesn't
+forward multicast between peers. A remote engine will not appear on its
+own. Use the **"Add host…"** dialog with the peer's tailnet address
+(`100.x.y.z` or its MagicDNS name) and its port; manual hosts are persisted,
+so this is a one-time step per peer.
+
+**Pin `tailscale0` on both ends**, under **This node → Egress interface** in
+the UI. Without it, the engine advertises whatever address
+`first_non_loopback_ipv4()` happens to pick — typically the LAN address —
+which a remote peer cannot route to at all. Be aware of the side effect: a
+node advertises exactly one address, so pinning `tailscale0` also sends
+LAN-local traffic through the tunnel — extra encryption cost and an extra
+hop for a peer sitting in the same room. There is currently no per-peer
+address selection; pinning is all-or-nothing per node.
+
+**Pinning also fixes the packet size**, as a side effect worth knowing
+about rather than relying on blindly: the packet payload cap now follows
+the pinned interface's real MTU (see `transport/sender.rs`), and
+`tailscale0` defaults to **1280** against Ethernet's 1500. Left at the
+Ethernet-sized cap, some channel counts produced datagrams that fragmented
+on every hop through the tunnel — the same all-or-nothing loss pattern the
+FEC discussion above describes, and just as invisible to roc. Pinning the
+interface is what makes the cap track it.
+
+**Check `tailscale status` for `direct` versus `relay`.** A path that says
+`relay` is going through a DERP relay rather than peer-to-peer, which adds
+tens to hundreds of milliseconds on top of whatever the tunnel itself
+costs — no amount of buffer or FEC tuning makes that usable for audio. If
+your peers show `relay`, fix that first (usually a firewall or NAT problem
+on one end preventing a direct connection); every other suggestion here is
+pointless until it says `direct`.
+
+**Starting settings** for a Tailscale route: `target_latency_ms` **80 or
+higher** (the internet's jitter is well past what Wi-Fi's 40–80 already
+assumes — the UI now offers up to 200ms for exactly this), FEC **on**, and
+`frames_per_period` **256**, for the same reasons as the Wi-Fi table above.
+Tune down from there once you've measured what the actual path needs.
+
 ## Recovery: what happens when a machine comes back
 
 Routes are persisted and restored at startup, so a host that reboots rejoins
