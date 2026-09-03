@@ -69,10 +69,7 @@ impl RunningRoute {
     /// `JoinHandle::is_finished` is the only way to notice after the fact
     /// that a "running" route's pipeline actually died.
     fn is_dead(&self) -> bool {
-        self.send
-            .as_ref()
-            .map(|s| s.thread.is_finished())
-            .unwrap_or(false)
+        self.send.as_ref().map(|s| s.is_dead()).unwrap_or(false)
             || self
                 .recv
                 .as_ref()
@@ -98,7 +95,7 @@ impl RunningRoute {
                 .unwrap_or_else(|e| e.into_inner())
                 .clone()
         };
-        let send = from(&self.send.as_ref().map(|s| s.last_error.clone()));
+        let send = self.send.as_ref().and_then(|s| s.failure_reason());
         let recv = from(&self.recv.as_ref().map(|r| r.last_error.clone()));
         match (send, recv) {
             (Some(s), Some(r)) => format!("send: {s}; recv: {r}"),
@@ -123,12 +120,12 @@ impl RunningRoute {
     /// no error, counts no xrun and keeps its thread alive, so `is_dead()` is
     /// false and the route reported a healthy `Ok` while producing silence.
     fn stalled_sides(&self) -> (bool, bool) {
-        let stalled = |flag: Option<&Arc<std::sync::atomic::AtomicBool>>| {
+        let load = |flag: Option<Arc<std::sync::atomic::AtomicBool>>| {
             flag.map(|f| f.load(Ordering::Relaxed)).unwrap_or(false)
         };
         (
-            stalled(self.send.as_ref().map(|s| &s.stalled)),
-            stalled(self.recv.as_ref().map(|r| &r.stalled)),
+            load(self.send.as_ref().map(|s| s.stalled())),
+            load(self.recv.as_ref().map(|r| r.stalled.clone())),
         )
     }
 
@@ -564,11 +561,13 @@ async fn try_start_inner(state: &Arc<EngineState>, route: &Route) -> Result<Opti
             dst_port,
             outgoing,
             route.src.channel_offset,
+            &route.id,
+            &state.capture,
         )?;
-        running.cap_level_bits = Some(pipeline.level_bits.clone());
-        running.cap_buffer_ns = Some(pipeline.buffer_ns.clone());
-        running.cap_format = Some(pipeline.format.clone());
-        running.cap_xruns = Some(pipeline.xruns.clone());
+        running.cap_level_bits = Some(pipeline.level_bits());
+        running.cap_buffer_ns = Some(pipeline.buffer_ns());
+        running.cap_format = Some(pipeline.format());
+        running.cap_xruns = Some(pipeline.xruns());
         running.send = Some(pipeline);
     }
 
@@ -934,6 +933,13 @@ pub async fn shutdown_all(state: &Arc<EngineState>) {
     // This is only safe because each pipeline owns its own device and its
     // own roc endpoint: there is no ordering to preserve between them, which
     // is exactly the property the merged send/recv pipelines were built for.
+    //
+    // Capture devices are the one thing `RunningRoute::request_stop` cannot
+    // flag on its own: a shared device must not stop when one of its routes
+    // does, so a route's own request is a no-op there. Only a whole-engine
+    // shutdown knows that every route is going, which is why the devices are
+    // flagged here rather than from the routes.
+    state.capture.request_stop_all();
     let ids: Vec<_> = state.running.iter().map(|e| e.key().clone()).collect();
     let mut draining = Vec::with_capacity(ids.len());
     for id in ids {

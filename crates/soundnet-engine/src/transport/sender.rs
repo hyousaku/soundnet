@@ -16,16 +16,26 @@ use std::sync::Arc;
 use super::{endpoint_free, endpoint_from_uri, RocContext};
 
 /// An open roc sender, connected to one destination.
-///
-/// Not `Send`: `roc_sender` is documented as thread-safe, but this type is
-/// deliberately confined to the single pipeline thread that opened it, which
-/// is what makes "the sound card paces everything" true by construction.
 pub struct Sender {
     raw: *mut roc::roc_sender,
     /// Keeps the shared context alive for at least as long as this sender —
     /// `roc_context_close` on a context with live senders is undefined.
     _ctx: Arc<RocContext>,
 }
+
+// SAFETY: `roc_sender` is documented as thread-safe (see roc/sender.h), and
+// this only claims the weaker property of being *movable* between threads.
+//
+// This used to be deliberately `!Send`, on the grounds that confining the
+// sender to the one thread that opened it made "the sound card paces
+// everything" true by construction. That property is still true and still
+// load-bearing, but it is no longer the *open* that establishes it: a capture
+// device shared by several routes has its senders opened on the control
+// thread — where a socket setup that blocks costs nothing — and moved into
+// the device's reading thread, which is then their sole writer for the rest
+// of their lives. Ownership moves once; nothing is ever written from two
+// threads. See `pipeline/capture.rs`.
+unsafe impl Send for Sender {}
 
 impl Drop for Sender {
     fn drop(&mut self) {

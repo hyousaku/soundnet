@@ -9,6 +9,7 @@ use std::sync::{Arc, RwLock as StdRwLock};
 use tokio::sync::{broadcast, Mutex, RwLock};
 
 use crate::config::ManualHost;
+use crate::pipeline::capture::CaptureRegistry;
 use crate::routing::{RouteFailure, RunningRoute};
 
 #[derive(Debug)]
@@ -55,6 +56,12 @@ pub struct EngineState {
     /// of keeping them is a mutex per route id the engine has ever seen,
     /// which for a patch bay is nothing.
     pub route_locks: DashMap<RouteId, Arc<Mutex<()>>>,
+
+    /// Capture devices this engine currently has open, and which routes are
+    /// reading from each. A device can only be opened once, so routes that
+    /// want the same input share one reading thread — see
+    /// `pipeline/capture.rs`.
+    pub capture: Arc<CaptureRegistry>,
 
     /// Persisted config path we write back to on route/manual-host changes.
     pub config_path: RwLock<Option<PathBuf>>,
@@ -103,6 +110,7 @@ impl EngineState {
             running: DashMap::new(),
             failures: DashMap::new(),
             route_locks: DashMap::new(),
+            capture: Arc::new(CaptureRegistry::default()),
             config_path: RwLock::new(None),
             manual_hosts: RwLock::new(Vec::new()),
             selected_interface: RwLock::new(None),

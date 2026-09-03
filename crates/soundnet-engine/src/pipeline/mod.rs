@@ -6,6 +6,7 @@
 //! with a ring buffer in between; see the module docs on `send.rs` for why
 //! that ring had to go.)
 
+pub mod capture;
 pub mod fade;
 pub mod recv;
 pub mod send;
