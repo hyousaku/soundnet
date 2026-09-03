@@ -189,6 +189,10 @@ pub struct Subscription {
     /// be worse than no meter.
     pub level_bits: Arc<AtomicU32>,
     pub health: Arc<SubscriberHealth>,
+    /// Routes whose audio this subscription briefly interrupted, because the
+    /// device had to be reopened wider to fit it. Empty in every other case.
+    /// The caller tells the operator; a gap nobody explains reads as a fault.
+    pub interrupted: Vec<String>,
 }
 
 enum Command {
@@ -204,13 +208,25 @@ pub struct CaptureOwner {
     /// thing will negotiate the same thing, and the negotiated value is not
     /// known until the thread has opened the card.
     params: DeviceParams,
-    /// How many channels the device was opened with — the far edge of the
-    /// widest window at the time. A later route whose window reaches past
-    /// this cannot be served without reopening the card.
-    device_channels: usize,
+    /// How many channels the device is currently open with — the far edge of
+    /// the widest window any of its routes asks for. Grows when a route needs
+    /// channels past it; see `reopen_wider`.
+    device_channels: Mutex<usize>,
     stop: Arc<AtomicBool>,
     thread: Mutex<Option<JoinHandle<()>>>,
     commands: Mutex<mpsc::Sender<Command>>,
+    /// Where the reading thread leaves its subscribers when it exits, so a
+    /// reopen can carry them across without rebuilding their roc senders. A
+    /// rebuilt sender would be a new RTP session to the far end, which its
+    /// receiver treats as a stream that went away and came back — two seconds
+    /// of cold-resume ramp on a gap that was tens of milliseconds.
+    handover: Arc<Mutex<Option<Vec<Subscriber>>>>,
+    /// Set while the device is being reopened. `is_dead` reports healthy in
+    /// that window: the old thread really has gone, but the route is not
+    /// failing — it is a few milliseconds from having a wider device — and
+    /// letting the supervisor see "dead" would tear down every route on the
+    /// card to fix a gap that was about to close by itself.
+    reopening: AtomicBool,
     /// Control-side mirror of who is subscribed. The audio thread has its own
     /// list; this one exists so a rejected route can be told which route is
     /// already holding the device, and so the registry knows when the last
@@ -224,6 +240,12 @@ pub struct CaptureOwner {
     pub format: Arc<AtomicU8>,
     pub stalled: Arc<AtomicBool>,
     pub last_error: Arc<Mutex<Option<String>>>,
+
+    /// Kept so a reopen can hand the same published state to the new thread —
+    /// every route's `SendHandle` already holds these `Arc`s, so replacing
+    /// them would freeze the stats of every route on the device.
+    worker: Worker,
+    spec: StreamSpec,
 }
 
 impl CaptureOwner {
@@ -235,9 +257,7 @@ impl CaptureOwner {
         let format = Arc::new(AtomicU8::new(UNKNOWN_FORMAT));
         let stalled = Arc::new(AtomicBool::new(false));
         let last_error: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
-        let (tx, rx) = mpsc::channel();
-
-        let roster = vec![first.route_id.clone()];
+        let handover: Arc<Mutex<Option<Vec<Subscriber>>>> = Arc::new(Mutex::new(None));
 
         let worker = Worker {
             stop: stop.clone(),
@@ -246,44 +266,107 @@ impl CaptureOwner {
             format: format.clone(),
             stalled: stalled.clone(),
         };
-        let error_worker = last_error.clone();
-        let name = alsa_name.to_string();
-        let spec_worker = spec.clone();
 
-        let thread = thread::Builder::new()
-            .name(format!("capture-{alsa_name}"))
-            .spawn(move || {
-                crate::rt::raise_thread_priority("capture device", crate::rt::PRIO_SEND);
-                if let Err(err) = owner_loop(
-                    &name,
-                    &spec_worker,
-                    device_channels,
-                    &worker,
-                    vec![first],
-                    rx,
-                ) {
-                    tracing::error!("capture device {name} failed: {err:#}");
-                    // Poisoning ignored on purpose — see the doc on
-                    // `SendHandle::last_error` in `send.rs`.
-                    *error_worker.lock().unwrap_or_else(|e| e.into_inner()) =
-                        Some(format!("{err:#}"));
-                }
-            })?;
-
-        Ok(Arc::new(Self {
+        let owner = Arc::new(Self {
             alsa_name: alsa_name.to_string(),
             params: DeviceParams::of(spec),
-            device_channels,
+            device_channels: Mutex::new(device_channels),
             stop,
-            thread: Mutex::new(Some(thread)),
-            commands: Mutex::new(tx),
-            roster: Mutex::new(roster),
+            thread: Mutex::new(None),
+            // Replaced immediately by `spawn_reader`; a channel with no
+            // receiver is the honest placeholder for "no thread yet".
+            commands: Mutex::new(mpsc::channel().0),
+            handover,
+            reopening: AtomicBool::new(false),
+            roster: Mutex::new(vec![first.route_id.clone()]),
             xruns,
             buffer_ns,
             format,
             stalled,
             last_error,
-        }))
+            worker,
+            spec: spec.clone(),
+        });
+        owner.spawn_reader(vec![first], device_channels)?;
+        Ok(owner)
+    }
+
+    /// Start (or restart) the reading thread with `subscribers` and a device
+    /// opened for `device_channels`.
+    fn spawn_reader(&self, subscribers: Vec<Subscriber>, device_channels: usize) -> Result<()> {
+        let (tx, rx) = mpsc::channel();
+        self.stop.store(false, Ordering::Relaxed);
+
+        let worker = self.worker.clone();
+        let error_worker = self.last_error.clone();
+        let handover = self.handover.clone();
+        let name = self.alsa_name.clone();
+        let spec = self.spec.clone();
+
+        let thread = thread::Builder::new()
+            .name(format!("capture-{}", self.alsa_name))
+            .spawn(move || {
+                crate::rt::raise_thread_priority("capture device", crate::rt::PRIO_SEND);
+                let mut subscribers = subscribers;
+                let result =
+                    owner_loop(&name, &spec, device_channels, &worker, &mut subscribers, rx);
+                // Hand the subscribers back whatever happened, so a reopen can
+                // reuse them. On a failure nobody collects them and they are
+                // dropped with the owner, which closes their senders — the
+                // same as before.
+                *handover.lock().unwrap_or_else(|e| e.into_inner()) = Some(subscribers);
+                if let Err(err) = result {
+                    tracing::error!("capture device {name} failed: {err:#}");
+                    // Poisoning ignored on purpose — see the doc on
+                    // `ToneWorker::last_error` in `send.rs`.
+                    *error_worker.lock().unwrap_or_else(|e| e.into_inner()) =
+                        Some(format!("{err:#}"));
+                }
+            })?;
+
+        *self.commands.lock().unwrap_or_else(|e| e.into_inner()) = tx;
+        *self.thread.lock().unwrap_or_else(|e| e.into_inner()) = Some(thread);
+        *self
+            .device_channels
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = device_channels;
+        Ok(())
+    }
+
+    /// Stop the reader, reopen the card wide enough for `device_channels`, and
+    /// carry every existing route across along with `extra`.
+    ///
+    /// This is the one operation here that deliberately interrupts audio
+    /// somebody else is listening to, and it was a decision taken with the
+    /// operator rather than by the code: reopening is what makes "patch
+    /// channels 5-6 somewhere" work at all, and the alternatives were
+    /// refusing (which forces the operator to delete and recreate the other
+    /// route by hand — the same gap, plus the manual steps) or always opening
+    /// every channel the card has, which spends USB bandwidth and CPU on
+    /// every period forever to avoid a gap that happens when somebody clicks.
+    ///
+    /// The gap is bounded by one device teardown and reopen, and the existing
+    /// roc senders are carried across untouched — a rebuilt sender would look
+    /// to the far end like the stream vanished and returned, which earns a
+    /// two-second cold-resume ramp for a gap of tens of milliseconds.
+    fn reopen_wider(&self, device_channels: usize, extra: Subscriber) -> Result<()> {
+        // Set before the teardown and cleared after the respawn, so nothing
+        // sampling `is_dead` in between mistakes a deliberate reopen for a
+        // device that failed.
+        self.reopening.store(true, Ordering::Release);
+        self.stop_and_join();
+
+        let mut subscribers = self
+            .handover
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+            .unwrap_or_default();
+        subscribers.push(extra);
+
+        let result = self.spawn_reader(subscribers, device_channels);
+        self.reopening.store(false, Ordering::Release);
+        result
     }
 
     /// Route ids currently subscribed, for error messages.
@@ -294,10 +377,21 @@ impl CaptureOwner {
             .clone()
     }
 
+    /// How many channels the device is currently open with.
+    pub fn device_channels(&self) -> usize {
+        *self
+            .device_channels
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
     /// Whether the reading thread has stopped. A dead owner means every route
     /// on the device is dead, which is exactly right: they all depended on
     /// that one read.
     pub fn is_dead(&self) -> bool {
+        if self.reopening.load(Ordering::Acquire) {
+            return false;
+        }
         self.thread
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -327,6 +421,7 @@ impl CaptureOwner {
 }
 
 /// Device-level state the reading thread publishes.
+#[derive(Clone)]
 struct Worker {
     stop: Arc<AtomicBool>,
     xruns: Arc<AtomicUsize>,
@@ -392,30 +487,58 @@ impl CaptureRegistry {
         };
 
         if let Some(owner) = owners.get(alsa_name).cloned() {
-            check_compatible(&owner, spec, channel_offset + channels)?;
+            let width = channel_offset + channels;
+            let fit = check_compatible(&owner, spec, width)?;
             let sub = make_subscriber(build()?);
+            let interrupted = owner.roster();
             owner
                 .roster
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .push(route_id.to_string());
-            if owner
-                .commands
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .send(Command::Add(Box::new(sub)))
-                .is_err()
-            {
-                // The device died between the liveness check above and here.
-                // Take the roster entry back out: leaving it would make the
-                // next rejected route name a route that is not running.
-                owner
-                    .roster
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .retain(|id| id != route_id);
-                bail!("capture device {alsa_name} stopped while adding this route");
+
+            match fit {
+                Fit::NeedsWider => {
+                    // Reopening interrupts the routes already on this card, so
+                    // say who and why. Silence here would look like a glitch;
+                    // this way the operator can connect the dip to the thing
+                    // they just did.
+                    tracing::warn!(
+                        "capture {alsa_name}: reopening for {width} channels to fit route \
+                         {route_id}; this briefly interrupts route {}",
+                        interrupted.join(", ")
+                    );
+                    if let Err(err) = owner.reopen_wider(width, sub) {
+                        owner
+                            .roster
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .retain(|id| id != route_id);
+                        return Err(err);
+                    }
+                }
+                Fit::AsIs => {
+                    if owner
+                        .commands
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .send(Command::Add(Box::new(sub)))
+                        .is_err()
+                    {
+                        // The device died between the liveness check above and
+                        // here. Take the roster entry back out: leaving it
+                        // would make the next rejected route name a route that
+                        // is not running.
+                        owner
+                            .roster
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .retain(|id| id != route_id);
+                        bail!("capture device {alsa_name} stopped while adding this route");
+                    }
+                }
             }
+
             tracing::info!(
                 "route {route_id} joined capture {alsa_name}, now serving {} routes",
                 owner.roster().len()
@@ -424,6 +547,10 @@ impl CaptureRegistry {
                 owner,
                 level_bits,
                 health,
+                interrupted: match fit {
+                    Fit::NeedsWider => interrupted,
+                    Fit::AsIs => Vec::new(),
+                },
             });
         }
 
@@ -433,6 +560,7 @@ impl CaptureRegistry {
             owner,
             level_bits,
             health,
+            interrupted: Vec::new(),
         })
     }
 
@@ -485,15 +613,24 @@ impl CaptureRegistry {
     }
 }
 
+/// How a route can join a device that is already open.
+enum Fit {
+    /// The device is open wide enough; just attach.
+    AsIs,
+    /// Same hardware parameters, but this route needs channels past the far
+    /// edge of what the card is currently open for. The device has to be
+    /// reopened, which interrupts everything already on it.
+    NeedsWider,
+}
+
 /// Whether a route can join a device that is already open, and a message
 /// naming the route in the way if not.
 ///
 /// The same shape as the port-collision error in `routing`: the operator's
 /// question is always "which of my routes is fighting this one", and the
 /// engine is the only thing that can answer it.
-fn check_compatible(owner: &CaptureOwner, spec: &StreamSpec, window_width: usize) -> Result<()> {
+fn check_compatible(owner: &CaptureOwner, spec: &StreamSpec, window_width: usize) -> Result<Fit> {
     let wanted = DeviceParams::of(spec);
-    let held = owner.roster().join(", ");
     if wanted != owner.params {
         bail!(
             "capture {} is already open at {} for route {}; this route asks for {}. \
@@ -501,22 +638,14 @@ fn check_compatible(owner: &CaptureOwner, spec: &StreamSpec, window_width: usize
              rate, period and format — change one of them to match, or use a different input.",
             owner.alsa_name,
             owner.params,
-            held,
+            owner.roster().join(", "),
             wanted
         );
     }
-    if window_width > owner.device_channels {
-        bail!(
-            "capture {} is open for {} channels (for route {}) and this route needs {}. \
-             Widening a device that is already streaming is not supported yet; \
-             remove and re-add the other route to reopen it wider.",
-            owner.alsa_name,
-            owner.device_channels,
-            held,
-            window_width
-        );
+    if window_width > owner.device_channels() {
+        return Ok(Fit::NeedsWider);
     }
-    Ok(())
+    Ok(Fit::AsIs)
 }
 
 /// Largest absolute sample in a period.
@@ -536,7 +665,7 @@ fn owner_loop(
     spec: &StreamSpec,
     device_channels: usize,
     w: &Worker,
-    mut subscribers: Vec<Subscriber>,
+    subscribers: &mut Vec<Subscriber>,
     commands: mpsc::Receiver<Command>,
 ) -> Result<()> {
     let (pcm, format) = pcm::open(
@@ -747,6 +876,37 @@ mod tests {
     use super::*;
     use soundnet_protocol::Encoding;
 
+    /// An owner with no thread behind it, for the checks that are pure
+    /// bookkeeping. Anything that actually reads a card needs hardware and
+    /// lives in `tests/loopback.rs`.
+    fn fake_owner(device_channels: usize, roster: Vec<String>) -> CaptureOwner {
+        let worker = Worker {
+            stop: Arc::new(AtomicBool::new(false)),
+            xruns: Arc::new(AtomicUsize::new(0)),
+            buffer_ns: Arc::new(AtomicU64::new(0)),
+            format: Arc::new(AtomicU8::new(UNKNOWN_FORMAT)),
+            stalled: Arc::new(AtomicBool::new(false)),
+        };
+        CaptureOwner {
+            alsa_name: "hw:CARD=UMC,DEV=0".to_string(),
+            params: DeviceParams::of(&spec(48_000, 128, SampleFormat::S24Le3)),
+            device_channels: Mutex::new(device_channels),
+            stop: worker.stop.clone(),
+            thread: Mutex::new(None),
+            commands: Mutex::new(mpsc::channel().0),
+            handover: Arc::new(Mutex::new(None)),
+            reopening: AtomicBool::new(false),
+            roster: Mutex::new(roster),
+            xruns: worker.xruns.clone(),
+            buffer_ns: worker.buffer_ns.clone(),
+            format: worker.format.clone(),
+            stalled: worker.stalled.clone(),
+            last_error: Arc::new(Mutex::new(None)),
+            worker,
+            spec: spec(48_000, 128, SampleFormat::S24Le3),
+        }
+    }
+
     fn spec(rate: u32, period: u32, format: SampleFormat) -> StreamSpec {
         StreamSpec {
             encoding: Encoding::Pcm,
@@ -798,31 +958,27 @@ mod tests {
         let owner = CaptureOwner {
             alsa_name: "hw:CARD=UMC,DEV=0".to_string(),
             params: DeviceParams::of(&spec(48_000, 128, SampleFormat::S24Le3)),
-            device_channels: 2,
-            stop: Arc::new(AtomicBool::new(false)),
-            thread: Mutex::new(None),
-            commands: Mutex::new(mpsc::channel().0),
-            roster: Mutex::new(vec!["studio-to-booth".to_string()]),
-            xruns: Arc::new(AtomicUsize::new(0)),
-            buffer_ns: Arc::new(AtomicU64::new(0)),
-            format: Arc::new(AtomicU8::new(UNKNOWN_FORMAT)),
-            stalled: Arc::new(AtomicBool::new(false)),
-            last_error: Arc::new(Mutex::new(None)),
+            ..fake_owner(2, vec!["studio-to-booth".to_string()])
         };
 
         let clash = check_compatible(&owner, &spec(96_000, 128, SampleFormat::S24Le3), 2)
-            .expect_err("a different rate cannot share the device");
+            .err()
+            .expect("a different rate cannot share the device");
         let text = format!("{clash:#}");
         assert!(text.contains("studio-to-booth"), "got: {text}");
         assert!(text.contains("48000Hz"), "the held parameters: {text}");
         assert!(text.contains("96000Hz"), "the requested parameters: {text}");
 
-        let too_wide = check_compatible(&owner, &spec(48_000, 128, SampleFormat::S24Le3), 6)
-            .expect_err("a window past the open width cannot be served");
-        assert!(format!("{too_wide:#}").contains("studio-to-booth"));
-
-        check_compatible(&owner, &spec(48_000, 128, SampleFormat::S24Le3), 2)
-            .expect("a matching route on a window that fits must be accepted");
+        // A wider window is not a refusal — it is a reopen, which is the
+        // decision the operator signed off on.
+        assert!(matches!(
+            check_compatible(&owner, &spec(48_000, 128, SampleFormat::S24Le3), 6),
+            Ok(Fit::NeedsWider)
+        ));
+        assert!(matches!(
+            check_compatible(&owner, &spec(48_000, 128, SampleFormat::S24Le3), 2),
+            Ok(Fit::AsIs)
+        ));
     }
 
     /// The point of the whole feature: a second route on the same device with
@@ -833,21 +989,18 @@ mod tests {
         let owner = CaptureOwner {
             alsa_name: "hw:CARD=UMC,DEV=0".to_string(),
             params: DeviceParams::of(&spec(48_000, 128, SampleFormat::S24Le3)),
-            device_channels: 8,
-            stop: Arc::new(AtomicBool::new(false)),
-            thread: Mutex::new(None),
-            commands: Mutex::new(mpsc::channel().0),
-            roster: Mutex::new(vec!["front-of-house".to_string()]),
-            xruns: Arc::new(AtomicUsize::new(0)),
-            buffer_ns: Arc::new(AtomicU64::new(0)),
-            format: Arc::new(AtomicU8::new(UNKNOWN_FORMAT)),
-            stalled: Arc::new(AtomicBool::new(false)),
-            last_error: Arc::new(Mutex::new(None)),
+            ..fake_owner(8, vec!["front-of-house".to_string()])
         };
         let same = spec(48_000, 128, SampleFormat::S24Le3);
-        // Channels 7-8 of an 8-channel device: offset 6, width 8.
-        check_compatible(&owner, &same, 8).expect("the far edge of the open device must fit");
-        check_compatible(&owner, &same, 9).expect_err("one past the edge must not");
+        // Channels 7-8 of an 8-channel device: offset 6, width 8. Fits inside
+        // what is already open, so nobody else is disturbed.
+        assert!(matches!(check_compatible(&owner, &same, 8), Ok(Fit::AsIs)));
+        // One past the edge needs the card reopened, which costs the other
+        // routes a gap — so it must be distinguishable from the case above.
+        assert!(matches!(
+            check_compatible(&owner, &same, 9),
+            Ok(Fit::NeedsWider)
+        ));
     }
 
     /// A device can outlive one of its routes. When a destination's sender

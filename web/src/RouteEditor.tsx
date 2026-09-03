@@ -287,7 +287,12 @@ function ActualFormat({ spec, stats }: { spec: StreamSpec; stats?: StreamStats }
 function xrunBreakdown(stats?: StreamStats): string {
   if (!stats) return "No data from this engine for this route.";
   const parts: string[] = [];
-  if (stats.capture_xruns != null) parts.push(`${stats.capture_xruns} capture (overrun: input samples lost)`);
+  // Capture-side figures belong to the *device*, not to this route: several
+  // routes can read one input, and one late read was late for all of them.
+  // Two routes off the same interface showing the same count is one event
+  // seen twice, not two events — worth saying, because the natural reading
+  // of two identical numbers is that they add up.
+  if (stats.capture_xruns != null) parts.push(`${stats.capture_xruns} capture (overrun: input samples lost; counted per input device, so routes sharing one input report the same number)`);
   if (stats.playback_xruns != null) parts.push(`${stats.playback_xruns} playback (underrun: output starved)`);
   if (parts.length === 0) return "This engine holds neither end of this route.";
   return parts.join(", ");

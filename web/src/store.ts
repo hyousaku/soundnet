@@ -23,6 +23,11 @@ interface Store {
   manualHosts: ManualHost[];
   interfaces: NetInterface[];
   selectedInterface: string | null;
+  /// Engine notices worth showing the operator, newest last. Bounded,
+  /// because these are informational and a screen full of stale ones is
+  /// worse than none.
+  notices: string[];
+  dismissNotice: (index: number) => void;
   send: (msg: ClientMsg) => void;
   _socket?: WebSocket;
   _connect: () => void;
@@ -37,6 +42,9 @@ export const useStore = create<Store>((set, get) => ({
   manualHosts: [],
   interfaces: [],
   selectedInterface: null,
+  notices: [],
+  dismissNotice: (index) =>
+    set((s) => ({ notices: s.notices.filter((_, i) => i !== index) })),
   send: (msg) => {
     const ws = get()._socket;
     if (ws && ws.readyState === WebSocket.OPEN) {
@@ -125,6 +133,11 @@ function applyServerMsg(
       break;
     case "error":
       console.warn("engine error:", msg.message);
+      // Also put it on screen. Some of these describe a side effect of what
+      // the operator just did — reopening a shared capture device interrupts
+      // the routes already on it — and an unexplained gap in somebody else's
+      // audio reads as a fault rather than as a consequence of the patch.
+      set({ notices: [...get().notices, msg.message].slice(-4) });
       break;
   }
 }

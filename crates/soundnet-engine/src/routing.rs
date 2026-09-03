@@ -564,6 +564,24 @@ async fn try_start_inner(state: &Arc<EngineState>, route: &Route) -> Result<Opti
             &route.id,
             &state.capture,
         )?;
+        // Starting this route may have cost other routes a gap: sharing one
+        // capture device means widening it for a new channel window stops
+        // every route already on it for as long as the reopen takes. Put that
+        // in front of whoever is watching, because an unexplained dip in
+        // somebody else's audio reads as a fault rather than as a consequence
+        // of the patch that was just made.
+        if !pipeline.interrupted.is_empty() {
+            let _ = state.events.send(ServerMsg::Error {
+                message: format!(
+                    "Adding route {} needed capture {} reopened for more channels, \
+                     which briefly interrupted route {}.",
+                    route.id,
+                    port.alsa_name,
+                    pipeline.interrupted.join(", ")
+                ),
+            });
+        }
+        let pipeline = pipeline.handle;
         running.cap_level_bits = Some(pipeline.level_bits());
         running.cap_buffer_ns = Some(pipeline.buffer_ns());
         running.cap_format = Some(pipeline.format());

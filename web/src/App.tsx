@@ -10,6 +10,8 @@ export default function App() {
   const connected = useStore((s) => s.connected);
   const self = useStore((s) => s.self);
   const send = useStore((s) => s.send);
+  const notices = useStore((s) => s.notices);
+  const dismissNotice = useStore((s) => s.dismissNotice);
   const [showAddHost, setShowAddHost] = useState(false);
   const [rescanning, setRescanning] = useState(false);
 
@@ -50,6 +52,16 @@ export default function App() {
           <button onClick={() => setShowAddHost(true)}>Add host…</button>
         </div>
       </header>
+      {notices.length > 0 && (
+        <div className="notices">
+          {notices.map((n, i) => (
+            <div key={`${i}-${n}`} className="notice">
+              <span>{n}</span>
+              <button onClick={() => dismissNotice(i)} title="Dismiss">×</button>
+            </div>
+          ))}
+        </div>
+      )}
       <Sidebar />
       <main className="main">
         <Patchbay />

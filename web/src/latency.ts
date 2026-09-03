@@ -55,6 +55,9 @@ export function summarizeLatency(s: StreamStats | undefined): LatencySummary {
   }
 
   const missing: string[] = [];
+  // Note for when it *is* present: this is the input device's buffer, not
+  // this route's. Several routes can read one input, and they all report the
+  // same figure because they are all reading out of the same buffer.
   if (capture_buffer_ms == null) missing.push("sender's ALSA capture buffer");
   if (roc_e2e_ms == null) missing.push("roc e2e (needs the receiver's RTCP data)");
   if (playback_buffer_ms == null) missing.push("receiver's ALSA playback buffer");

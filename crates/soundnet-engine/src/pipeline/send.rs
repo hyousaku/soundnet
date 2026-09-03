@@ -230,17 +230,20 @@ pub fn spawn(
     channel_offset: u8,
     route_id: &str,
     registry: &Arc<capture::CaptureRegistry>,
-) -> Result<SendHandle> {
+) -> Result<Spawned> {
     if let Some(freq) = alsa_name.strip_prefix(tone::TONE_PREFIX) {
-        return spawn_tone(
-            freq.parse().unwrap_or(440.0),
-            alsa_name,
-            spec,
-            ctx,
-            dst_host,
-            dst_port,
-            outgoing,
-        );
+        return Ok(Spawned {
+            handle: spawn_tone(
+                freq.parse().unwrap_or(440.0),
+                alsa_name,
+                spec,
+                ctx,
+                dst_host,
+                dst_port,
+                outgoing,
+            )?,
+            interrupted: Vec::new(),
+        });
     }
 
     // The sender is built lazily: `subscribe` only calls this once it knows
@@ -258,15 +261,29 @@ pub fn spawn(
         build,
     )?;
 
-    Ok(SendHandle {
-        level_bits: sub.level_bits,
-        kind: Kind::Capture {
-            registry: registry.clone(),
-            owner: sub.owner,
-            health: sub.health,
-            route_id: route_id.to_string(),
+    Ok(Spawned {
+        handle: SendHandle {
+            level_bits: sub.level_bits,
+            kind: Kind::Capture {
+                registry: registry.clone(),
+                owner: sub.owner,
+                health: sub.health,
+                route_id: route_id.to_string(),
+            },
         },
+        interrupted: sub.interrupted,
     })
+}
+
+/// A freshly started send side, plus anything the operator needs to be told
+/// about the side effects of starting it.
+pub struct Spawned {
+    pub handle: SendHandle,
+    /// Routes whose audio this one briefly interrupted by forcing its capture
+    /// device to be reopened wider. Empty in every other case. A gap nobody
+    /// explains reads as a fault, so `routing` puts this in front of whoever
+    /// made the change.
+    pub interrupted: Vec<String>,
 }
 
 #[allow(clippy::too_many_arguments)]

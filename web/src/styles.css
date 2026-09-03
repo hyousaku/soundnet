@@ -137,3 +137,41 @@ select, input[type=number] {
   color: var(--muted);
   font-size: 12px;
 }
+
+/* Engine notices. Positioned out of the grid rather than given a row of
+   their own: these come and go, and a layout that reflows every time one
+   arrives would move the patch bay under the operator's cursor. */
+.notices {
+  position: fixed;
+  top: 52px;
+  right: 12px;
+  z-index: 20;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-width: 480px;
+}
+.notice {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 8px 10px;
+  font-size: 12px;
+  line-height: 1.45;
+  color: var(--fg);
+  background: var(--panel);
+  border: 1px solid var(--warn, #f59e0b);
+  border-left-width: 3px;
+  border-radius: 4px;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.45);
+}
+.notice button {
+  flex: none;
+  padding: 0 4px;
+  line-height: 1;
+  background: none;
+  border: none;
+  color: var(--muted);
+  cursor: pointer;
+}
+.notice button:hover { color: var(--fg); }
