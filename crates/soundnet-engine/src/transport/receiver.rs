@@ -24,6 +24,18 @@ use super::{endpoint_free, endpoint_from_uri, RocContext};
 /// makes that impossible.
 pub const BIND_FAILED: &str = "receiver bind";
 
+/// A snapshot of what roc knows about this receiver's senders.
+pub struct ReceiverMetrics {
+    /// Live connections in this slot. **Zero is meaningfully different from
+    /// silence**: it means nothing is sending at all, where a connected
+    /// sender playing nothing produces a stream of exact zeros that looks
+    /// identical in the audio but is not an absence.
+    pub connections: usize,
+    /// Largest end-to-end latency across those connections, `None` when
+    /// there are none or none has been measured yet.
+    pub e2e_ns: Option<u64>,
+}
+
 pub struct Receiver {
     raw: *mut roc::roc_receiver,
     /// Keeps the shared context alive for at least as long as this receiver.
@@ -57,13 +69,15 @@ impl Receiver {
         Ok(())
     }
 
-    /// Largest end-to-end latency (ns) across the connections feeding this
-    /// receiver, or `None` when nothing is connected yet.
+    /// What roc currently knows about the senders feeding this receiver.
     ///
-    /// `None` rather than 0 is load-bearing: a freshly connected RTCP session
-    /// can legitimately report zero, so zero cannot double as "no data" —
-    /// see `routing::ns_to_ms` and the honesty note on `StreamStats`.
-    pub fn query_e2e_ns(&self) -> Option<u64> {
+    /// Returns `None` only when the query itself fails — "nobody is
+    /// connected" is a successful answer with `connections == 0`, and the
+    /// caller needs to be able to tell those apart. See
+    /// `pipeline/recv.rs`, where the difference decides whether a run of
+    /// digital silence means "the sender went away" or "the sender is right
+    /// there, playing nothing".
+    pub fn query(&self) -> Option<ReceiverMetrics> {
         let mut slot_metrics = roc::roc_receiver_metrics::default();
         let mut conn = [roc::roc_connection_metrics::default(); 8];
         let mut conn_count: usize = conn.len();
@@ -80,10 +94,17 @@ impl Receiver {
             return None;
         }
         let n = conn_count.min(conn.len());
-        if n == 0 {
-            return None;
-        }
-        conn[..n].iter().map(|c| c.e2e_latency).max()
+        Some(ReceiverMetrics {
+            // The slot-level count is the authority on how many senders
+            // there are; `conn_count` only says how many fitted in the array
+            // we handed over.
+            connections: slot_metrics.connection_count as usize,
+            // `None` rather than 0 is load-bearing: a freshly connected RTCP
+            // session can legitimately report zero, so zero cannot double as
+            // "no data" — see `routing::ns_to_ms` and the honesty note on
+            // `StreamStats`.
+            e2e_ns: conn[..n].iter().map(|c| c.e2e_latency).max(),
+        })
     }
 }
 

@@ -233,6 +233,14 @@ fn run(
     let silence_before_fade = frames_in(SILENCE_BEFORE_FADE_MS);
     let long_absence = frames_in(LONG_ABSENCE_MS);
     let mut silent_frames: u64 = 0;
+    // Whether roc currently has a sender connected, sampled at the metrics
+    // cadence below. `None` means the query failed and we do not know, which
+    // falls back to the old exact-zeros proxy — the cautious direction.
+    //
+    // This is what tells "the sender went away" apart from "the sender is
+    // right there, playing nothing". Both produce an unbroken run of exact
+    // zeros, and for a long time this loop could only see the zeros.
+    let mut sender_connected: Option<bool> = None;
 
     while !w.stop.load(Ordering::Relaxed) {
         // Set false by anything that went wrong this iteration. The error
@@ -241,11 +249,13 @@ fn run(
         // reach the limit and bail, and it wouldn't if a good read reset the
         // counter on the way past.
         let mut healthy = true;
+        let mut read_ok = true;
 
         // Returns immediately (EXTERNAL clock): zero-filled if no sender has
         // connected yet, otherwise resampled out of the jitter buffer.
         if let Err(err) = rx.read(&mut floats) {
             healthy = false;
+            read_ok = false;
             tracing::warn!("recv pipeline {alsa_name}: {err:#}");
             // Silence, not the previous period. Falling through to the write
             // is deliberate — skipping it would skip this loop's only
@@ -259,11 +269,10 @@ fn run(
             floats.fill(0.0);
         }
 
-        // What roc handed over, before any ramp of ours. Exact zeros mean it
-        // has no session — see `SILENCE_BEFORE_FADE_MS` for why that is a
-        // sound enough proxy — so a long run of them followed by signal is
-        // the sender coming back, which is precisely when the level is
-        // unknown and must not arrive as a step.
+        // What roc handed over, before any ramp of ours. A long run of exact
+        // zeros followed by signal is the sender coming back, which is
+        // precisely when the level is unknown and must not arrive as a step —
+        // see `fade.rs` for the incident that is about.
         //
         // Samples past the rails are counted here, in the same pass, and
         // deliberately *before* the ramp — see the note on the meter below
@@ -282,8 +291,33 @@ fn run(
         if over > 0 {
             w.clipped.fetch_add(over, Ordering::Relaxed);
         }
-        if raw_peak == 0.0 {
+        // Zeros only count as *absence* when nothing is actually sending.
+        //
+        // The exact-zeros test alone was a proxy for "roc has no session",
+        // and it is wrong for any source that is digitally silent between
+        // items — a PC playing back media, which is silent between every clip
+        // by definition. There the proxy fires on every gap, and the cost is
+        // not the harmless "fade-in over a passage that was already silent"
+        // it was assumed to be: the ramp runs over the *returning* audio, so
+        // the first seconds of the next clip come back inaudible. At an event
+        // that is the failure, not the protection.
+        //
+        // roc knows the difference, so ask it. A connection in the slot means
+        // a sender is there and the zeros are its silence; no connection
+        // means it has genuinely gone, which is the case the ramp exists for
+        // and is unchanged. When the query fails we cannot tell, so we keep
+        // the old behaviour and stay cautious.
+        //
+        // A failed read counts as absence regardless: `floats` was filled
+        // with zeros by the error path above, and those are ours, not the
+        // sender's.
+        let absent = zeros_mean_absence(read_ok, sender_connected);
+        if raw_peak == 0.0 && absent {
             silent_frames = silent_frames.saturating_add(period_frames as u64);
+        } else if raw_peak == 0.0 {
+            // Connected and quiet. Not an absence, so nothing to ramp back
+            // in from — but do not reset the counter either, or a sender
+            // that drops out mid-silence would start counting from zero.
         } else {
             if silent_frames >= silence_before_fade {
                 // How cautious to be depends on how long it was away. A short
@@ -444,12 +478,85 @@ fn run(
             if let Some(ns) = pcm::delay_ns(&pcm, spec.rate) {
                 w.buffer_ns.store(ns, Ordering::Relaxed);
             }
-            // Only overwrite the sentinel once there's an actual connection
-            // to report on — see `Receiver::query_e2e_ns`.
-            if let Some(ns) = rx.query_e2e_ns() {
-                w.e2e_ns.store(ns, Ordering::Relaxed);
+            match rx.query() {
+                Some(metrics) => {
+                    // Sampled here rather than every period: the thresholds
+                    // this feeds are half a second and five seconds, so a
+                    // ~200ms granularity on "is anybody sending" is far finer
+                    // than it needs to be, and an FFI call per period on a
+                    // SCHED_FIFO thread is not something to spend for nothing.
+                    sender_connected = Some(metrics.connections > 0);
+                    // Only overwrite the sentinel once there's an actual
+                    // connection to report on — see `Receiver::query`.
+                    if let Some(ns) = metrics.e2e_ns {
+                        w.e2e_ns.store(ns, Ordering::Relaxed);
+                    }
+                }
+                // The query itself failed. Don't claim to know.
+                None => sender_connected = None,
             }
         }
     }
     Ok(())
+}
+
+/// Whether a period of exact zeros means the sender is *gone*, as opposed to
+/// present and playing nothing.
+///
+/// Both look identical in the audio, and telling them apart is what decides
+/// whether returning audio gets ramped in. Getting it wrong is costly in
+/// both directions: treat a real absence as silence and a machine that
+/// rebooted streams back at full scale with no warning (the incident
+/// `fade.rs` exists for); treat silence as an absence and every gap between
+/// clips on a PC source eats the first seconds of the next one.
+///
+/// `connected` is `None` when roc's query failed and we genuinely do not
+/// know. That resolves to "absent", which is the cautious direction: a
+/// needless ramp is survivable, an unannounced full-scale return is not.
+///
+/// A failed read is always an absence regardless of what roc says, because
+/// the zeros in the buffer are then ours — written by the error path to
+/// avoid replaying a stale period — and not the sender's.
+fn zeros_mean_absence(read_ok: bool, connected: Option<bool>) -> bool {
+    !read_ok || !connected.unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::zeros_mean_absence;
+
+    /// The case this function was added for. A PC source is digitally silent
+    /// between clips, so the old "exact zeros mean no session" proxy fired on
+    /// every gap — and the ramp it armed ran over the *returning* audio, not
+    /// over the silence, so the first seconds of the next clip came back
+    /// inaudible. At an event that is the failure, not the protection.
+    #[test]
+    fn a_connected_sender_playing_nothing_is_not_an_absence() {
+        assert!(!zeros_mean_absence(true, Some(true)));
+    }
+
+    /// And the case the ramp exists for is untouched: nothing connected means
+    /// the sender really has gone, and whatever comes back arrives at a level
+    /// this engine has no knowledge of.
+    #[test]
+    fn nothing_connected_is_an_absence() {
+        assert!(zeros_mean_absence(true, Some(false)));
+    }
+
+    /// Not knowing resolves to the cautious answer. A needless ramp is
+    /// survivable; an unannounced full-scale return is the thing that put a
+    /// bang through somebody's speakers.
+    #[test]
+    fn an_unanswerable_query_is_treated_as_an_absence() {
+        assert!(zeros_mean_absence(true, None));
+    }
+
+    /// A failed read fills the buffer with zeros of our own making. Counting
+    /// those as the sender's silence would let a receiver that is failing
+    /// every read look like a healthy quiet one.
+    #[test]
+    fn our_own_zeros_after_a_failed_read_are_an_absence() {
+        assert!(zeros_mean_absence(false, Some(true)));
+        assert!(zeros_mean_absence(false, None));
+    }
 }
