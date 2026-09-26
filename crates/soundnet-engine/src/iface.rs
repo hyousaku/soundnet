@@ -120,6 +120,13 @@ pub async fn set_selected(state: &Arc<EngineState>, name: Option<String>) -> Res
     // restart to pick up.
     routing::persist(state).await;
 
+    move_to(state, new_addr).await;
+    Ok(())
+}
+
+/// Re-advertise and restart routes after the effective address changed.
+/// `identity.addr` must already hold `new_addr`.
+async fn move_to(state: &Arc<EngineState>, new_addr: IpAddr) {
     if let Err(err) = discovery::reregister(state, new_addr).await {
         tracing::warn!("mDNS re-register after interface change failed: {err:#}");
     }
@@ -131,8 +138,79 @@ pub async fn set_selected(state: &Arc<EngineState>, name: Option<String>) -> Res
     // new address — same machinery that already recovers a route after any
     // other kind of restart.
     routing::shutdown_all(state).await;
+}
 
-    Ok(())
+/// How often [`spawn_reconciler`] looks again.
+const RECONCILE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The address this engine should be using, if it is not the one it is
+/// using now. `None` means leave it alone.
+///
+/// The startup choice is made once, and "once" is often too early. On a boot
+/// the engine comes up with `network-online.target`, which does not wait for
+/// Tailscale: `tailscale0` either does not exist yet or has no address. The
+/// pinned name fails to resolve, startup falls back to the first LAN address
+/// — as it must, rather than refuse to start — and nothing ever looked again.
+/// The UI kept showing `tailscale0` as selected (that is the saved choice)
+/// while the engine advertised, and sent audio from, `192.168.x.y`: a peer
+/// across the tailnet saw a private address it could not reach.
+///
+/// - Pinned: move to the pinned interface's address as soon as it has one
+///   (and follow it if it changes). While it has none, stay on the fallback.
+/// - Automatic: stay put while the current address still exists on some
+///   interface — switching just because enumeration order shifted would
+///   restart every route for nothing. Move only when it has gone (DHCP gave
+///   a new lease, the cable moved), or when startup found no network at all
+///   and settled for loopback.
+fn desired_addr(
+    pinned: Option<&str>,
+    current: IpAddr,
+    ifaces: &[if_addrs::Interface],
+) -> Option<IpAddr> {
+    let want = match pinned {
+        Some(name) => resolve_in(name, ifaces)?,
+        None => {
+            if ifaces
+                .iter()
+                .filter_map(usable_ipv4)
+                .any(|v4| IpAddr::V4(v4) == current)
+            {
+                return None;
+            }
+            IpAddr::V4(ifaces.iter().find_map(usable_ipv4)?)
+        }
+    };
+    (want != current).then_some(want)
+}
+
+/// Keep the advertised address in step with the interfaces as they come,
+/// go and change (see [`desired_addr`]). Not started when `--bind` named an
+/// explicit address: the operator fixed the address themselves, and it wins
+/// over everything (see `pick_advertise_ip` in main.rs).
+pub fn spawn_reconciler(state: Arc<EngineState>) {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(RECONCILE_INTERVAL);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tick.tick().await;
+            let pinned = state.selected_interface.read().await.clone();
+            let current = *state.identity.addr.read().unwrap();
+            let ifaces = if_addrs::get_if_addrs().unwrap_or_default();
+            let Some(new_addr) = desired_addr(pinned.as_deref(), current, &ifaces) else {
+                continue;
+            };
+            tracing::info!(
+                "address changed: {current} -> {new_addr} ({}); re-advertising and restarting routes",
+                pinned.as_deref().unwrap_or("automatic")
+            );
+            *state.identity.addr.write().unwrap() = new_addr;
+            move_to(&state, new_addr).await;
+            let snapshot = crate::control::snapshot(&state).await;
+            let _ = state
+                .events
+                .send(soundnet_protocol::ServerMsg::State { snapshot });
+        }
+    });
 }
 
 #[cfg(test)]
@@ -189,6 +267,54 @@ mod tests {
     /// exists to prove the read and the parse work, not to police somebody's
     /// loopback configuration. Pinning the exact value would fail for a
     /// reason that has nothing to do with the code under test.
+    fn v4(a: u8, b: u8, c: u8, d: u8) -> IpAddr {
+        IpAddr::V4(Ipv4Addr::new(a, b, c, d))
+    }
+
+    #[test]
+    fn pinned_interface_that_appears_late_is_picked_up() {
+        // Boot: tailscale0 not up yet, startup fell back to the LAN address.
+        let lan = vec![fake_iface("wlan0", Ipv4Addr::new(192, 168, 10, 123))];
+        assert_eq!(
+            desired_addr(Some("tailscale0"), v4(192, 168, 10, 123), &lan),
+            None
+        );
+        // Tailscale comes up: move to it.
+        let mut both = lan.clone();
+        both.push(fake_iface("tailscale0", Ipv4Addr::new(100, 103, 234, 52)));
+        assert_eq!(
+            desired_addr(Some("tailscale0"), v4(192, 168, 10, 123), &both),
+            Some(v4(100, 103, 234, 52))
+        );
+        // Already there: nothing to do.
+        assert_eq!(
+            desired_addr(Some("tailscale0"), v4(100, 103, 234, 52), &both),
+            None
+        );
+    }
+
+    #[test]
+    fn automatic_stays_put_while_its_address_exists() {
+        let ifaces = vec![
+            fake_iface("eth0", Ipv4Addr::new(192, 168, 10, 5)),
+            fake_iface("wlan0", Ipv4Addr::new(192, 168, 10, 123)),
+        ];
+        // Not the first in the list, but still present: no restart.
+        assert_eq!(desired_addr(None, v4(192, 168, 10, 123), &ifaces), None);
+        // Gone (new DHCP lease): move to what there is.
+        assert_eq!(
+            desired_addr(None, v4(192, 168, 10, 99), &ifaces),
+            Some(v4(192, 168, 10, 5))
+        );
+        // Started with no network at all and settled for loopback.
+        assert_eq!(
+            desired_addr(None, v4(127, 0, 0, 1), &ifaces),
+            Some(v4(192, 168, 10, 5))
+        );
+        // Still no network: leave loopback alone.
+        assert_eq!(desired_addr(None, v4(127, 0, 0, 1), &[]), None);
+    }
+
     #[test]
     fn mtu_of_reads_a_real_interface() {
         let mtu = mtu_of("lo").expect("every Linux host has lo with an mtu in sysfs");

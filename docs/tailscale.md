@@ -116,5 +116,6 @@ journalctl -u soundnet-engine@$USER | grep -i mtu
 |---|---|
 | リモートノードが UI に現れない | mDNS は Tailscale を越えない。「Add host」（キー H）で手入力する。 |
 | 一度現れた相手が消えたきり戻らない | 手動ホストの再探索。10秒毎に自動で再試行するので、戻らない場合はネットワーク側を疑う（`tailscale status`）。 |
+| `tailscale0` を選んでいるのに、自分のアドレスが `192.168.x.y` のまま | 起動時に Tailscale がまだアドレスを持っていなかった（`network-online.target` は Tailscale を待たない）。エンジンは 5 秒毎に見直し、`tailscale0` にアドレスが付いた時点で自動で切り替える（ルートは一度再起動）。UI のインターフェース欄の下に「Not in use yet」等が出ている間は切り替え待ち。ログ: `journalctl -u soundnet-engine@$USER \| grep "address changed"` |
 | ノードは現れたが、ルートが「retrying」のまま | ノードが広告しているアドレスにピアが到達できない。「Network interface」で `tailscale0` をピンしているか確認。 |
 | 音が来るが、ブツブツで FEC が効かない | MTU またはリレー。`tailscale status` が `direct` か確認。IP フラグメンテーションが起きていないか確認（`ip link show tailscale0` で MTU）。 |

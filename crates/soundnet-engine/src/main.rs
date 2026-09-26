@@ -160,6 +160,12 @@ async fn main() -> Result<()> {
     // had a working peer-independent cause (e.g. the audio device) fixed
     // except by operator action unrelated to mDNS. This sweep catches both.
     routing::spawn_route_supervisor(state.clone());
+    // The address picked above is only a first guess when it came from an
+    // interface (see iface::desired_addr for why that guess is often wrong
+    // at boot). An explicit --bind address is not a guess.
+    if bind_addr.ip().is_unspecified() {
+        iface::spawn_reconciler(state.clone());
+    }
 
     // Control plane (HTTP + WebSocket + embedded web UI).
     let control_handle = tokio::spawn(control::serve(state.clone(), bind_addr));

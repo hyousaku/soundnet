@@ -90,7 +90,17 @@ function InterfacePicker() {
   const interfaces = useStore((s) => s.interfaces);
   const selectedInterface = useStore((s) => s.selectedInterface);
   const routes = useStore((s) => s.routes);
+  const self = useStore((s) => s.self);
   const send = useStore((s) => s.send);
+
+  // The saved choice and the address actually in use can differ: the pinned
+  // interface may have no address yet (Tailscale still starting at boot, or
+  // down), and the engine then runs on a fallback until it does. The menu
+  // alone showed "tailscale0" either way, so a machine advertising its LAN
+  // address looked correctly configured. Say which address is really used.
+  const pinned = selectedInterface ? interfaces.find((i) => i.name === selectedInterface) : undefined;
+  const missing = !!selectedInterface && !pinned;
+  const notYet = !!pinned && !!self && pinned.addr !== self.addr;
 
   // Switching interface re-announces this machine and restarts every route
   // it takes part in: a short dropout on all of them. Arrowing through a
@@ -125,6 +135,9 @@ function InterfacePicker() {
         <span>Network interface (this machine only)</span>
         <select value={selectedInterface ?? ""} onChange={(e) => change(e.target.value)}>
           <option value="">Automatic</option>
+          {/* Without this the select had no option matching the saved name
+              and silently displayed "Automatic". */}
+          {missing && <option value={selectedInterface!}>{selectedInterface} — no address</option>}
           {interfaces.map((i) => (
             <option key={i.name} value={i.name}>
               {i.name} — {i.addr}
@@ -132,6 +145,15 @@ function InterfacePicker() {
           ))}
         </select>
       </label>
+      {(missing || notYet) && self && (
+        <p className="field-error" role="status">
+          {missing
+            ? `${selectedInterface} has no address right now, so this machine is using ${self.addr} instead. `
+            : `Not in use yet: this machine is still on ${self.addr}. `}
+          It moves to {selectedInterface} by itself within a few seconds of it
+          getting an address — no restart needed.
+        </p>
+      )}
     </div>
   );
 }
