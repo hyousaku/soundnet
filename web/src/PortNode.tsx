@@ -12,6 +12,12 @@ export type PortRFNode = RFNode<PortNodeData, "port">;
 /// the user can wire a specific source port to a specific playback port.
 /// Capture/Tone rows expose a source handle on the right;
 /// Playback rows expose a target handle on the left.
+///
+/// The two groups are headed "Sources" and "Destinations". They used to be
+/// "Outputs" and "Inputs" — patch-bay convention, where a capture device is
+/// an output *of the card* — which put "USB Audio (in)" under OUTPUTS and
+/// left operators wiring the wrong way round. Source/destination is also
+/// what the New route dialog and the route table call them.
 export default function PortNode({ data }: NodeProps<PortRFNode>) {
   const { node, ports } = data;
   // Sorted here as well as in the engine, because a port list can also arrive
@@ -54,7 +60,7 @@ export default function PortNode({ data }: NodeProps<PortRFNode>) {
             fontSize: 10,
             textTransform: "uppercase",
             letterSpacing: "0.08em",
-          }}>Outputs</div>
+          }}>Sources</div>
         )}
         {capturePorts.map((p) => (
           <PortRow key={p.id} port={p} side="source" />
@@ -67,7 +73,7 @@ export default function PortNode({ data }: NodeProps<PortRFNode>) {
             fontSize: 10,
             textTransform: "uppercase",
             letterSpacing: "0.08em",
-          }}>Inputs</div>
+          }}>Destinations</div>
         )}
         {playbackPorts.map((p) => (
           <PortRow key={p.id} port={p} side="target" />
@@ -119,8 +125,8 @@ function PortRow({ port, side }: { port: LocalPort; side: "source" | "target" })
       gap: 6,
     }}>
       {/*
-        Only on the output side, where it separates CAPTURE from TONE. Under
-        INPUTS every row is a playback port by construction, so the badge said
+        Only on the source side, where it separates CAPTURE from TONE. Under
+        DESTINATIONS every row is a playback port by construction, so the badge said
         "PLAYBACK" eight times beneath a heading that already said INPUTS —
         about sixty pixels per row spent repeating the heading, on exactly the
         rows whose names are longest.
@@ -154,14 +160,24 @@ function PortRow({ port, side }: { port: LocalPort; side: "source" | "target" })
         {port.label}
       </span>
       <PortCaps port={port} />
+      {/*
+        14px rather than 10: this dot is the only mouse target for making a
+        route on the canvas, and at 10px it took aim. React Flow also accepts
+        click-then-click (one dot, then the other) as well as dragging.
+      */}
       <Handle
         type={side}
         position={isSource ? Position.Right : Position.Left}
         id={port.id}
+        title={
+          isSource
+            ? "Drag to a destination's dot, or click here and then on one"
+            : "Drag here from a source's dot, or click here and then on one"
+        }
         style={{
           background: isSource ? "#6cf" : "#4ade80",
-          width: 10,
-          height: 10,
+          width: 14,
+          height: 14,
           border: "2px solid #0b0d10",
         }}
       />

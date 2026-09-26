@@ -1,4 +1,7 @@
+import { useEffect, useRef, useState } from "react";
 import { useStore } from "./store";
+import { useUi } from "./ui";
+import { askRemoveRoute, sortedRoutes, widthOf } from "./actions";
 import type { LocalPort, Route, SampleFormat, StreamSpec, StreamStats } from "./protocol";
 import { summarizeLatency } from "./latency";
 import { describeHealth } from "./health";
@@ -12,23 +15,127 @@ const PERIODS = [32, 64, 128, 256, 512];
 // "Running over Tailscale" section.
 const LATENCIES = [3, 5, 10, 20, 40, 80, 120, 200];
 
+/// How long after the last change to a row before it is sent.
+///
+/// Every change to a route restarts its pipelines on both machines — a real,
+/// audible gap. Sending on every `change` event meant arrowing a period menu
+/// from 128 to 512 restarted the audio twice, and typing "16" into a channel
+/// box sent "1" first: a genuine reconfiguration to one channel, on the way
+/// to the value that was meant. Edits now collect in a draft and go out
+/// together once the operator pauses, or at once on Enter or on leaving the
+/// row.
+const COMMIT_DELAY_MS = 600;
+
+/// How long to keep showing a draft the engine has not answered. An edit the
+/// engine rejects produces an error notice and no updated route, so without
+/// a limit the row would show the rejected value forever — the one thing
+/// worse than the old behaviour.
+const DRAFT_TIMEOUT_MS = 4000;
+
+const range = (n: number) => Array.from({ length: Math.max(1, n) }, (_, i) => i + 1);
+
 export default function RouteEditor() {
   const routes = useStore((s) => s.routes);
   const nodes = useStore((s) => s.nodes);
   const stats = useStore((s) => s.stats);
   const send = useStore((s) => s.send);
   const ports = useStore((s) => s.ports);
+  const selectedRouteId = useUi((s) => s.selectedRouteId);
+  const selectRoute = useUi((s) => s.selectRoute);
+  const openDialog = useUi((s) => s.openDialog);
+
+  const [drafts, setDrafts] = useState<Record<string, Route>>({});
+  const draftsRef = useRef(drafts);
+  draftsRef.current = drafts;
+  const routesRef = useRef(routes);
+  routesRef.current = routes;
+  const timers = useRef<Record<string, number>>({});
+  /// The server's copy of a route at the moment a draft was sent. When a
+  /// different object arrives for that id, the engine has answered and the
+  /// draft can go.
+  const awaiting = useRef<Record<string, Route>>({});
+
+  const dropDraft = (id: string) => {
+    delete awaiting.current[id];
+    const { [id]: _gone, ...rest } = draftsRef.current;
+    draftsRef.current = rest;
+    setDrafts(rest);
+  };
+
+  useEffect(() => {
+    for (const id of Object.keys(awaiting.current)) {
+      if (timers.current[id]) continue; // still being edited; keep it
+      if (routes[id] !== awaiting.current[id]) dropDraft(id);
+    }
+  }, [routes]);
+
+  useEffect(
+    () => () => {
+      for (const t of Object.values(timers.current)) window.clearTimeout(t);
+    },
+    [],
+  );
+
+  const commit = (id: string) => {
+    window.clearTimeout(timers.current[id]);
+    delete timers.current[id];
+    const draft = draftsRef.current[id];
+    const server = routesRef.current[id];
+    if (!draft || !server) return;
+    if (JSON.stringify(draft) === JSON.stringify(server)) {
+      // Changed and changed back: nothing to send, and sending would still
+      // cost a restart on an engine that compares only after the fact.
+      dropDraft(id);
+      return;
+    }
+    awaiting.current[id] = server;
+    // The whole route, not just the spec: channel offsets live on the ports,
+    // and one message keeps a combined edit to one restart. `add_route` with
+    // a known id is an update on the engine side, and — unlike the spec-only
+    // message — reports a refusal back to the page.
+    send({ type: "add_route", route: draft });
+    window.setTimeout(() => {
+      if (!timers.current[id] && awaiting.current[id] === server) dropDraft(id);
+    }, DRAFT_TIMEOUT_MS);
+  };
+
+  const edit = (id: string, next: Route) => {
+    draftsRef.current = { ...draftsRef.current, [id]: next };
+    setDrafts(draftsRef.current);
+    window.clearTimeout(timers.current[id]);
+    timers.current[id] = window.setTimeout(() => commit(id), COMMIT_DELAY_MS);
+  };
+
+  // A route selected elsewhere — a wire clicked on the canvas, J/K — is
+  // brought into view here, unless the operator is already working in that
+  // row, in which case scrolling it would move the control they are using.
+  useEffect(() => {
+    if (!selectedRouteId) return;
+    const row = document.querySelector<HTMLElement>(`[data-route-row="${selectedRouteId}"]`);
+    if (!row || row.contains(document.activeElement)) return;
+    // Vertical only. scrollIntoView on a row wider than the table's box also
+    // scrolls sideways, and J/K then left the table scrolled to its right
+    // end with the route names under the sticky column's edge.
+    const box = row.closest<HTMLElement>(".route-editor");
+    if (!box) return;
+    const r = row.getBoundingClientRect();
+    const b = box.getBoundingClientRect();
+    if (r.top < b.top) box.scrollTop -= b.top - r.top;
+    else if (r.bottom > b.bottom) box.scrollTop += r.bottom - b.bottom;
+  }, [selectedRouteId]);
+
+  const findPort = (nodeId: string, portId: string): LocalPort | undefined =>
+    (ports[nodeId] ?? []).find((p) => p.id === portId);
 
   /// How many channels each end's device has, or null when that is not a
   /// real constraint: a tone synthesizes as many as asked for, and an
   /// unprobed device's "2" is a placeholder rather than a limit — clamping to
   /// it would turn a display problem into a real one.
   const deviceWidths = (r: Route): { src: number | null; dst: number | null } => {
-    const find = (nodeId: string, portId: string): LocalPort | undefined =>
-      (ports[nodeId] ?? []).find((p) => p.id === portId);
-    const width = (p?: LocalPort) =>
-      p && p.kind !== "tone" && !p.probe_failed ? p.max_channels : null;
-    return { src: width(find(r.src.node_id, r.src.port_id)), dst: width(find(r.dst.node_id, r.dst.port_id)) };
+    return {
+      src: widthOf(findPort(r.src.node_id, r.src.port_id)),
+      dst: widthOf(findPort(r.dst.node_id, r.dst.port_id)),
+    };
   };
 
   /// Widest window that still fits inside both devices from their current
@@ -42,155 +149,243 @@ export default function RouteEditor() {
     return room.length === 0 ? 32 : Math.max(1, Math.min(...room));
   };
 
-  const routeList = Object.values(routes);
+  const routeList = sortedRoutes(routes);
+
   if (routeList.length === 0) {
     return (
-      <div className="route-editor">
-        <div className="hint">
-          No routes yet. Connect two nodes in the graph above to create one.
-          Drag from a source node to a destination — the first available
-          Capture/Tone port on the source is wired to the first Playback port
-          on the destination.
+      <section className="route-editor" id="region-routes" tabIndex={-1} aria-label="Routes">
+        <div className="empty-state">
+          <p>No routes yet.</p>
+          <p className="hint">
+            Press <kbd>N</kbd> or use{" "}
+            <button className="linklike" onClick={() => openDialog({ kind: "newRoute" })}>
+              New route
+            </button>{" "}
+            to pick a source and a destination from lists. Or, in the patch
+            bay, drag from the dot at the right end of a source row to the dot
+            at the left end of a destination row — or click one dot, then the
+            other.
+          </p>
         </div>
-      </div>
+      </section>
     );
   }
 
+  const endLabel = (nodeId: string, portId: string) => {
+    const host = nodes[nodeId]?.hostname ?? nodeId.slice(0, 8);
+    const port = findPort(nodeId, portId);
+    return { host, port: port?.label ?? portId };
+  };
+
   return (
-    <div className="route-editor">
+    <section className="route-editor" id="region-routes" tabIndex={-1} aria-label="Routes">
       <table>
         <thead>
           <tr>
-            <th>Src → Dst</th>
+            <th>Route</th>
             <th>Rate</th>
             <th title="How many channels this route carries.">Ch</th>
-            <th title="First channel of the source device this route takes, counting from 1.">src ch</th>
-            <th title="First channel of the destination device this route lands on, counting from 1.">dst ch</th>
+            <th title="First channel of the source device this route takes, counting from 1.">Src ch</th>
+            <th title="First channel of the destination device this route lands on, counting from 1.">Dst ch</th>
             <th>Format</th>
-            <th>Period</th>
-            <th>Latency</th>
-            <th>FEC</th>
-            <th title="Peak level in and out, as measured by THIS engine. A route's two ends usually live on two machines, and each engine can only meter the half it holds — so a dash means &quot;not mine to measure&quot;, not silence. Open the other machine's UI to see its half.">Level</th>
-            <th title="Latency this engine can actually account for — see the cell tooltips for what's missing on a partial figure.">
-              latency
-            </th>
-            <th>xr</th>
-            <th title="Samples clamped at full scale on the way to the device. Non-zero means the clicks are gain staging, not timing — turn the input down.">clip</th>
-            <th>health</th>
-            <th></th>
+            <th title="ALSA period: smaller is lower latency and more demanding.">Period</th>
+            <th title="How much audio the receiving end buffers to ride out network jitter.">Target</th>
+            <th title="Forward error correction: spends bandwidth to recover lost packets.">FEC</th>
+            <th title="Peak level in and out, as measured by THIS engine. A route's two ends usually live on two machines, and each engine can only meter the half it holds — so a dashed outline means &quot;not mine to measure&quot;, not silence. Open the other machine's UI to see its half.">Level</th>
+            <th title="Latency this engine can actually account for — see the cell tooltips for what's missing on a partial figure.">Measured</th>
+            <th title="Glitches (xruns): times a device was not served in time.">xr</th>
+            <th title="Samples clamped at full scale on the way to the device. Non-zero means the clicks are gain staging, not timing — turn the input down.">Clip</th>
+            <th>Health</th>
+            <th className="actions-cell"><span className="sr-only">Actions</span></th>
           </tr>
         </thead>
         <tbody>
-          {routeList.map((r) => {
-            const health = describeHealth(stats[r.id]?.health);
+          {routeList.map((server) => {
+            const r = drafts[server.id] ?? server;
+            const id = r.id;
+            const health = describeHealth(stats[id]?.health);
+            const pending = !!drafts[id];
+            const src = endLabel(r.src.node_id, r.src.port_id);
+            const dst = endLabel(r.dst.node_id, r.dst.port_id);
+            const name = `${src.host} → ${dst.host}`;
+            const widths = deviceWidths(r);
+            const setSpec = (patch: Partial<StreamSpec>) =>
+              edit(id, { ...r, spec: { ...r.spec, ...patch } });
+            const setStart = (side: "src" | "dst", start: number) =>
+              edit(id, { ...r, [side]: { ...r[side], channel_offset: start - 1 } });
+            const classes = [
+              selectedRouteId === id ? "selected" : "",
+              health.bad ? "bad" : "",
+            ].join(" ");
             return (
-            <tr key={r.id} style={health.bad ? { background: `${health.color}14` } : undefined}>
-              <td>
-                {nodes[r.src.node_id]?.hostname ?? r.src.node_id.slice(0, 8)} →{" "}
-                {nodes[r.dst.node_id]?.hostname ?? r.dst.node_id.slice(0, 8)}
-              </td>
-              <td>
-                <select
-                  value={r.spec.rate}
-                  onChange={(e) => update(send, r.id, r.spec, { rate: Number(e.target.value) })}
-                >
-                  {RATES.map((v) => (
-                    <option key={v} value={v}>{v / 1000}k</option>
-                  ))}
-                </select>
-              </td>
-              <td style={{ whiteSpace: "nowrap" }}>
-                <input
-                  type="number"
-                  min={1}
-                  max={maxWidth(r)}
-                  style={{ width: 46 }}
-                  value={r.spec.channels}
-                  onChange={(e) =>
-                    update(send, r.id, r.spec, {
-                      channels: Math.max(1, Math.min(maxWidth(r), Number(e.target.value))),
-                    })
+              <tr
+                key={id}
+                data-route-row={id}
+                className={classes}
+                style={health.bad ? { background: `${health.color}14` } : undefined}
+                onMouseDown={() => selectRoute(id)}
+                onFocus={() => selectRoute(id)}
+                onBlur={(e) => {
+                  // Leaving the row sends whatever is waiting. Moving between
+                  // controls *within* the row does not, so a rate change and a
+                  // period change made together still cost one restart.
+                  if (!e.currentTarget.contains(e.relatedTarget as Node | null) && timers.current[id]) {
+                    commit(id);
                   }
+                }}
+                onKeyDown={(e) => {
+                  const t = e.target as HTMLElement;
+                  if (e.key === "Enter" && (t.tagName === "SELECT" || t.tagName === "INPUT")) {
+                    e.preventDefault();
+                    commit(id);
+                  }
+                }}
+              >
+                <td className="route-name">
+                  <div>
+                    {src.host} <span aria-hidden>→</span> {dst.host}
+                    {pending && (
+                      <span className="pending" title="Waiting to apply — this change has not reached the engine yet">
+                        applying…
+                      </span>
+                    )}
+                  </div>
+                  <div className="route-ports" title={`${src.port}\n→ ${dst.port}`}>
+                    {src.port} → {dst.port}
+                  </div>
+                </td>
+                <td>
+                  <select
+                    aria-label={`Sample rate, ${name}`}
+                    value={r.spec.rate}
+                    onChange={(e) => setSpec({ rate: Number(e.target.value) })}
+                  >
+                    {RATES.map((v) => (
+                      <option key={v} value={v}>
+                        {v / 1000}k
+                      </option>
+                    ))}
+                  </select>
+                </td>
+                <td>
+                  {/*
+                    A menu rather than a number box: it can only offer values
+                    that fit both devices, it works the same from the mouse and
+                    the keyboard, and it never sends a half-typed number.
+                  */}
+                  <select
+                    aria-label={`Channels, ${name}`}
+                    value={r.spec.channels}
+                    onChange={(e) => setSpec({ channels: Number(e.target.value) })}
+                  >
+                    {range(Math.max(maxWidth(r), r.spec.channels)).map((v) => (
+                      <option key={v} value={v}>
+                        {v}
+                      </option>
+                    ))}
+                  </select>
+                </td>
+                <ChannelStart
+                  label={`Source start channel, ${name}`}
+                  offset={r.src.channel_offset ?? 0}
+                  channels={r.spec.channels}
+                  deviceWidth={widths.src}
+                  onChange={(start) => setStart("src", start)}
                 />
-              </td>
-              <ChannelStart
-                route={r}
-                side="src"
-                deviceWidth={deviceWidths(r).src}
-                send={send}
-              />
-              <ChannelStart
-                route={r}
-                side="dst"
-                deviceWidth={deviceWidths(r).dst}
-                send={send}
-              />
-              <td>
-                <select
-                  value={r.spec.alsa_format}
-                  onChange={(e) => update(send, r.id, r.spec, { alsa_format: e.target.value as SampleFormat })}
-                >
-                  {FORMATS.map((v) => (<option key={v} value={v}>{v}</option>))}
-                </select>
-                <ActualFormat spec={r.spec} stats={stats[r.id]} />
-              </td>
-              <td>
-                <select
-                  value={r.spec.frames_per_period}
-                  onChange={(e) => update(send, r.id, r.spec, { frames_per_period: Number(e.target.value) })}
-                >
-                  {PERIODS.map((v) => (<option key={v} value={v}>{v}</option>))}
-                </select>
-              </td>
-              <td>
-                <select
-                  value={r.spec.target_latency_ms}
-                  onChange={(e) => update(send, r.id, r.spec, { target_latency_ms: Number(e.target.value) })}
-                >
-                  {LATENCIES.map((v) => (<option key={v} value={v}>{v} ms</option>))}
-                </select>
-              </td>
-              <td>
-                <input
-                  type="checkbox"
-                  checked={r.spec.fec}
-                  onChange={(e) => update(send, r.id, r.spec, { fec: e.target.checked })}
+                <ChannelStart
+                  label={`Destination start channel, ${name}`}
+                  offset={r.dst.channel_offset ?? 0}
+                  channels={r.spec.channels}
+                  deviceWidth={widths.dst}
+                  onChange={(start) => setStart("dst", start)}
                 />
-              </td>
-              <td style={{ width: 110 }}>
-                <LevelMeter label="in" db={stats[r.id]?.capture_level_db ?? null} />
-                <LevelMeter label="out" db={stats[r.id]?.playback_level_db ?? null} />
-              </td>
-              <td>
-                {(() => {
-                  const lat = summarizeLatency(stats[r.id]);
-                  return (
-                    <span title={lat.title} style={lat.partial ? { color: "#f59e0b" } : undefined}>
-                      {lat.text}
-                    </span>
-                  );
-                })()}
-              </td>
-              <td title={xrunBreakdown(stats[r.id])}>{stats[r.id]?.xruns ?? 0}</td>
-              <td style={(stats[r.id]?.clipped_samples ?? 0) > 0 ? { color: "#ef5350" } : undefined}>
-                {stats[r.id]?.clipped_samples ?? "—"}
-              </td>
-              <td style={{ maxWidth: 220 }}>
-                <span title={health.title} style={{ color: health.color }}>
-                  {health.text}
-                </span>
-              </td>
-              <td>
-                <button onClick={() => send({ type: "remove_route", id: r.id })}>
-                  Remove
-                </button>
-              </td>
-            </tr>
+                <td>
+                  <select
+                    aria-label={`Sample format, ${name}`}
+                    value={r.spec.alsa_format}
+                    onChange={(e) => setSpec({ alsa_format: e.target.value as SampleFormat })}
+                  >
+                    {FORMATS.map((v) => (
+                      <option key={v} value={v}>
+                        {v}
+                      </option>
+                    ))}
+                  </select>
+                  <ActualFormat spec={r.spec} stats={stats[id]} />
+                </td>
+                <td>
+                  <select
+                    aria-label={`Period, ${name}`}
+                    value={r.spec.frames_per_period}
+                    onChange={(e) => setSpec({ frames_per_period: Number(e.target.value) })}
+                  >
+                    {PERIODS.map((v) => (
+                      <option key={v} value={v}>
+                        {v}
+                      </option>
+                    ))}
+                  </select>
+                </td>
+                <td>
+                  <select
+                    aria-label={`Target latency, ${name}`}
+                    value={r.spec.target_latency_ms}
+                    onChange={(e) => setSpec({ target_latency_ms: Number(e.target.value) })}
+                  >
+                    {LATENCIES.map((v) => (
+                      <option key={v} value={v}>
+                        {v} ms
+                      </option>
+                    ))}
+                  </select>
+                </td>
+                <td>
+                  <input
+                    type="checkbox"
+                    aria-label={`Forward error correction, ${name}`}
+                    checked={r.spec.fec}
+                    onChange={(e) => setSpec({ fec: e.target.checked })}
+                  />
+                </td>
+                <td style={{ width: 110 }}>
+                  <LevelMeter label="in" db={stats[id]?.capture_level_db ?? null} />
+                  <LevelMeter label="out" db={stats[id]?.playback_level_db ?? null} />
+                </td>
+                <td>
+                  {(() => {
+                    const lat = summarizeLatency(stats[id]);
+                    return (
+                      <span title={lat.title} style={lat.partial ? { color: "#f59e0b" } : undefined}>
+                        {lat.text}
+                      </span>
+                    );
+                  })()}
+                </td>
+                <td title={xrunBreakdown(stats[id])}>{stats[id]?.xruns ?? 0}</td>
+                <td style={(stats[id]?.clipped_samples ?? 0) > 0 ? { color: "#ef5350" } : undefined}>
+                  {stats[id]?.clipped_samples ?? "—"}
+                </td>
+                <td className="health-cell">
+                  <span title={health.title} style={{ color: health.color }}>
+                    {health.text}
+                  </span>
+                </td>
+                <td className="actions-cell">
+                  <button
+                    className="danger-quiet"
+                    onClick={() => askRemoveRoute(id)}
+                    aria-label={`Remove route ${name}`}
+                    title="Remove this route (Del). Asks first."
+                  >
+                    Remove
+                  </button>
+                </td>
+              </tr>
             );
           })}
         </tbody>
       </table>
-    </div>
+    </section>
   );
 }
 
@@ -202,56 +397,38 @@ export default function RouteEditor() {
 /// like a patching error rather than a UI bug, so it happens exactly here and
 /// nowhere else.
 function ChannelStart({
-  route,
-  side,
+  label,
+  offset,
+  channels,
   deviceWidth,
-  send,
+  onChange,
 }: {
-  route: Route;
-  side: "src" | "dst";
+  label: string;
+  offset: number;
+  channels: number;
   deviceWidth: number | null;
-  send: (msg: any) => void;
+  onChange: (start: number) => void;
 }) {
-  const ref = side === "src" ? route.src : route.dst;
-  const offset = ref.channel_offset ?? 0;
   // The window has to fit: a 2-channel route on an 8-channel device can start
-  // at 7 at the latest.
-  const maxStart = deviceWidth === null ? 32 : Math.max(1, deviceWidth - route.spec.channels + 1);
+  // at 7 at the latest. The current value is always offered even if it no
+  // longer fits, so a device that shrank shows what is configured rather than
+  // silently displaying a different number.
+  const maxStart = deviceWidth === null ? 32 : Math.max(1, deviceWidth - channels + 1);
+  const current = offset + 1;
   return (
     <td style={{ whiteSpace: "nowrap" }}>
-      <input
-        type="number"
-        min={1}
-        max={maxStart}
-        style={{ width: 46 }}
-        value={offset + 1}
-        onChange={(e) => {
-          const start = Math.max(1, Math.min(maxStart, Number(e.target.value)));
-          const patched = { ...ref, channel_offset: start - 1 };
-          // Offsets live on the PortRef, not the spec, so this goes back as a
-          // whole route. `apply_route` treats a known id as an update: it
-          // restarts the pipelines and gossips to the other engine, same as
-          // any other change.
-          send({
-            type: "add_route",
-            route: side === "src" ? { ...route, src: patched } : { ...route, dst: patched },
-          });
-        }}
-      />
-      <span style={{ color: "#8a94a5", fontSize: 10, marginLeft: 3 }}>
-        /{deviceWidth ?? "?"}
-      </span>
+      <select aria-label={label} value={current} onChange={(e) => onChange(Number(e.target.value))}>
+        {range(Math.max(maxStart, current)).map((v) => (
+          <option key={v} value={v}>
+            {channels > 1 ? `${v}–${v + channels - 1}` : v}
+          </option>
+        ))}
+      </select>
+      {/* Nothing when there is no limit to show: "/?" beside a tone read as
+          a problem with the route rather than a fact about tones. */}
+      {deviceWidth !== null && <span className="of-width">/{deviceWidth}</span>}
     </td>
   );
-}
-
-function update(
-  send: (msg: any) => void,
-  id: string,
-  spec: StreamSpec,
-  patch: Partial<StreamSpec>,
-): void {
-  send({ type: "update_spec", id, spec: { ...spec, ...patch } });
 }
 
 /// Shows what the hardware actually got, whenever that isn't what was asked
@@ -347,7 +524,15 @@ function LevelMeter({ label, db }: { label: string; db: number | null }) {
   return (
     <div style={{ display: "flex", alignItems: "center", gap: 4, marginBottom: 2 }}>
       {tag}
-      <div style={track} title={`${db.toFixed(1)} dBFS`}>
+      <div
+        style={track}
+        role="meter"
+        aria-label={`${label === "in" ? "Source" : "Destination"} level`}
+        aria-valuemin={-60}
+        aria-valuemax={0}
+        aria-valuenow={Math.round(clamped)}
+        title={`${db.toFixed(1)} dBFS`}
+      >
         <div
           style={{
             width: `${norm * 100}%`,

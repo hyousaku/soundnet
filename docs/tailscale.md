@@ -8,7 +8,7 @@ SoundNet を公開インターネット越しに使う場合の注意点と手�
 
 Tailscale はレイヤー3のオーバーレイで、マルチキャストをフォワードしない。したがって `_soundnet._udp.local.` による自動発見は遠隔ピアに届かない。
 
-代わりに、UI の「Add host…」ダイアログを使う。ピアの tailnet アドレスと control port を手入力する（`100.x.y.z` と `7788`）。tailnet のアドレスは CGNAT レンジ `100.64.0.0/10` から配られるので、`tailscale status` に出る `100.` で始まるアドレスがそれ。
+代わりに、UI の「Add host」（キー H）ダイアログを使う。ピアの tailnet アドレスと control port を手入力する（`100.x.y.z` と `7788`）。tailnet のアドレスは CGNAT レンジ `100.64.0.0/10` から配られるので、`tailscale status` に出る `100.` で始まるアドレスがそれ。
 
 手動で追加したホストは設定ファイルに保存され、再起動後も残る。
 
@@ -16,7 +16,7 @@ Tailscale はレイヤー3のオーバーレイで、マルチキャストをフ
 
 ## このノードは tailscale0 をピンして使う
 
-UI の「This node」→「Egress interface」で `tailscale0` を選ぶ。
+UI の「This machine」→「Network interface」で `tailscale0` を選ぶ（ルートが再起動するので確認ダイアログが出る）。
 
 理由: エンジンは1つのアドレスをピアに広告し、ピアはそのアドレスへ音声を送る。LAN アドレスをピンしたままだと、インターネット経由のピアはそのアドレスに到達できない。
 
@@ -28,7 +28,7 @@ UI の「This node」→「Egress interface」で `tailscale0` を選ぶ。
 
 片側だけピン留めを忘れると、こういう見え方になる:
 
-1. 「Add host…」で tailnet アドレスを入れると、**20秒ほどで相手が現れる**
+1. 「Add host」（キー H）で tailnet アドレスを入れると、**20秒ほどで相手が現れる**
    （制御プレーンは tunnel を問題なく通る）
 2. ところが UI に出る相手のアドレスが **プライベートアドレス**になっている
 3. ルートを張るとエラーになる
@@ -114,7 +114,7 @@ journalctl -u soundnet-engine@$USER | grep -i mtu
 
 | 症状 | 原因と対策 |
 |---|---|
-| リモートノードが UI に現れない | mDNS は Tailscale を越えない。「Add host…」で手入力する。 |
+| リモートノードが UI に現れない | mDNS は Tailscale を越えない。「Add host」（キー H）で手入力する。 |
 | 一度現れた相手が消えたきり戻らない | 手動ホストの再探索。10秒毎に自動で再試行するので、戻らない場合はネットワーク側を疑う（`tailscale status`）。 |
-| ノードは現れたが、ルートが「retrying」のまま | ノードが広告しているアドレスにピアが到達できない。「Egress interface」で `tailscale0` をピンしているか確認。 |
+| ノードは現れたが、ルートが「retrying」のまま | ノードが広告しているアドレスにピアが到達できない。「Network interface」で `tailscale0` をピンしているか確認。 |
 | 音が来るが、ブツブツで FEC が効かない | MTU またはリレー。`tailscale status` が `direct` か確認。IP フラグメンテーションが起きていないか確認（`ip link show tailscale0` で MTU）。 |

@@ -32,6 +32,11 @@ box.
   — open `http://<hostname>.local:7788/` in any browser
 - **Patch bay** — drag between source and destination nodes to create a
   route, adjust parameters per route
+- **Mouse or keyboard, either one all the way** — every action has a button
+  (New route, Send…/Play… beside each port, Remove), and every action has a
+  key: `N` new route, `J`/`K` select, `Del` remove (always asks first),
+  `1`/`2`/`3` jump between sidebar, patch bay and route table, `?` for the
+  full list
 - **Per-route tuning**: sample rate, sample format, channel count,
   ALSA `period_size`, roc `target_latency`, FEC on/off
 - **Preview tones** — 440 Hz / 1 kHz virtual capture ports on every engine so
@@ -120,7 +125,8 @@ cargo build --release -p soundnet-engine
 ```
 
 Then open `http://<hostname>.local:7788/` in any browser on the same LAN and
-drag between nodes to route audio.
+press **New route** (or `N`) — or drag between nodes in the patch bay — to
+route audio. `?` shows every mouse and keyboard way of doing things.
 
 ## CLI flags
 
@@ -237,7 +243,7 @@ Prefer 5 GHz. Expect ~50 ms end to end, and treat anything under 20 ms as
 wired-only territory.
 
 The engine has no opinion about which interface you use — pin one per node
-under **This node → Egress interface** in the UI — so the same node can be
+under **This machine → Network interface** in the UI — so the same node can be
 wired for a session and wireless for a soundcheck.
 
 ## Running over Tailscale
@@ -250,11 +256,11 @@ substitute for a wired LAN when you need in-ear-monitor-grade timing.
 **mDNS does not cross Tailscale.** Auto-discovery is a LAN thing: mDNS is
 link-local multicast, and Tailscale is a layer-3 overlay that doesn't
 forward multicast between peers. A remote engine will not appear on its
-own. Use the **"Add host…"** dialog with the peer's tailnet address
+own. Use the **"Add host"** dialog with the peer's tailnet address
 (`100.x.y.z` or its MagicDNS name) and its port; manual hosts are persisted,
 so this is a one-time step per peer.
 
-**Pin `tailscale0` on both ends**, under **This node → Egress interface** in
+**Pin `tailscale0` on both ends**, under **This machine → Network interface** in
 the UI. Without it, the engine advertises whatever address
 `first_non_loopback_ipv4()` happens to pick — typically the LAN address —
 which a remote peer cannot route to at all. Be aware of the side effect: a

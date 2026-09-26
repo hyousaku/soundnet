@@ -65,6 +65,13 @@ async fn serve_socket(socket: WebSocket, state: Arc<EngineState>) {
                     route.spec = spec;
                     if let Err(err) = routing::apply_route(&state, route.clone(), true).await {
                         tracing::warn!("ws update_spec failed: {err:#}");
+                        // Same as add_route: a refusal that only reaches the
+                        // log looks, from the UI, like the change was taken —
+                        // the control shows the new value until the next
+                        // snapshot quietly puts the old one back.
+                        let _ = state.events.send(ServerMsg::Error {
+                            message: format!("{err:#}"),
+                        });
                     } else {
                         let _ = state.events.send(ServerMsg::RouteUpdated { route });
                     }

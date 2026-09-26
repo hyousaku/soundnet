@@ -1,50 +1,77 @@
 import { useState } from "react";
 import { useStore } from "./store";
+import Dialog from "./Dialog";
 
 export default function AddHostDialog({ onClose }: { onClose: () => void }) {
   const send = useStore((s) => s.send);
   const [addr, setAddr] = useState("");
-  const [port, setPort] = useState(7788);
+  const [port, setPort] = useState("7788");
+
+  const portNum = Number(port);
+  const portOk = Number.isInteger(portNum) && portNum >= 1 && portNum <= 65535;
+  const addrOk = addr.trim().length > 0;
+  const ok = addrOk && portOk;
 
   const submit = () => {
-    if (!addr.trim()) return;
-    send({ type: "add_manual_host", addr: addr.trim(), port });
+    if (!ok) return;
+    send({ type: "add_manual_host", addr: addr.trim(), port: portNum });
     onClose();
   };
 
   return (
-    <div className="dialog" onClick={onClose}>
-      <div className="box" onClick={(e) => e.stopPropagation()}>
-        <h3>Add host manually</h3>
-        <p className="hint">
-          Use this when mDNS is blocked (different VLAN, VPN, or the peer's
-          firewall). Point it at the peer's control port.
-        </p>
-        <div style={{ display: "flex", gap: 8, marginTop: 12, alignItems: "center" }}>
-          <input
-            type="text"
-            placeholder="192.168.1.42 or raspi.local"
-            value={addr}
-            onChange={(e) => setAddr(e.target.value)}
-            style={{ flex: 1, padding: "6px 8px", background: "#1c222b",
-                     color: "#e6e9ef", border: "1px solid #262d38", borderRadius: 4 }}
-            onKeyDown={(e) => { if (e.key === "Enter") submit(); }}
-            autoFocus
-          />
-          <input
-            type="number"
-            min={1}
-            max={65535}
-            value={port}
-            onChange={(e) => setPort(Number(e.target.value))}
-            style={{ width: 90 }}
-          />
+    <Dialog title="Add host" onClose={onClose}>
+      <p className="hint">
+        For a peer that auto-discovery cannot see: a different VLAN, a
+        firewall, or anything over a VPN such as Tailscale (use its{" "}
+        <code>100.x.y.z</code> address). The engine keeps retrying a host
+        added here, so it comes back on its own after a network blip.
+      </p>
+      {/*
+        A form so Enter submits from either field. It used to be wired to the
+        address box only, so after tabbing to the port Enter did nothing.
+      */}
+      <form
+        onSubmit={(e) => {
+          e.preventDefault();
+          submit();
+        }}
+      >
+        <div className="field-row">
+          <label className="field grow">
+            <span>Address</span>
+            <input
+              type="text"
+              placeholder="192.168.1.42, raspi.local or 100.x.y.z"
+              value={addr}
+              onChange={(e) => setAddr(e.target.value)}
+              data-autofocus
+              autoComplete="off"
+              spellCheck={false}
+            />
+          </label>
+          <label className="field">
+            <span>Port</span>
+            <input
+              type="number"
+              min={1}
+              max={65535}
+              value={port}
+              onChange={(e) => setPort(e.target.value)}
+              style={{ width: 90 }}
+              aria-invalid={!portOk}
+            />
+          </label>
         </div>
-        <div style={{ display: "flex", gap: 8, marginTop: 16, justifyContent: "flex-end" }}>
-          <button onClick={onClose}>Cancel</button>
-          <button onClick={submit} disabled={!addr.trim()}>Add</button>
+        {!portOk && <p className="field-error">Port must be between 1 and 65535.</p>}
+        <div className="dialog-actions">
+          <button type="button" onClick={onClose}>
+            Cancel
+          </button>
+          <button type="submit" className="primary" disabled={!ok}>
+            Add host
+          </button>
         </div>
-      </div>
-    </div>
+      </form>
+    </Dialog>
   );
 }
