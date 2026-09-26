@@ -211,6 +211,7 @@ pub fn spawn_liveness_checker(state: Arc<EngineState>) {
         loop {
             interval.tick().await;
             check_peers_once(&state, &mut failures).await;
+            reprobe_manual_hosts(&state).await;
         }
     });
 }
@@ -267,10 +268,15 @@ async fn check_peers_once(state: &Arc<EngineState>, failures: &mut HashMap<Strin
                 }
                 // Refresh the cached record either way — ports may have
                 // changed since we first saw this peer, and this is cheap.
+                //
+                // Same merge as on first contact, and it has to be: this runs
+                // every ten seconds, so adopting the peer's self-reported
+                // address here would quietly undo `merge_reachable` moments
+                // after it took effect.
                 state.peers.insert(
                     real_id,
                     PeerRecord {
-                        node: snap.self_node.clone(),
+                        node: merge_reachable(&snap.self_node, &node.addr, node.port),
                         ports: snap.local_ports,
                     },
                 );
@@ -290,6 +296,46 @@ async fn check_peers_once(state: &Arc<EngineState>, failures: &mut HashMap<Strin
                     failures.remove(&id);
                 }
             }
+        }
+    }
+}
+
+/// Re-probe every manually-added host that is not currently a known peer.
+///
+/// Without this, `probe_manual` runs exactly twice in a host's life — at
+/// startup and when the operator adds it — and the liveness checker above is
+/// free to evict the resulting peer after three failed checks. Nothing ever
+/// brings it back, so a manual host that blinks out is gone until the engine
+/// restarts.
+///
+/// On a LAN that is survivable, because mDNS re-announces and re-discovers
+/// continuously; manual hosts are the fallback for when it does not. Over a
+/// tunnel there is no fallback — mDNS cannot cross it, so manual hosts are
+/// the *only* way a peer is ever known, and a thirty-second network hiccup
+/// permanently disconnects two machines that are both running fine. That is
+/// how a peer appeared, failed to route, and then vanished for good.
+///
+/// Re-probing an already-known host would be harmless (the insert is keyed
+/// by node id, so it just refreshes), but it is skipped anyway: a healthy
+/// manual peer is already being polled by the liveness checker on this very
+/// tick, and asking twice for the same thing every ten seconds is noise in
+/// somebody's journal for nothing.
+async fn reprobe_manual_hosts(state: &Arc<EngineState>) {
+    let hosts = state.manual_hosts.read().await.clone();
+    if hosts.is_empty() {
+        return;
+    }
+    for host in hosts {
+        // Matching on the address pair works precisely because
+        // `merge_reachable` keeps the address we reached the peer on: a live
+        // manual host is recorded under the address the operator typed, not
+        // under whatever the peer thinks it is called.
+        let known = state
+            .peers
+            .iter()
+            .any(|e| e.node.addr == host.addr && e.node.port == host.port);
+        if !known {
+            probe_manual(state.clone(), host.addr.clone(), host.port);
         }
     }
 }
@@ -397,6 +443,34 @@ pub fn push_ports_to_peers(state: &Arc<EngineState>) {
     }
 }
 
+/// Merge a peer's self-description with the address that actually reached it.
+///
+/// Identity and capabilities come from the peer — its node id, hostname,
+/// version and above all its `audio_port`, which nothing here could know.
+/// **Reachability does not.** `addr` and `port` are kept as the ones we just
+/// got an answer on, because that pair is evidence and the peer's own
+/// `addr` is a guess: it is whatever `first_non_loopback_ipv4()` picked over
+/// there, which is right only when the peer happens to be reachable at the
+/// address it would choose for itself.
+///
+/// Over a tunnel it is reliably wrong. A peer added by hand at its tailnet
+/// address answers perfectly well, then reports `192.168.x.x`, and adopting
+/// that replaces a working address with one that is unroutable from here —
+/// and, worse, may belong to a completely different machine on the local
+/// network, since both ends of a VPN routinely use the same RFC1918 range.
+/// Audio then goes somewhere nobody chose, or nowhere at all.
+///
+/// On a LAN this changes nothing: the address mDNS gave us is the address
+/// the peer would have reported. An interface change on the peer still
+/// propagates, because that re-registers with mDNS (see `reregister`).
+fn merge_reachable(reported: &Node, reached_addr: &str, reached_port: u16) -> Node {
+    Node {
+        addr: reached_addr.to_string(),
+        port: reached_port,
+        ..reported.clone()
+    }
+}
+
 async fn fetch_peer_state(state: &Arc<EngineState>, node: Node) {
     let url = format!("http://{}:{}/api/state", node.addr, node.port);
     // Same String-flattening as in `check_peers_once`, for the same reason.
@@ -413,8 +487,9 @@ async fn fetch_peer_state(state: &Arc<EngineState>, node: Node) {
     .await;
     match fetched {
         Ok(Ok(snap)) => {
-            // Prefer the ids/ports the peer reports over whatever we had.
-            let node = snap.self_node.clone();
+            // Identity from the peer, reachability from what just worked —
+            // see `merge_reachable`.
+            let node = merge_reachable(&snap.self_node, &node.addr, node.port);
             let ports: Vec<LocalPort> = snap.local_ports;
             let record = PeerRecord {
                 node: node.clone(),
@@ -434,5 +509,67 @@ async fn fetch_peer_state(state: &Arc<EngineState>, node: Node) {
             node.port
         ),
         Err(err) => tracing::warn!("peer state task panicked: {err}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::merge_reachable;
+    use soundnet_protocol::Node;
+
+    fn peer_reporting(addr: &str) -> Node {
+        Node {
+            id: "peer-node-id".to_string(),
+            hostname: "booth".to_string(),
+            addr: addr.to_string(),
+            port: 7788,
+            audio_port: 10_001,
+            version: "test".to_string(),
+        }
+    }
+
+    /// The case this exists for. A peer added by hand at its tailnet address
+    /// answers fine and then reports the LAN address it picked for itself.
+    /// Adopting that throws away the one address known to work.
+    #[test]
+    fn the_address_that_answered_wins_over_the_one_the_peer_reports() {
+        let merged = merge_reachable(&peer_reporting("192.168.1.50"), "100.101.102.103", 7788);
+        assert_eq!(merged.addr, "100.101.102.103");
+        assert_eq!(merged.port, 7788);
+    }
+
+    /// Everything the peer alone can know still comes from the peer. The
+    /// audio port especially: nothing on this side could derive it, and
+    /// getting it wrong sends the stream to a port nobody is listening on.
+    #[test]
+    fn identity_and_capabilities_still_come_from_the_peer() {
+        let reported = peer_reporting("192.168.1.50");
+        let merged = merge_reachable(&reported, "100.101.102.103", 7788);
+        assert_eq!(merged.id, reported.id);
+        assert_eq!(merged.hostname, reported.hostname);
+        assert_eq!(merged.version, reported.version);
+        assert_eq!(
+            merged.audio_port, reported.audio_port,
+            "the audio port is the peer's to declare; overriding it would \
+             send the stream nowhere"
+        );
+    }
+
+    /// A control port reached on something other than the default is kept,
+    /// not silently replaced by whatever the peer advertises.
+    #[test]
+    fn a_non_default_control_port_is_kept() {
+        let merged = merge_reachable(&peer_reporting("192.168.1.50"), "100.64.0.9", 17_788);
+        assert_eq!(merged.port, 17_788);
+    }
+
+    /// On a LAN this is a no-op: mDNS hands over the same address the peer
+    /// would report, so nothing changes for the case that already worked.
+    #[test]
+    fn a_lan_peer_is_unaffected() {
+        let reported = peer_reporting("192.168.1.50");
+        let merged = merge_reachable(&reported, "192.168.1.50", 7788);
+        assert_eq!(merged.addr, reported.addr);
+        assert_eq!(merged.port, reported.port);
     }
 }
