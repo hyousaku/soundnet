@@ -27,6 +27,21 @@ async fn serve_socket(socket: WebSocket, state: Arc<EngineState>) {
     if let Ok(json) = serde_json::to_string(&ServerMsg::State { snapshot: snap }) {
         let _ = sink.send(Message::Text(json)).await;
     }
+    // Said to each browser as it connects rather than broadcast once: the
+    // condition is permanent for the life of the process, and whoever opens
+    // the page later is exactly who is looking at the xruns it causes.
+    if crate::rt::degraded() {
+        let message = format!(
+            "{}: audio is running WITHOUT real-time priority, so xruns (the xr column) \
+             are likely under any load. Run the engine through \
+             packaging/soundnet-engine.service (it grants LimitRTPRIO / LimitMEMLOCK), \
+             or give the user rtprio via packaging/99-realtime.conf.",
+            state.identity.hostname
+        );
+        if let Ok(json) = serde_json::to_string(&ServerMsg::Error { message }) {
+            let _ = sink.send(Message::Text(json)).await;
+        }
+    }
 
     // Fan-out from the engine's broadcast to this socket.
     let mut rx = state.events.subscribe();

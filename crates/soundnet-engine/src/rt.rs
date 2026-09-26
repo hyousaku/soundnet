@@ -12,6 +12,7 @@
 //! that case, and that must never be fatal: it's strictly better to run at
 //! normal priority than to refuse to start because the box isn't tuned yet.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Once;
 
 /// Priorities for the four audio-path worker threads. Chosen in the 70s
@@ -30,6 +31,18 @@ pub const PRIO_SEND: i32 = 72;
 pub const PRIO_RECV: i32 = 71;
 
 static WARN_ONCE: Once = Once::new();
+
+/// Set once either call below has failed. Read by the control plane, which
+/// tells every browser that connects: the log line alone reaches nobody on a
+/// Raspberry Pi running headless, and running without real-time priority is
+/// the first thing to rule out when a machine's `xr` column keeps climbing.
+static DEGRADED: AtomicBool = AtomicBool::new(false);
+
+/// Whether this process is running its audio threads without real-time
+/// scheduling or locked memory.
+pub fn degraded() -> bool {
+    DEGRADED.load(Ordering::Relaxed)
+}
 
 /// Lock all current and future process memory into RAM so audio buffers
 /// never get paged out. Call exactly once, at process startup — `mlockall`
@@ -81,6 +94,7 @@ pub fn raise_thread_priority(label: &str, priority: i32) {
 }
 
 fn warn_once_degraded() {
+    DEGRADED.store(true, Ordering::Relaxed);
     WARN_ONCE.call_once(|| {
         tracing::warn!(
             "could not acquire real-time scheduling / locked memory for audio threads \

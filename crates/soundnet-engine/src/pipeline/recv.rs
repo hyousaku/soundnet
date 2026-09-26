@@ -83,6 +83,10 @@ pub struct RecvHandle {
     /// Why this pipeline stopped, if it stopped on its own. See the same
     /// field on `SendHandle`.
     pub last_error: Arc<Mutex<Option<String>>>,
+    /// Periods currently kept queued in the playback device: 2 to start
+    /// with, raised by repeated xruns. See `pcm::DepthGovernor`. 0 until
+    /// the device is open.
+    pub depth: Arc<AtomicU32>,
 }
 
 impl RecvHandle {
@@ -120,6 +124,7 @@ pub fn spawn(
     let clipped = Arc::new(AtomicUsize::new(0));
     let stalled = Arc::new(AtomicBool::new(false));
     let last_error: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let depth = Arc::new(AtomicU32::new(0));
 
     let worker = Worker {
         stop: stop.clone(),
@@ -130,6 +135,7 @@ pub fn spawn(
         e2e_ns: e2e_ns.clone(),
         format: format.clone(),
         clipped: clipped.clone(),
+        depth: depth.clone(),
     };
     let error_worker = last_error.clone();
     let alsa_name = alsa_name.to_string();
@@ -169,6 +175,7 @@ pub fn spawn(
         clipped,
         stalled,
         last_error,
+        depth,
     })
 }
 
@@ -183,6 +190,47 @@ struct Worker {
     e2e_ns: Arc<AtomicU64>,
     format: Arc<AtomicU8>,
     clipped: Arc<AtomicUsize>,
+    depth: Arc<AtomicU32>,
+}
+
+/// Count a recovered playback xrun and, if they have become a pattern,
+/// queue one more period from now on. See `pcm::DepthGovernor` for when,
+/// and `pcm::PLAYBACK_BUFFER_PERIODS` for why a larger period is not the
+/// answer on the hardware where this happens.
+fn note_xrun(
+    pcm: &alsa::PCM,
+    governor: &mut pcm::DepthGovernor,
+    w: &Worker,
+    alsa_name: &str,
+    write_frames: usize,
+    rate: u32,
+) {
+    w.xruns.fetch_add(1, Ordering::Relaxed);
+    let Some(want) = governor.on_xrun(std::time::Instant::now()) else {
+        tracing::warn!("playback {alsa_name} xrun recovered");
+        return;
+    };
+    match pcm::set_playback_depth(pcm, write_frames, want) {
+        Ok(applied) => {
+            governor.settle(applied);
+            w.depth.store(applied, Ordering::Relaxed);
+            if applied == want {
+                tracing::warn!(
+                    "playback {alsa_name} xrun recovered; xruns are repeating, now keeping \
+                     {applied} periods queued (+{} ms of latency per step)",
+                    write_frames as u64 * 1000 / rate.max(1) as u64
+                );
+            } else {
+                tracing::warn!(
+                    "playback {alsa_name} xrun recovered; xruns are repeating but the device \
+                     buffer is already as deep as it goes ({applied} periods)"
+                );
+            }
+        }
+        Err(err) => {
+            tracing::warn!("playback {alsa_name} xrun recovered; deepening failed: {err:#}")
+        }
+    }
 }
 
 fn run(
@@ -206,9 +254,17 @@ fn run(
     w.format.store(format.as_u8(), Ordering::Relaxed);
     let io = pcm.io_bytes();
 
+    let period_frames = spec.frames_per_period as usize;
+    let mut governor = pcm::DepthGovernor::new();
+    governor.settle(pcm::set_playback_depth(
+        &pcm,
+        period_frames,
+        governor.depth(),
+    )?);
+    w.depth.store(governor.depth(), Ordering::Relaxed);
+
     let mut rx = receiver::open(ctx, bind_host, bind_port, spec)?;
 
-    let period_frames = spec.frames_per_period as usize;
     let period_samples = period_frames * channels;
     // What roc hands over (the window), and what the device is written
     // (full width, with every channel this route doesn't drive left silent).
@@ -420,8 +476,7 @@ fn run(
                 }
                 Err(err) => {
                     if pcm.try_recover(err, false).is_ok() {
-                        w.xruns.fetch_add(1, Ordering::Relaxed);
-                        tracing::warn!("playback {alsa_name} xrun recovered");
+                        note_xrun(&pcm, &mut governor, w, alsa_name, period_frames, spec.rate);
                         healthy = false;
                         break;
                     }
@@ -448,8 +503,7 @@ fn run(
                 }
                 Err(err) => {
                     if pcm.try_recover(err, false).is_ok() {
-                        w.xruns.fetch_add(1, Ordering::Relaxed);
-                        tracing::warn!("playback {alsa_name} xrun recovered");
+                        note_xrun(&pcm, &mut governor, w, alsa_name, period_frames, spec.rate);
                         healthy = false;
                         break;
                     }

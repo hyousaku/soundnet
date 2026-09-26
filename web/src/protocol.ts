@@ -111,6 +111,9 @@ export interface StreamStats {
   // is merely inaudible during silence, while clipping only happens when the
   // signal is genuinely near full scale.
   clipped_samples: number | null;
+  /** Periods the playback device is kept filled to: 2, raised automatically
+   *  when xruns repeat. null when this engine holds no playback side. */
+  playback_periods?: number | null;
 }
 
 export interface ManualHost {

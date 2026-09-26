@@ -8,7 +8,11 @@ import { describeHealth } from "./health";
 
 const RATES = [44100, 48000, 88200, 96000];
 const FORMATS: SampleFormat[] = ["S16_LE", "S24_LE3", "S24_LE", "S32_LE", "F32_LE"];
-const PERIODS = [32, 64, 128, 256, 512];
+// 1024 is for outputs that cannot keep a short queue fed however fast the
+// machine is — a Raspberry Pi's headphone jack and HDMI take audio in large
+// chunks. The engine also deepens the queue on its own when underruns
+// repeat (see the "buf ×N" chip in the xr column); this is the manual lever.
+const PERIODS = [32, 64, 128, 256, 512, 1024];
 // 120 and 200 exist for paths that leave the LAN entirely — over the public
 // internet (a Tailscale tunnel, say) jitter runs much larger than on a wire,
 // and 80ms of buffer can still be too little to absorb it. See the README's
@@ -361,7 +365,26 @@ export default function RouteEditor() {
                     );
                   })()}
                 </td>
-                <td title={xrunBreakdown(stats[id])}>{stats[id]?.xruns ?? 0}</td>
+                <td title={xrunBreakdown(stats[id])} style={{ whiteSpace: "nowrap" }}>
+                  {stats[id]?.xruns ?? 0}
+                  {/* The engine deepens the playback queue by itself when
+                      underruns repeat. That is latency the Period column
+                      does not show, so it is shown here, where the xruns
+                      that caused it are. */}
+                  {(stats[id]?.playback_periods ?? 2) > 2 && (
+                    <span
+                      className="depth-chip"
+                      title={
+                        `Playback underruns kept repeating, so this machine now keeps ` +
+                        `${stats[id]!.playback_periods} periods queued instead of 2 ` +
+                        `(+${(((stats[id]!.playback_periods! - 2) * r.spec.frames_per_period * 1000) / r.spec.rate).toFixed(1)} ms). ` +
+                        `It stays that way until the route is restarted; changing any setting restarts it at 2.`
+                      }
+                    >
+                      buf ×{stats[id]!.playback_periods}
+                    </span>
+                  )}
+                </td>
                 <td style={(stats[id]?.clipped_samples ?? 0) > 0 ? { color: "#ef5350" } : undefined}>
                   {stats[id]?.clipped_samples ?? "—"}
                 </td>

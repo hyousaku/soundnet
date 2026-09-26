@@ -308,6 +308,17 @@ pub struct StreamStats {
     /// Without this counter the two are indistinguishable by ear.
     #[serde(default)]
     pub clipped_samples: Option<u32>,
+    /// How many periods the playback device is being kept filled to. Starts
+    /// at 2 and goes up by one when xruns repeat (see the engine's
+    /// `pcm::DepthGovernor`), each step adding one period of latency.
+    ///
+    /// Reported because that latency is otherwise invisible as a *setting*:
+    /// the route still says "256 frames", and without this the only trace
+    /// of the engine having traded latency for stability is a playback
+    /// buffer figure that is larger than the period suggests. `None` when
+    /// this engine holds no playback side.
+    #[serde(default)]
+    pub playback_periods: Option<u32>,
 }
 
 /// A host the user added manually (mDNS was blocked / offline). Rendered in

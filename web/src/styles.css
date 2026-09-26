@@ -344,3 +344,11 @@ code {
 .notice button:hover { color: var(--fg); }
 .help-list { margin: 0; padding-left: 18px; line-height: 1.5; }
 .help-list li { margin-bottom: 4px; }
+.depth-chip {
+  margin-left: 4px;
+  padding: 0 4px;
+  border-radius: 3px;
+  background: #3a2f12;
+  color: #f59e0b;
+  font-size: 10px;
+}

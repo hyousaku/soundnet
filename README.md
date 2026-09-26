@@ -481,6 +481,23 @@ than this and reported correspondingly lower figures. It was not a working
 configuration: with no margin at all, a single late wakeup produced a run of
 xruns rather than one.)
 
+Two periods is where a route *starts*. When playback underruns repeat — two
+within a minute — the engine keeps one more period queued, and again on
+each further repeat, up to 8. The xr column then shows `buf ×N`; the extra
+latency is `(N − 2) × frames_per_period`. It does not come back down by
+itself (a route that has become stable at an event should stay stable);
+changing any of the route's settings restarts it at two.
+
+This exists because some outputs cannot be fed from a two-period queue at
+any period size. A Raspberry Pi's own headphone jack and HDMI hand audio to
+the firmware in large chunks, so the queue empties in steps and a bigger
+period only makes the steps bigger — `xr` climbs with the period at its
+maximum. A USB audio interface on the same Pi does not behave like this and
+is the better choice for low latency.
+
+If `xr` climbs on a machine, check the notices first: an engine running
+without real-time priority says so to every browser that connects.
+
 ### Measuring it for real
 
 The `latency` column adds up what each engine can account for. It cannot see
